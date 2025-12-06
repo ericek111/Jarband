@@ -180,10 +180,11 @@ public class WaterfallPanel extends JPanel implements ComponentListener, MouseMo
 			// int simdEnd = species.loopBound(searchEnd); // this would need aligned searchStart
 			int simdDiff = searchEnd - searchStart;
 			int simdCount = simdDiff - simdDiff % species.length();
-			int simdEnd = searchStart + simdCount;
-			
+						
 			// FloatVector vr = FloatVector.broadcast(species, maxVal);
-			if (simdCount > 0 && true) {
+			if (simdCount > 0 && simdDiff >= species.length()) { // don't vectorize if it's not worth it
+				int simdEnd = searchStart + simdCount;
+				
 				FloatVector vr = FloatVector.fromArray(species, fftLineBuf, searchStart);
 				searchStart += species.length();
 				for (; searchStart < simdEnd; searchStart += species.length()) {
