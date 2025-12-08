@@ -17,6 +17,7 @@ import javax.swing.event.ChangeListener;
 import eu.lixko.jarband.gui.SettingsPanel;
 import eu.lixko.jarband.gui.WaterfallPanel;
 import eu.lixko.jarband.swing.RangeSlider;
+import eu.lixko.jsoapy.soapy.Converters;
 import eu.lixko.jsoapy.soapy.Converters_h;
 import eu.lixko.jsoapy.soapy.Errors_h;
 import eu.lixko.jsoapy.soapy.SoapySDRConverterFunction;
@@ -134,8 +135,8 @@ public class SoapyRxFft extends JFrame {
 			System.out.println("Block size: " + stream.getBlockSize() + ", native sample size: " + stream.getNativeFormat(0).format().byteSize() + ", stream sample size: " + stream.getFormat().byteSize());
 			stream.activateStream();
 			boolean DMA = true;
-			MemorySegment convFunction = Converters_h.SoapySDRConverter_getFunction((DMA ? stream.getNativeFormat(0).format() : stream.getFormat()).addr(), StreamFormat.CF32.addr());
-			
+			// MemorySegment convFunction = Converters_h.SoapySDRConverter_getFunction((DMA ? stream.getNativeFormat(0).format() : stream.getFormat()).addr(), StreamFormat.CF32.addr());
+			var convFunction = Converters.getFunction((DMA ? stream.getNativeFormat(0).format() : stream.getFormat()), StreamFormat.CF32);
 			long t1 = System.nanoTime();
 			long totalFetched = 0;
 			long fftInPos = 0; // samples
@@ -170,7 +171,8 @@ public class SoapyRxFft extends JFrame {
 				while (inSamplesOffset < inSamples.byteSize()) {
 					long leftSamplesInBuf = (inSamples.byteSize() - inSamplesOffset) / streamSampleSize;
 					long shouldCopySamples = Math.max(0, Math.min(fftSize - fftInPos, leftSamplesInBuf));
-					SoapySDRConverterFunction.invokeLongs(convFunction, inSamples.address() + inSamplesOffset, fftGen.fft_in.address() + fftInPos * Float.BYTES * 2, shouldCopySamples, 1.0);
+					convFunction.invokeLongs(inSamples.address() + inSamplesOffset, fftGen.fft_in.address() + fftInPos * Float.BYTES * 2, shouldCopySamples, 1.0);
+					// SoapySDRConverterFunction.invokeLongs(convFunction, inSamples.address() + inSamplesOffset, fftGen.fft_in.address() + fftInPos * Float.BYTES * 2, shouldCopySamples, 1.0);
 					fftInPos += shouldCopySamples;
 					inSamplesOffset += shouldCopySamples * streamSampleSize;
 
