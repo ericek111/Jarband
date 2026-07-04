@@ -139,7 +139,7 @@ public class WaterfallPanel extends JPanel implements ComponentListener, MouseMo
 	    	MemorySegment.copy(fftGen.fft_out, ValueLayout.JAVA_FLOAT, 0, this.fftData[currentLine], fftSize / 2, fftSize / 2);
 	    	MemorySegment.copy(fftGen.fft_out, ValueLayout.JAVA_FLOAT, fftSize * Float.BYTES / 2, this.fftData[currentLine], 0, fftSize / 2);
 	    	fftSizes[currentLine] = fftSize;
-	    	drawFftLine(imageData, currentLine, 0);
+	    	drawFftLine(imageData, currentLine, 0, 0, waterfallImage.getWidth());
 	    	
 	    	currentLine = (currentLine + 1) % this.fftData.length;
 	    	
@@ -149,12 +149,12 @@ public class WaterfallPanel extends JPanel implements ComponentListener, MouseMo
 		}
 	}
     
-    private void drawFftLine(int imageData[], int fftIdx, int yPos) {
+    private void drawFftLine(int imageData[], int fftIdx, int yPos, int startPx, int endPx) {
     	float dataRange = waterfallMax - waterfallMin;
     	    	
     	int waterfallWidth = waterfallImage.getWidth();
     	int yIdx = waterfallImage.getWidth() * yPos;
-    	if (waterfallWidth == 0)
+    	if (waterfallWidth == 0 || startPx >= endPx)
     		return;
     	
     	float[] fftLineBuf = this.fftData[fftIdx];
@@ -168,10 +168,10 @@ public class WaterfallPanel extends JPanel implements ComponentListener, MouseMo
     	
     	final VectorSpecies<Float> species = FloatVector.SPECIES_PREFERRED;
     	
-    	double searchCursor = (double) drawDataStart;
     	double searchStep = ((double) drawDataSize / waterfallWidth);
-    	
-    	for (int px = 0; px < waterfallWidth; px++) {
+    	double searchCursor = (double) drawDataStart + startPx * searchStep;
+
+    	for (int px = startPx; px < endPx; px++) {
     		float maxVal = -Float.MAX_VALUE;
     		int searchStart = (int) (searchCursor);
     		searchCursor += searchStep;
@@ -208,6 +208,44 @@ public class WaterfallPanel extends JPanel implements ComponentListener, MouseMo
 			imageData[yIdx + px] = palette[paletteIdx];
     	}
     }
+
+    private void doIncrementalUpdateWork(int pixelDelta) {
+        if (pixelDelta == 0)
+            return;
+
+        WritableRaster raster = waterfallImage.getRaster();
+        int[] imageData = ((DataBufferInt) raster.getDataBuffer()).getData();
+        int width = raster.getWidth();
+        int height = raster.getHeight();
+
+        int shift = Math.abs(pixelDelta);
+        if (shift >= (width * 0.9f)) {
+            doFullUpdateWork();
+            return;
+        }
+
+        int srcOffset = pixelDelta > 0 ? pixelDelta : 0;
+        int dstOffset = pixelDelta > 0 ? 0 : shift;
+        int stripStart = pixelDelta > 0 ? width - shift : 0;
+        int stripEnd = pixelDelta > 0 ? width : shift;
+
+        for (int y = 0; y < height; y++) {
+            int rowStart = y * width;
+            System.arraycopy(imageData, rowStart + srcOffset, imageData, rowStart + dstOffset, width - shift);
+        }
+
+        for (int i = this.fftData.length - 1; i > 0; i--) {
+            if (zoomWorkAvailable.get())
+                return;
+
+            int fftIdx = (currentLine + i) % this.fftData.length;
+            int yPos = height - 1 - i;
+            if (yPos >= 0 && yPos < height) {
+                drawFftLine(imageData, fftIdx, yPos, stripStart, stripEnd);
+            }
+        }
+
+    }
     
     public void doFullUpdate() {
     	zoomWorkAvailable.set(true);
@@ -227,7 +265,7 @@ public class WaterfallPanel extends JPanel implements ComponentListener, MouseMo
     			// System.out.println("Bailing");
     			return;
     		}
-    		drawFftLine(imageData, (currentLine + i) % this.fftData.length, raster.getHeight() - 1 - i);    		
+    		drawFftLine(imageData, (currentLine + i) % this.fftData.length, raster.getHeight() - 1 - i, 0, waterfallImage.getWidth());
     	}
     	long took = System.nanoTime() - t1;
     	// System.out.println("Full update took: " + (took / 1000000) + " ms");
@@ -235,7 +273,13 @@ public class WaterfallPanel extends JPanel implements ComponentListener, MouseMo
     }
     
     public void setViewOffset(double offset) {
+        int pixelDelta = 0;
+        int waterfallWidth = waterfallImage != null ? waterfallImage.getWidth() : 0;
+        if (waterfallWidth == 0)
+            return;
+        
     	synchronized(waterfallSyncObj) {
+    		double oldOffset = this.offsetFactor;
 	    	this.offsetFactor = offset;
 	    	if (this.offsetFactor + this.zoomFactor > 1.0) {
 	    		this.offsetFactor = 1.0 - this.zoomFactor;
@@ -244,8 +288,22 @@ public class WaterfallPanel extends JPanel implements ComponentListener, MouseMo
 	    	if (this.offsetFactor - this.zoomFactor < -1.0) {
 	    		this.offsetFactor = -1.0 + this.zoomFactor;
 	    	}
+	    	
+            double offsetDelta = this.offsetFactor - oldOffset;
+            pixelDelta = (int) Math.round(offsetDelta * waterfallWidth / (2.0 * this.zoomFactor));
 	    }
     	
+        if (pixelDelta != 0 && Math.abs(pixelDelta) < (waterfallWidth * 0.9f)) {
+            resizingLock.readLock().lock();
+            try {
+                doIncrementalUpdateWork(pixelDelta);
+            } finally {
+                resizingLock.readLock().unlock();
+            }
+        } else {
+            doFullUpdate();
+        }
+        
     	// this.offsetFactor = Math.clamp(this.offsetFactor, -this.zoomFactor, this.zoomFactor);
     	
     	doFullUpdate();
