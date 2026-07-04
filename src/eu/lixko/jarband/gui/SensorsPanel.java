@@ -19,7 +19,8 @@ public abstract class SensorsPanel extends JPanel {
 	protected final SoapySDRDevice device;
 	
 	protected HashMap<String, JLabel> valFields = new HashMap<>();
-	
+	private javax.swing.Timer refreshTimer;
+
 	public SensorsPanel(SoapySDRDevice device) {
 		super (new GridBagLayout());
 		
@@ -62,8 +63,8 @@ public abstract class SensorsPanel extends JPanel {
 
         this.updateValFields();
         
-        javax.swing.Timer timer = new javax.swing.Timer(1000, e -> this.updateValFields());
-        timer.start();
+        refreshTimer = new javax.swing.Timer(1000, e -> this.updateValFields());
+        refreshTimer.start();
 
         this.validate();
 	}
@@ -79,7 +80,15 @@ public abstract class SensorsPanel extends JPanel {
 	public abstract String readSensor(String key);
 	
 	public abstract SoapySDRArgInfo getSensorInfo(String key);
-	
+
+	@Override
+	public void removeNotify() {
+		super.removeNotify();
+		if (refreshTimer != null) {
+			refreshTimer.stop();
+		}
+	}
+
 	protected static class DeviceSensors extends SensorsPanel {
 		public DeviceSensors(SoapySDRDevice device) {
 			super(device);
