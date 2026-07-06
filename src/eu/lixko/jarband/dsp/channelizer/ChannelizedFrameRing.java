@@ -6,8 +6,8 @@ import java.lang.foreign.ValueLayout;
 public final class ChannelizedFrameRing {
     private final ChannelizedFrame[] frames;
     private final int branchCount;
-    private long nextSequence;
-    private int size;
+    private volatile long nextSequence;
+    private volatile int size;
 
     public ChannelizedFrameRing(int capacityFrames, int branchCount) {
         if (capacityFrames <= 0) {

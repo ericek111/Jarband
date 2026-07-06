@@ -3,7 +3,6 @@ package eu.lixko.jarband.app;
 import java.awt.BorderLayout;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
-import java.time.Clock;
 import java.util.concurrent.ArrayBlockingQueue;
 
 import javax.swing.JFrame;
@@ -29,10 +28,7 @@ import eu.lixko.jsoapy.util.NativeUtils;
 
 public final class AirbandRecorder {
     private static final int WATERFALL_FFT_SIZE = 262_144;
-
-    private static final float SQUELCH_OPEN_DB = 18.0f;
-    private static final float SQUELCH_CLOSE_DB = 18.0f;
-    private static final int PREROLL_MILLIS = 80;
+    private static final int CHANNELIZED_QUEUE_CAPACITY = 1024;
 
     private AirbandRecorder() {}
 
@@ -62,51 +58,54 @@ public final class AirbandRecorder {
                         config.centerFrequencyHz(), config.gains()),
                 captureQueue);
         Thread captureThread = null;
+        Thread channelizerThread = null;
 
-        int prerollFrames = Math.max(1, (int) Math.ceil(pfb.channelOutputRateHz() * PREROLL_MILLIS / 1000.0));
-        int closeLookaheadFrames = Math.max(1, (int) Math.ceil(pfb.channelOutputRateHz() * 100.0 / 1000.0));
-        ChannelizedFrameRing preroll = new ChannelizedFrameRing(prerollFrames + closeLookaheadFrames + 16, pfb.branches());
+        int prerollFrames = Math.max(1,
+                (int) Math.ceil(pfb.channelOutputRateHz() * config.squelchPrerollMillis() / 1000.0));
+        int closeLookaheadFrames = Math.max(1,
+                (int) Math.ceil(pfb.channelOutputRateHz() * config.squelchCloseLookaheadMillis() / 1000.0));
+        ChannelizedFrameRing preroll = new ChannelizedFrameRing(
+                prerollFrames + closeLookaheadFrames + CHANNELIZED_QUEUE_CAPACITY + 16,
+                pfb.branches());
         AirbandFrameProcessor processor = new AirbandFrameProcessor(
                 plan, preroll, prerollFrames, pfb.channelOutputRateHz(), config.opusSampleRateHz(),
-                SQUELCH_OPEN_DB, SQUELCH_CLOSE_DB, Clock.systemUTC());
+                config.squelchOpenDb(), config.squelchCloseDb(),
+                config.squelchOpenConfirmMillis(), config.squelchCloseLookaheadMillis());
         ChannelStatus status = processor.status();
         DebugWindow debug = DebugWindow.open(plan, pfb, status, config.waterfall(), config.channelWaterfall());
+        var channelizedQueue = new ArrayBlockingQueue<ChannelizedFrame>(CHANNELIZED_QUEUE_CAPACITY);
+        CaptureStats captureStats = new CaptureStats();
+        ChannelizerWorker channelizer = new ChannelizerWorker(
+                captureQueue, channelizedQueue, pfb, preroll, debug, captureStats);
 
-        try (DebugWindow debugWindow = debug;
-             LiquidPfbAnalyzer analyzer = new LiquidPfbAnalyzer(pfb);
+        try (AirbandFrameProcessor frameProcessor = processor;
+             DebugWindow debugWindow = debug;
              RecorderBank recorders = new RecorderBank(config.outputDirectory(), plan, true,
                      config.opusSampleRateHz(), config.opusBitrateBps(),
                      config.opusFrameMillis(), config.opusComplexity())) {
-            FFT waterfallFft = debugWindow.waterfall() == null ? null : new FFT(WATERFALL_FFT_SIZE);
-            float[] oneSample = new float[1];
-            int waterfallFill = 0;
             long lastStatusNanos = System.nanoTime();
-            CaptureStats captureStats = new CaptureStats();
+            long lastRepaintNanos = 0L;
             captureThread = Thread.ofPlatform().name("jarband-capture").start(capture);
+            channelizerThread = Thread.ofPlatform().name("jarband-channelizer").start(channelizer);
             while (!Thread.currentThread().isInterrupted()) {
-                NativeSampleBlock block = captureQueue.take();
-                if (block.isPoison()) {
+                ChannelizedFrame channelized = channelizedQueue.take();
+                if (channelized.isPoison()) {
+                    channelizer.throwIfFailed();
                     break;
                 }
-                captureStats.accept(block);
-                if (waterfallFft != null) {
-                    waterfallFill = updateWaterfall(block, waterfallFft, debugWindow.waterfall(), waterfallFill);
-                }
-                int frames = analyzer.framesIn(block);
-                for (int i = 0; i < frames; i++) {
-                    var channelized = analyzer.execute(block, i, preroll);
-                    if (debugWindow.channelSpectrum() != null) {
-                        debugWindow.channelSpectrum().accept(channelized);
-                    }
-                    processor.process(channelized, oneSample, recorders::accept);
-                }
-                debugWindow.repaintActivity();
+                frameProcessor.process(channelized, recorders);
                 long now = System.nanoTime();
+                if (now - lastRepaintNanos > 100_000_000L) {
+                    lastRepaintNanos = now;
+                    debugWindow.repaintActivity();
+                }
                 if (now - lastStatusNanos > 1_000_000_000L) {
                     lastStatusNanos = now;
+                    channelizer.throwIfFailed();
                     System.out.println(captureStats.statusAndReset());
                     System.out.printf("Squelch open: %,d / %,d channels, above threshold: %,d, max margin: %.1f dB%n",
-                            countOpen(status), plan.size(), countAboveMargin(status, SQUELCH_OPEN_DB), maxMargin(status));
+                            countOpen(status), plan.size(), countAboveMargin(status, config.squelchOpenDb()),
+                            maxMargin(status));
                 }
             }
         } finally {
@@ -114,6 +113,10 @@ public final class AirbandRecorder {
             if (captureThread != null) {
                 captureThread.interrupt();
                 captureThread.join(1000);
+            }
+            if (channelizerThread != null) {
+                channelizerThread.interrupt();
+                channelizerThread.join(1000);
             }
         }
     }
@@ -244,6 +247,74 @@ public final class AirbandRecorder {
         }
     }
 
+    private static final class ChannelizerWorker implements Runnable {
+        private final ArrayBlockingQueue<NativeSampleBlock> input;
+        private final ArrayBlockingQueue<ChannelizedFrame> output;
+        private final PfbConfig pfb;
+        private final ChannelizedFrameRing preroll;
+        private final DebugWindow debug;
+        private final CaptureStats captureStats;
+        private volatile Throwable failure;
+
+        ChannelizerWorker(ArrayBlockingQueue<NativeSampleBlock> input,
+                          ArrayBlockingQueue<ChannelizedFrame> output,
+                          PfbConfig pfb,
+                          ChannelizedFrameRing preroll,
+                          DebugWindow debug,
+                          CaptureStats captureStats) {
+            this.input = input;
+            this.output = output;
+            this.pfb = pfb;
+            this.preroll = preroll;
+            this.debug = debug;
+            this.captureStats = captureStats;
+        }
+
+        @Override
+        public void run() {
+            try (LiquidPfbAnalyzer analyzer = new LiquidPfbAnalyzer(pfb)) {
+                FFT waterfallFft = debug.waterfall() == null ? null : new FFT(WATERFALL_FFT_SIZE);
+                int waterfallFill = 0;
+                while (!Thread.currentThread().isInterrupted()) {
+                    NativeSampleBlock block = input.take();
+                    if (block.isPoison()) {
+                        break;
+                    }
+                    captureStats.accept(block);
+                    if (waterfallFft != null) {
+                        waterfallFill = updateWaterfall(block, waterfallFft, debug.waterfall(), waterfallFill);
+                    }
+                    int frames = analyzer.framesIn(block);
+                    for (int i = 0; i < frames; i++) {
+                        ChannelizedFrame channelized = analyzer.execute(block, i, preroll);
+                        if (debug.channelSpectrum() != null) {
+                            debug.channelSpectrum().accept(channelized);
+                        }
+                        output.put(channelized);
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Throwable t) {
+                failure = t;
+            } finally {
+                signalDone();
+            }
+        }
+
+        void throwIfFailed() {
+            if (failure != null) {
+                throw new IllegalStateException("Channelizer thread failed", failure);
+            }
+        }
+
+        private void signalDone() {
+            while (!output.offer(ChannelizedFrame.poison())) {
+                output.poll();
+            }
+        }
+    }
+
     private static final class ChannelSpectrumWaterfall implements AutoCloseable {
         private static final int NEIGHBOR_BINS = 129;
 
@@ -298,7 +369,7 @@ public final class AirbandRecorder {
         private double sumSquares;
         private float peak;
 
-        void accept(NativeSampleBlock block) {
+        synchronized void accept(NativeSampleBlock block) {
             MemorySegment samplesSegment = block.samples();
             int availableSamples = block.availableSampleCount();
             for (int n = 0; n < availableSamples; n += SAMPLE_STRIDE) {
@@ -315,7 +386,7 @@ public final class AirbandRecorder {
             }
         }
 
-        String statusAndReset() {
+        synchronized String statusAndReset() {
             double rms = samples == 0 ? 0.0 : Math.sqrt(sumSquares / samples);
             double clippedPercent = samples == 0 ? 0.0 : nearFullScale * 100.0 / samples;
             String status = String.format(java.util.Locale.ROOT,

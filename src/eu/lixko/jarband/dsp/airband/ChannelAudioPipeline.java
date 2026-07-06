@@ -6,52 +6,64 @@ final class ChannelAudioPipeline {
 
     private final AirbandAmDemodulator[] demods;
     private final LinearAudioResampler resampler;
-    private final float[][] inputBatches;
+    private final double inputRate;
+    private final float[][] iqBatches;
+    private final float[][] audioBatches;
     private final float[][] outputBatches;
-    private final int[] inputFill;
+    private final int[] iqFill;
 
     public ChannelAudioPipeline(int channels, double inputRate, int outputRate) {
+        this.inputRate = inputRate;
         this.demods = new AirbandAmDemodulator[channels];
         this.resampler = new LinearAudioResampler(channels, inputRate, outputRate);
-        this.inputBatches = new float[channels][INPUT_BATCH];
+        this.iqBatches = new float[channels][INPUT_BATCH * 2];
+        this.audioBatches = new float[channels][INPUT_BATCH];
         this.outputBatches = new float[channels][OUTPUT_BATCH];
-        this.inputFill = new int[channels];
-        for (int channel = 0; channel < channels; channel++) {
-            demods[channel] = new AirbandAmDemodulator(inputRate);
-        }
+        this.iqFill = new int[channels];
     }
 
     public void acceptIq(int channel, long unixMillis, float i, float q, AirbandFrameProcessor.AudioSink sink) {
-        acceptAudio(channel, unixMillis, demods[channel].demodulate(i, q), sink);
+        float[] iq = iqBatches[channel];
+        int offset = iqFill[channel] * 2;
+        iq[offset] = i;
+        iq[offset + 1] = q;
+        if (++iqFill[channel] == INPUT_BATCH) {
+            flush(channel, unixMillis, sink);
+        }
     }
 
     public void flush(int channel, long unixMillis, AirbandFrameProcessor.AudioSink sink) {
-        int count = inputFill[channel];
+        int count = iqFill[channel];
         if (count == 0) {
             return;
         }
+        AirbandAmDemodulator demod = demodulator(channel);
+        demod.demodulateBlock(iqBatches[channel], count, audioBatches[channel]);
         // Resample in small batches to keep the recorder path allocation-free and
         // avoid one native/resampler call per demodulated channel sample.
-        int produced = resampler.process(channel, inputBatches[channel], count, outputBatches[channel]);
-        inputFill[channel] = 0;
+        int produced = resampler.process(channel, audioBatches[channel], count, outputBatches[channel]);
+        iqFill[channel] = 0;
         if (produced > 0) {
-            sink.accept(channel, unixMillis, outputBatches[channel], produced);
+            sink.audio(channel, unixMillis, outputBatches[channel], produced);
         }
     }
 
     public void reset(int channel) {
         // Called when squelch closes. Any unflushed input is tail/noise by then,
         // so drop it instead of writing a final noisy fragment.
-        inputFill[channel] = 0;
+        iqFill[channel] = 0;
+        if (demods[channel] != null) {
+            demods[channel].reset();
+        }
         resampler.reset(channel);
     }
 
-    private void acceptAudio(int channel, long unixMillis, float audio, AirbandFrameProcessor.AudioSink sink) {
-        float[] input = inputBatches[channel];
-        input[inputFill[channel]++] = audio;
-        if (inputFill[channel] == input.length) {
-            flush(channel, unixMillis, sink);
+    private AirbandAmDemodulator demodulator(int channel) {
+        AirbandAmDemodulator demod = demods[channel];
+        if (demod == null) {
+            demod = new AirbandAmDemodulator(inputRate);
+            demods[channel] = demod;
         }
+        return demod;
     }
-
 }

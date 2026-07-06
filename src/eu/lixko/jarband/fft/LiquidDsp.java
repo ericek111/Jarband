@@ -559,7 +559,12 @@ public class LiquidDsp {
         ValueLayout.ADDRESS
     ));
     public static int msresamp_rrrf_destroy(MemorySegment q) {
-        return (int) NativeUtils.call(msresamp_rrrf_destroy, q);
+    	try {
+			return (int) msresamp_rrrf_destroy.HANDLE.invokeExact(q);
+		} catch (Throwable e) {
+			e.printStackTrace();
+			return -1;
+		}
     }
 
     private static ApiMethod msresamp_rrrf_reset = new ApiMethod("msresamp_rrrf_reset", FunctionDescriptor.of(
@@ -567,7 +572,12 @@ public class LiquidDsp {
         ValueLayout.ADDRESS
     ));
     public static int msresamp_rrrf_reset(MemorySegment q) {
-        return (int) NativeUtils.call(msresamp_rrrf_reset, q);
+    	try {
+			return (int) msresamp_rrrf_reset.HANDLE.invokeExact(q);
+		} catch (Throwable e) {
+			e.printStackTrace();
+			return -1;
+		}
     }
 
     private static ApiMethod msresamp_rrrf_execute = new ApiMethod("msresamp_rrrf_execute", FunctionDescriptor.of(
@@ -663,7 +673,12 @@ public class LiquidDsp {
         ValueLayout.ADDRESS
     ));
     public static int agc_crcf_reset(MemorySegment q) {
-        return (int) NativeUtils.call(agc_crcf_reset, q);
+    	try {
+			return (int) agc_crcf_reset.HANDLE.invokeExact(q);
+		} catch (Throwable e) {
+			e.printStackTrace();
+			return -1;
+		}
     }
 
     private static ApiMethod agc_crcf_set_bandwidth = new ApiMethod("agc_crcf_set_bandwidth", FunctionDescriptor.of(
@@ -672,7 +687,12 @@ public class LiquidDsp {
         ValueLayout.JAVA_FLOAT
     ));
     public static int agc_crcf_set_bandwidth(MemorySegment q, float bandwidth) {
-        return (int) NativeUtils.call(agc_crcf_set_bandwidth, q, bandwidth);
+    	try {
+			return (int) agc_crcf_set_bandwidth.HANDLE.invokeExact(q, bandwidth);
+		} catch (Throwable e) {
+			e.printStackTrace();
+			return -1;
+		}
     }
 
     private static ApiMethod agc_crcf_execute_block = new ApiMethod("agc_crcf_execute_block", FunctionDescriptor.of(
@@ -696,7 +716,12 @@ public class LiquidDsp {
         ValueLayout.ADDRESS
     ));
     public static float agc_crcf_get_gain(MemorySegment q) {
-        return (float) NativeUtils.call(agc_crcf_get_gain, q);
+    	try {
+			return (float) agc_crcf_get_gain.HANDLE.invokeExact(q);
+		} catch (Throwable e) {
+			e.printStackTrace();
+			return Float.NaN;
+		}
     }
     
     private static ApiMethod agc_crcf_get_rssi = new ApiMethod("agc_crcf_get_rssi", FunctionDescriptor.of(
@@ -704,9 +729,13 @@ public class LiquidDsp {
         ValueLayout.ADDRESS
     ));
     public static float agc_crcf_get_rssi(MemorySegment q) {
-        return (float) NativeUtils.call(agc_crcf_get_rssi, q);
+    	try {
+			return (float) agc_crcf_get_rssi.HANDLE.invokeExact(q);
+		} catch (Throwable e) {
+			e.printStackTrace();
+			return Float.NaN;
+		}
     }
-
 
     // ========== AGC (agc_rrrf) - Real AGC ==========
 

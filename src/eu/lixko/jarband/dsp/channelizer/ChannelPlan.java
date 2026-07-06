@@ -51,7 +51,7 @@ public record ChannelPlan(PfbConfig pfb, List<LogicalChannel> channels) {
             int[] bins = mergeBins.contains(bin)
                     ? new int[] { wrapBin(bin - 1, pfb.branches()), bin, wrapBin(bin + 1, pfb.branches()) }
                     : new int[] { bin };
-            channels.add(new LogicalChannel(id++, f, bins, channelName(f)));
+            channels.add(new LogicalChannel(id++, f, bins, channelName(f, bins.length == 3)));
         }
         return new ChannelPlan(pfb, List.copyOf(channels));
     }
@@ -71,8 +71,20 @@ public record ChannelPlan(PfbConfig pfb, List<LogicalChannel> channels) {
         return pfb.centerFrequency() + signedBin * pfb.branchSpacingHz();
     }
 
-    private static String channelName(double frequencyHz) {
-        return String.format(java.util.Locale.ROOT, "%.6fMHz", frequencyHz / 1_000_000.0);
+    private static String channelName(double frequencyHz, boolean merged25kHz) {
+        if (merged25kHz) {
+            return String.format(java.util.Locale.ROOT, "%.3f", frequencyHz / 1_000_000.0);
+        }
+
+        long hz = Math.round(frequencyHz);
+        long base25kHz = Math.floorDiv(hz, 25_000L) * 25_000L;
+        int offset = (int) Math.round((hz - base25kHz) / AIRBAND_RASTER_HZ);
+        long identifierHz = base25kHz + switch (Math.floorMod(offset, 3)) {
+            case 0 -> 5_000L;
+            case 1 -> 10_000L;
+            default -> 15_000L;
+        };
+        return String.format(java.util.Locale.ROOT, "%.3f", identifierHz / 1_000_000.0);
     }
 
     private static double alignUp(double frequencyHz, double rasterHz) {

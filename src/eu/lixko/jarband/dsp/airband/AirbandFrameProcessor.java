@@ -1,6 +1,5 @@
 package eu.lixko.jarband.dsp.airband;
 
-import java.time.Clock;
 import java.util.Arrays;
 
 import eu.lixko.jarband.dsp.channelizer.ChannelPlan;
@@ -8,15 +7,10 @@ import eu.lixko.jarband.dsp.channelizer.ChannelizedFrame;
 import eu.lixko.jarband.dsp.channelizer.ChannelizedFrameRing;
 import eu.lixko.jarband.dsp.channelizer.LogicalChannel;
 
-public final class AirbandFrameProcessor {
-    // Do not open the recorder for single-frame spikes. A real AM voice
-    // transmission has a carrier that stays up; short RF bursts are discarded.
-    private static final int OPEN_CONFIRM_MILLIS = 30;
-    // We intentionally delay writing by this much so the recorder can see the
-    // carrier drop and trim the tail instead of committing post-squelch noise.
-    private static final int CLOSE_LOOKAHEAD_MILLIS = 100;
+public final class AirbandFrameProcessor implements AutoCloseable {
     private static final float POWER_ALPHA = 0.005f;
     private static final int STATUS_DB_UPDATE_MASK = 0x7f;
+    private static final int NOISE_FLOOR_UPDATE_MASK = 0x0f;
 
     private final ChannelPlan plan;
     private final ChannelStatus status;
@@ -28,33 +22,40 @@ public final class AirbandFrameProcessor {
     private final int closeLookaheadFrames;
     private final ChannelRuntimeState channels;
     private final ChannelAudioPipeline audio;
-    private final Clock clock;
+    private final long wallClockAnchorMillis;
+    private final long nanoTimeAnchor;
 
     public AirbandFrameProcessor(ChannelPlan plan, ChannelizedFrameRing preroll, int prerollFrames,
                                  double channelSampleRate, int audioSampleRate,
-                                 float squelchOpenDb, float squelchCloseDb, Clock clock) {
+                                 float squelchOpenDb, float squelchCloseDb,
+                                 int openConfirmMillis, int closeLookaheadMillis) {
         this.plan = plan;
         this.status = new ChannelStatus(plan.size());
         this.squelchOpenRatio = dbToPowerRatio(squelchOpenDb);
         this.squelchCloseRatio = dbToPowerRatio(squelchCloseDb);
         this.preroll = preroll;
         this.prerollFrames = prerollFrames;
-        this.openConfirmFrames = Math.max(1, (int) Math.ceil(channelSampleRate * OPEN_CONFIRM_MILLIS / 1000.0));
-        this.closeLookaheadFrames = Math.max(1, (int) Math.ceil(channelSampleRate * CLOSE_LOOKAHEAD_MILLIS / 1000.0));
+        this.openConfirmFrames = Math.max(1, (int) Math.ceil(channelSampleRate * openConfirmMillis / 1000.0));
+        this.closeLookaheadFrames = Math.max(1, (int) Math.ceil(channelSampleRate * closeLookaheadMillis / 1000.0));
         this.channels = new ChannelRuntimeState(plan.size());
         this.audio = new ChannelAudioPipeline(plan.size(), channelSampleRate, audioSampleRate);
-        this.clock = clock;
+        this.wallClockAnchorMillis = System.currentTimeMillis();
+        this.nanoTimeAnchor = System.nanoTime();
     }
 
     public ChannelStatus status() {
         return status;
     }
 
-    public int process(ChannelizedFrame frame, float[] activeAudioScratch, AudioSink sink) {
-        long now = clock.millis();
+    @Override
+    public void close() {
+    }
+
+    public int process(ChannelizedFrame frame, AudioSink sink) {
         long sequence = frame.sequence();
         // First pass extracts one complex sample per logical channel and measures
-        // power for the entire band. The median becomes our per-frame noise floor.
+        // power for the entire band. Squelch still uses per-frame channel power,
+        // but the band noise floor is intentionally updated at a lower rate.
         for (LogicalChannel channel : plan.channels()) {
             int channelId = channel.id();
             float i = 0.0f;
@@ -70,23 +71,26 @@ public final class AirbandFrameProcessor {
         }
 
         int active = 0;
-        float bandNoiseFloor = median(channels.power, channels.medianScratch);
+        float bandNoiseFloor = channels.bandNoiseFloor;
+        if (!Float.isFinite(bandNoiseFloor) || (sequence & NOISE_FLOOR_UPDATE_MASK) == 0) {
+            bandNoiseFloor = median(channels.power, channels.medianScratch);
+            channels.bandNoiseFloor = bandNoiseFloor;
+        }
         boolean updateStatusDb = (sequence & STATUS_DB_UPDATE_MASK) == 0;
         for (LogicalChannel channel : plan.channels()) {
             int channelId = channel.id();
             if (updateStatusDb) {
                 updateStatusPower(channelId, bandNoiseFloor);
             }
-            if (updateGate(channel, sequence, frame.capturedNanos(), now, bandNoiseFloor, activeAudioScratch, sink)) {
+            if (updateGate(channel, sequence, frame.capturedNanos(), bandNoiseFloor, sink)) {
                 active++;
             }
         }
         return active;
     }
 
-    private boolean updateGate(LogicalChannel channel, long sequence, long currentNanos, long nowMillis,
-                               float bandNoiseFloor, float[] activeAudioScratch,
-                               AudioSink sink) {
+    private boolean updateGate(LogicalChannel channel, long sequence, long currentNanos,
+                               float bandNoiseFloor, AudioSink sink) {
         int channelId = channel.id();
         float thresholdBase = Math.max(bandNoiseFloor, 1.0e-20f);
         boolean aboveOpen = channels.power[channelId] >= thresholdBase * squelchOpenRatio;
@@ -103,7 +107,7 @@ public final class AirbandFrameProcessor {
                     // The signal survived the confirmation window. Start from
                     // the original carrier rise, with only a small pre-roll to
                     // cover detector/PFB latency instead of saving idle noise.
-                    openGate(channelId, sequence, nowMillis);
+                    openGate(channelId, sequence);
                 }
             } else {
                 channels.openRunFrames[channelId] = 0;
@@ -117,24 +121,25 @@ public final class AirbandFrameProcessor {
             channels.lastSignalSequence[channelId] = sequence;
         }
 
+        if (!aboveClose && sequence - channels.lastSignalSequence[channelId] >= closeLookaheadFrames) {
+            // The carrier has been gone for the whole lookahead window. Emit up
+            // to the last carrier-positive frame and discard only samples that
+            // remained buffered after that trusted range.
+            emitRange(channel, channels.nextEmitSequence[channelId], channels.lastSignalSequence[channelId] + 1,
+                    sink);
+            closeGate(channelId, unixMillisForNanos(currentNanos), sink);
+            return false;
+        }
+
         // Only frames older than the lookahead window are safe to write. Newer
         // frames might turn out to be tail noise if the carrier does not return.
         long safeEndExclusive = Math.min(channels.lastSignalSequence[channelId] + 1,
                 sequence - closeLookaheadFrames + 1);
-        emitRange(channel, channels.nextEmitSequence[channelId], safeEndExclusive, currentNanos, nowMillis, sink);
-
-        if (!aboveClose && sequence - channels.lastSignalSequence[channelId] >= closeLookaheadFrames) {
-            // The carrier has been gone for the whole lookahead window. Flush up
-            // to the last carrier-positive frame and discard everything after it.
-            emitRange(channel, channels.nextEmitSequence[channelId], channels.lastSignalSequence[channelId] + 1,
-                    currentNanos, nowMillis, sink);
-            closeGate(channelId, nowMillis, activeAudioScratch, sink);
-            return false;
-        }
+        emitRange(channel, channels.nextEmitSequence[channelId], safeEndExclusive, sink);
         return true;
     }
 
-    private void openGate(int channelId, long sequence, long nowMillis) {
+    private void openGate(int channelId, long sequence) {
         channels.gateOpen[channelId] = true;
         status.squelchState[channelId] = ChannelStatus.OPEN;
         channels.nextEmitSequence[channelId] = Math.max(channels.candidateStartSequence[channelId] - prerollFrames,
@@ -143,8 +148,11 @@ public final class AirbandFrameProcessor {
         channels.openRunFrames[channelId] = 0;
     }
 
-    private void closeGate(int channelId, long nowMillis, float[] activeAudioScratch, AudioSink sink) {
-        audio.flush(channelId, nowMillis, sink);
+    private void closeGate(int channelId, long unixMillis, AudioSink sink) {
+        // Do not flush the final partial DSP batch here. At close time the
+        // delayed gate has already emitted every frame it trusts; any samples
+        // still buffered are exactly the edge material users hear as squelch
+        // tail, so drop them.
         audio.reset(channelId);
         channels.gateOpen[channelId] = false;
         status.squelchState[channelId] = ChannelStatus.CLOSED;
@@ -152,11 +160,11 @@ public final class AirbandFrameProcessor {
         channels.candidateStartSequence[channelId] = -1L;
         channels.lastSignalSequence[channelId] = -1L;
         channels.nextEmitSequence[channelId] = -1L;
-        sink.accept(channelId, nowMillis, activeAudioScratch, 0);
+        sink.closeUtterance(channelId, unixMillis);
     }
 
     private void emitRange(LogicalChannel channel, long firstSequence, long lastSequenceExclusive,
-                           long currentNanos, long nowMillis, AudioSink sink) {
+                           AudioSink sink) {
         int channelId = channel.id();
         if (firstSequence < 0 || lastSequenceExclusive <= firstSequence) {
             return;
@@ -168,7 +176,7 @@ public final class AirbandFrameProcessor {
         // Replay from the shared channelized-spectrum ring. We do not store audio
         // in the ring; demodulation happens only after a range is proven useful.
         preroll.replay(channel, first, lastSequenceExclusive, (i, q, capturedNanos) -> {
-            long sampleMillis = nowMillis - Math.max(0L, currentNanos - capturedNanos) / 1_000_000L;
+            long sampleMillis = unixMillisForNanos(capturedNanos);
             audio.acceptIq(channelId, sampleMillis, i, q, sink);
         });
         channels.emittedThroughSequence[channelId] = lastSequenceExclusive - 1;
@@ -197,9 +205,14 @@ public final class AirbandFrameProcessor {
         return 10.0f * (float) Math.log10(Math.max(power, 1.0e-20f));
     }
 
-    @FunctionalInterface
+    private long unixMillisForNanos(long capturedNanos) {
+        return wallClockAnchorMillis + (capturedNanos - nanoTimeAnchor) / 1_000_000L;
+    }
+
     public interface AudioSink {
-        void accept(int channelId, long unixMillis, float[] audio, int length);
+        void audio(int channelId, long unixMillis, float[] audio, int length);
+
+        void closeUtterance(int channelId, long unixMillis);
     }
 
     public static final class ChannelStatus {
@@ -235,6 +248,7 @@ public final class AirbandFrameProcessor {
         final float[] q;
         final float[] power;
         final float[] medianScratch;
+        float bandNoiseFloor = Float.NaN;
 
         ChannelRuntimeState(int channelCount) {
             gateOpen = new boolean[channelCount];
@@ -255,16 +269,10 @@ public final class AirbandFrameProcessor {
     }
 
     private static float median(float[] values, float[] scratch) {
-        int count = 0;
-        for (float value : values) {
-            if (Float.isFinite(value)) {
-                scratch[count++] = value;
-            }
-        }
-        if (count == 0) {
-            return Float.NaN;
-        }
-        return select(scratch, 0, count - 1, count / 2);
+        // measurePower() always writes finite positive values, so avoid a
+        // per-channel isFinite branch in this hot path.
+        System.arraycopy(values, 0, scratch, 0, values.length);
+        return select(scratch, 0, values.length - 1, values.length / 2);
     }
 
     private static float select(float[] values, int left, int right, int k) {

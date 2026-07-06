@@ -26,25 +26,29 @@ public final class AirbandAmDemodulator {
         this.lowPass = FirFilter.lowPass(usableBandwidth * 0.5, usableBandwidth * 0.05, sampleRate);
     }
 
-    public float demodulate(float i, float q) {
-        // SDR++ AM: carrier AGC, when enabled, runs on complex IQ before envelope detection.
-        // In carrier-AGC mode SDR++ skips the post-envelope audio AGC, so this port does too.
+    public int demodulateBlock(float[] interleavedIq, int count, float[] audioOut) {
+        // Stage 1: normalize the complex carrier before envelope detection.
+        // SDR++ skips post-envelope audio AGC when carrier AGC is enabled.
         if (CARRIER_AGC) {
-            float gain = carrierAgc.gain(i, q);
-            i *= gain;
-            q *= gain;
+            carrierAgc.apply(interleavedIq, count);
+            dcBlock.envelopeToAudio(interleavedIq, count, audioOut);
+        } else {
+            dcBlock.envelopeToAudio(interleavedIq, count, audioOut);
+            audioAgc.apply(audioOut, count);
         }
-        float audio = (float) Math.sqrt(i * i + q * q);
-        audio = dcBlock.process(audio);
-        if (!CARRIER_AGC) {
-            audio = audioAgc.process(audio);
+
+        // Stage 2: remove high-frequency envelope artifacts before resampling.
+        lowPass.process(audioOut, count);
+
+        // Stage 3: keep Opus input comfortably below full-scale.
+        for (int n = 0; n < count; n++) {
+            float scaled = audioOut[n] * OUTPUT_GAIN;
+            audioOut[n] = scaled > OUTPUT_LIMIT ? OUTPUT_LIMIT : Math.max(scaled, -OUTPUT_LIMIT);
         }
-        audio = lowPass.process(audio);
-        return clamp(audio * OUTPUT_GAIN, -OUTPUT_LIMIT, OUTPUT_LIMIT);
+        return count;
     }
 
-    private static float clamp(float value, float min, float max) {
-        return Math.max(min, Math.min(max, value));
+    public void reset() {
     }
 
     private static final class DcBlocker {
@@ -55,11 +59,19 @@ public final class AirbandAmDemodulator {
             this.rate = (float) rate;
         }
 
-        float process(float sample) {
-            float corrected = sample - average;
-            // SDR++ integrates the corrected sample, not the raw input error.
-            average += corrected * rate;
-            return corrected;
+        void envelopeToAudio(float[] interleavedIq, int count, float[] audioOut) {
+            float average = this.average;
+            float rate = this.rate;
+            for (int n = 0; n < count; n++) {
+                float i = interleavedIq[n * 2];
+                float q = interleavedIq[n * 2 + 1];
+                float envelope = (float) Math.sqrt(i * i + q * q);
+                float corrected = envelope - average;
+                // SDR++ integrates the corrected output, not the raw envelope error.
+                average += corrected * rate;
+                audioOut[n] = corrected;
+            }
+            this.average = average;
         }
     }
 
@@ -81,25 +93,31 @@ public final class AirbandAmDemodulator {
             this.invDecay = 1.0f - this.decay;
         }
 
-        float process(float sample) {
-            float inAmp = Math.abs(sample);
-            float gain;
-            if (inAmp != 0.0f) {
-                amp = inAmp > amp
-                        ? amp * invAttack + inAmp * attack
-                        : amp * invDecay + inAmp * decay;
-                gain = Math.min(SET_POINT / amp, MAX_GAIN);
-            } else {
-                gain = 1.0f;
+        void apply(float[] samples, int count) {
+            // Keep these in locals for the block and write back once; this keeps
+            // the loop readable without turning each sample into tiny method calls.
+            float amp = this.amp;
+            float attack = this.attack;
+            float invAttack = this.invAttack;
+            float decay = this.decay;
+            float invDecay = this.invDecay;
+            for (int n = 0; n < count; n++) {
+                float sample = samples[n];
+                float inAmp = Math.abs(sample);
+                float gain = 1.0f;
+                if (inAmp != 0.0f) {
+                    amp = inAmp > amp
+                            ? amp * invAttack + inAmp * attack
+                            : amp * invDecay + inAmp * decay;
+                    gain = Math.min(SET_POINT / amp, MAX_GAIN);
+                }
+                if (inAmp * gain > MAX_OUTPUT_AMP) {
+                    amp = inAmp;
+                    gain = Math.min(SET_POINT / amp, MAX_GAIN);
+                }
+                samples[n] = sample * gain;
             }
-
-            // The C++ block can scan ahead inside a buffer before a clip. With one-sample
-            // streaming we can only correct the current sample, but we preserve the limit.
-            if (inAmp * gain > MAX_OUTPUT_AMP) {
-                amp = inAmp;
-                gain = Math.min(SET_POINT / amp, MAX_GAIN);
-            }
-            return sample * gain;
+            this.amp = amp;
         }
     }
 
@@ -121,28 +139,38 @@ public final class AirbandAmDemodulator {
             this.invDecay = 1.0f - this.decay;
         }
 
-        float gain(float i, float q) {
-            float inAmp = (float) Math.sqrt(i * i + q * q);
-            if (inAmp == 0.0f) {
-                return 1.0f;
+        void apply(float[] interleavedIq, int count) {
+            // Carrier AGC runs before envelope detection. It normalizes carrier
+            // level while preserving AM envelope enough for voice demodulation.
+            float amp = this.amp;
+            float attack = this.attack;
+            float invAttack = this.invAttack;
+            float decay = this.decay;
+            float invDecay = this.invDecay;
+            for (int n = 0; n < count; n++) {
+                int offset = n * 2;
+                float i = interleavedIq[offset];
+                float q = interleavedIq[offset + 1];
+                float inAmp = (float) Math.sqrt(i * i + q * q);
+                if (inAmp == 0.0f) {
+                    continue;
+                }
+                if (amp == 0.0f) {
+                    amp = inAmp;
+                } else {
+                    amp = inAmp > amp
+                            ? amp * invAttack + inAmp * attack
+                            : amp * invDecay + inAmp * decay;
+                }
+                float gain = Math.min(SET_POINT / amp, MAX_GAIN);
+                if (inAmp * gain > MAX_OUTPUT_AMP) {
+                    amp = inAmp;
+                    gain = Math.min(SET_POINT / amp, MAX_GAIN);
+                }
+                interleavedIq[offset] = i * gain;
+                interleavedIq[offset + 1] = q * gain;
             }
-
-            if (amp == 0.0f) {
-                amp = inAmp;
-            } else {
-                amp = inAmp > amp
-                        ? amp * invAttack + inAmp * attack
-                        : amp * invDecay + inAmp * decay;
-            }
-            float gain = Math.min(SET_POINT / amp, MAX_GAIN);
-
-            // SDR++ scans the rest of the current buffer before clipping; this streaming
-            // port can only clamp against the current complex sample.
-            if (inAmp * gain > MAX_OUTPUT_AMP) {
-                amp = inAmp;
-                gain = Math.min(SET_POINT / amp, MAX_GAIN);
-            }
-            return gain;
+            this.amp = amp;
         }
     }
 
@@ -179,20 +207,27 @@ public final class AirbandAmDemodulator {
             return new FirFilter(taps);
         }
 
-        float process(float sample) {
-            delay[pos] = sample;
-            float acc = 0.0f;
-            int idx = pos;
-            for (float tap : taps) {
-                acc += tap * delay[idx];
-                if (--idx < 0) {
-                    idx = delay.length - 1;
+        void process(float[] samples, int count) {
+            float[] taps = this.taps;
+            float[] delay = this.delay;
+            int pos = this.pos;
+            int delayLength = delay.length;
+            for (int n = 0; n < count; n++) {
+                delay[pos] = samples[n];
+                float acc = 0.0f;
+                int idx = pos;
+                for (float tap : taps) {
+                    acc += tap * delay[idx];
+                    if (--idx < 0) {
+                        idx = delayLength - 1;
+                    }
+                }
+                samples[n] = acc;
+                if (++pos == delayLength) {
+                    pos = 0;
                 }
             }
-            if (++pos == delay.length) {
-                pos = 0;
-            }
-            return acc;
+            this.pos = pos;
         }
 
         private static double sinc(double x) {
@@ -208,4 +243,5 @@ public final class AirbandAmDemodulator {
             return a0 - a1 * Math.cos(x) + a2 * Math.cos(2.0 * x) - a3 * Math.cos(3.0 * x);
         }
     }
+
 }

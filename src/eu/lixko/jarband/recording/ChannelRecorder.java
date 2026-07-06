@@ -2,10 +2,17 @@ package eu.lixko.jarband.recording;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.Locale;
 
 import eu.lixko.jarband.dsp.channelizer.LogicalChannel;
 
 public final class ChannelRecorder implements AutoCloseable {
+    private static final DateTimeFormatter WEEKLY_ROTATION_FORMAT =
+            DateTimeFormatter.ofPattern("YYYY-'w'ww", Locale.ROOT).withZone(ZoneOffset.UTC);
+
     private final Path outputDir;
     private final LogicalChannel channel;
     private final boolean weeklyRotation;
@@ -38,6 +45,9 @@ public final class ChannelRecorder implements AutoCloseable {
             utteranceOpen = true;
         } else if (!open) {
             utteranceOpen = false;
+            // Keep utterances independent and avoid carrying a partial Opus
+            // frame, often containing squelch-edge noise, into the next one.
+            frameFill = 0;
         }
         if (!open) {
             return;
@@ -52,8 +62,16 @@ public final class ChannelRecorder implements AutoCloseable {
         }
     }
 
+    public synchronized void closeUtterance(long unixMillis) throws IOException {
+        rotateIfNeeded(unixMillis);
+        utteranceOpen = false;
+        // Keep utterances independent and avoid carrying a partial Opus frame,
+        // often containing squelch-edge noise, into the next one.
+        frameFill = 0;
+    }
+
     private void rotateIfNeeded(long unixMillis) throws IOException {
-        String next = weeklyRotation ? WeeklyRotation.key(unixMillis) : "current";
+        String next = weeklyRotation ? weeklyRotationKey(unixMillis) : "current";
         if (next.equals(rotationKey)) {
             return;
         }
@@ -64,6 +82,10 @@ public final class ChannelRecorder implements AutoCloseable {
         dbFile = new UtteranceDbWriter(channelDir.resolve(rotationKey + ".udb"));
         utteranceOpen = false;
         frameFill = 0;
+    }
+
+    private static String weeklyRotationKey(long unixMillis) {
+        return WEEKLY_ROTATION_FORMAT.format(Instant.ofEpochMilli(unixMillis));
     }
 
     private void closeFiles() throws IOException {

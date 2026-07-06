@@ -1,15 +1,31 @@
 package eu.lixko.jarband.dsp.channelizer;
 
 public final class ChannelizedFrame {
+    private static final ChannelizedFrame POISON = new ChannelizedFrame(new float[0], 0, true);
+
     private final float[] interleavedIqByBin;
     private final int branchCount;
+    private final boolean poison;
     private long sequence;
     private long sourceSampleIndex;
     private long capturedNanos;
 
     ChannelizedFrame(float[] interleavedIqByBin, int branchCount) {
+        this(interleavedIqByBin, branchCount, false);
+    }
+
+    private ChannelizedFrame(float[] interleavedIqByBin, int branchCount, boolean poison) {
         this.interleavedIqByBin = interleavedIqByBin;
         this.branchCount = branchCount;
+        this.poison = poison;
+    }
+
+    public static ChannelizedFrame poison() {
+        return POISON;
+    }
+
+    public boolean isPoison() {
+        return poison;
     }
 
     void reset(long sequence, long sourceSampleIndex, long capturedNanos) {

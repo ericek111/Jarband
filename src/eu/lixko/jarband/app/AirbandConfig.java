@@ -25,6 +25,15 @@ public record AirbandConfig(
         int opusBitrateBps,
         int opusFrameMillis,
         int opusComplexity,
+        float squelchOpenDb,
+        float squelchCloseDb,
+        // Do not open the recorder for single-frame spikes. A real AM voice
+        // transmission has a carrier that stays up; short RF bursts are discarded.
+        int squelchOpenConfirmMillis,
+        // Delay writing by this much so the recorder can see the carrier drop
+        // and trim the tail instead of committing post-squelch noise.
+        int squelchCloseLookaheadMillis,
+        int squelchPrerollMillis,
         boolean waterfall,
         boolean channelWaterfall) {
 
@@ -42,6 +51,11 @@ public record AirbandConfig(
             24_000,
             20,
             5,
+            18.0f,
+            18.0f,
+            30,
+            100,
+            80,
             false,
             false);
 
@@ -72,6 +86,11 @@ public record AirbandConfig(
                 (int) number(toml, "opus.bitrate_bps", DEFAULTS.opusBitrateBps),
                 (int) number(toml, "opus.frame_millis", DEFAULTS.opusFrameMillis),
                 (int) number(toml, "opus.complexity", DEFAULTS.opusComplexity),
+                (float) number(toml, "squelch.open_db", DEFAULTS.squelchOpenDb),
+                (float) number(toml, "squelch.close_db", DEFAULTS.squelchCloseDb),
+                (int) number(toml, "squelch.open_confirm_millis", DEFAULTS.squelchOpenConfirmMillis),
+                (int) number(toml, "squelch.close_lookahead_millis", DEFAULTS.squelchCloseLookaheadMillis),
+                (int) number(toml, "squelch.preroll_millis", DEFAULTS.squelchPrerollMillis),
                 bool(toml, "debug.waterfall", DEFAULTS.waterfall),
                 bool(toml, "debug.channel_waterfall", DEFAULTS.channelWaterfall));
     }
