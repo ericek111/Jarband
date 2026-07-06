@@ -21,6 +21,7 @@ import eu.lixko.jarband.dsp.channelizer.ChannelizedFrame;
 import eu.lixko.jarband.dsp.channelizer.LiquidPfbAnalyzer;
 import eu.lixko.jarband.dsp.channelizer.LogicalChannel;
 import eu.lixko.jarband.dsp.channelizer.PfbConfig;
+import eu.lixko.jarband.dsp.vdl2.Vdl2Processor;
 import eu.lixko.jarband.gui.ChannelActivityPanel;
 import eu.lixko.jarband.gui.WaterfallPanel;
 import eu.lixko.jarband.recording.RecorderBank;
@@ -84,8 +85,18 @@ public final class AirbandRecorder {
         DebugWindow debug = DebugWindow.open(plan, pfb, status, config.waterfall(), config.channelWaterfall());
         var channelizedQueue = new ArrayBlockingQueue<ChannelizedFrame>(CHANNELIZED_QUEUE_CAPACITY);
         CaptureStats captureStats = new CaptureStats();
+        Vdl2Processor vdl2 = config.vdl2Enabled()
+                ? new Vdl2Processor(config.sampleRateHz(), config.centerFrequencyHz(),
+                        config.vdl2FrequenciesHz(), config.vdl2Output())
+                : null;
+        if (vdl2 != null) {
+            System.out.printf("VDL2 demod enabled: %,d channels -> %s:%d%n",
+                    config.vdl2FrequenciesHz().size(),
+                    config.vdl2Output().getHostString(),
+                    config.vdl2Output().getPort());
+        }
         ChannelizerWorker channelizer = new ChannelizerWorker(
-                captureQueue, channelizedQueue, pfb, preroll, debug, captureStats);
+                captureQueue, channelizedQueue, pfb, preroll, debug, captureStats, vdl2);
 
         try (AirbandFrameProcessor frameProcessor = processor;
              DebugWindow debugWindow = debug;
@@ -263,6 +274,7 @@ public final class AirbandRecorder {
         private final ChannelizedFrameRing preroll;
         private final DebugWindow debug;
         private final CaptureStats captureStats;
+        private final Vdl2Processor vdl2;
         private volatile Throwable failure;
 
         ChannelizerWorker(ArrayBlockingQueue<NativeSampleBlock> input,
@@ -270,13 +282,15 @@ public final class AirbandRecorder {
                           PfbConfig pfb,
                           ChannelizedFrameRing preroll,
                           DebugWindow debug,
-                          CaptureStats captureStats) {
+                          CaptureStats captureStats,
+                          Vdl2Processor vdl2) {
             this.input = input;
             this.output = output;
             this.pfb = pfb;
             this.preroll = preroll;
             this.debug = debug;
             this.captureStats = captureStats;
+            this.vdl2 = vdl2;
         }
 
         @Override
@@ -290,6 +304,9 @@ public final class AirbandRecorder {
                         break;
                     }
                     captureStats.accept(block);
+                    if (vdl2 != null) {
+                        vdl2.process(block);
+                    }
                     if (waterfallFft != null) {
                         waterfallFill = updateWaterfall(block, waterfallFft, debug.waterfall(), waterfallFill);
                     }
@@ -307,6 +324,15 @@ public final class AirbandRecorder {
             } catch (Throwable t) {
                 failure = t;
             } finally {
+                if (vdl2 != null) {
+                    try {
+                        vdl2.close();
+                    } catch (Exception e) {
+                        if (failure == null) {
+                            failure = e;
+                        }
+                    }
+                }
                 signalDone();
             }
         }

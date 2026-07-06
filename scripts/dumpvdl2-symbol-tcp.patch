@@ -1,0 +1,183 @@
+diff --git a/src/input-raw_frames_file.c b/src/input-raw_frames_file.c
+index aafbde8..bbba4d5 100644
+--- a/src/input-raw_frames_file.c
++++ b/src/input-raw_frames_file.c
+@@ -20,15 +20,167 @@
+ #include <stdint.h>
+ #include <stdio.h>                  // FILE, fopen, fclose, fread
+ #include <string.h>                 // memcpy
++#include <stdlib.h>                 // strtol
++#include <math.h>
+ #include <arpa/inet.h>              // ntohs
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <unistd.h>
+ #include "dumpvdl2.pb-c.h"
++#include "decode.h"                 // decode_vdl2_burst
+ #include "output-common.h"          // vdl2_msg_metadata
+ #include "output-file.h"            // OUT_BINARY_FRAME_LEN_MAX, OUT_FILE_FRAME_LEN_OCTETS
+-#include "decode.h"                 // avlc_decoder_queue_push
+ #include "dumpvdl2.h"               // ASSERT, do_exit
+ 
+ #define BUF_SIZE (3 * OUT_BINARY_FRAME_LEN_MAX)
+ #define READ_SIZE (2 * OUT_BINARY_FRAME_LEN_MAX)
++#define SYMBOL_STREAM_MAGIC "JV2S"
++#define SYMBOL_STREAM_VERSION 1
++#define SYMBOL_HEADER_LEN 30
++#define SYMBOL_MAX_BATCH 512
++
++typedef struct {
++	uint32_t freq;
++	vdl2_channel_t *channel;
++} symbol_channel_t;
++
++static uint32_t read_u32_be(uint8_t const *p) {
++	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++}
++
++static uint16_t read_u16_be(uint8_t const *p) {
++	return ((uint16_t)p[0] << 8) | p[1];
++}
++
++static int64_t read_i64_be(uint8_t const *p) {
++	uint64_t v = 0;
++	for(int i = 0; i < 8; i++) v = (v << 8) | p[i];
++	return (int64_t)v;
++}
++
++static float read_f32_be(uint8_t const *p) {
++	uint32_t u = read_u32_be(p);
++	float f;
++	memcpy(&f, &u, sizeof(f));
++	return f;
++}
++
++static int read_exact(int fd, uint8_t *buf, size_t len) {
++	size_t done = 0;
++	while(done < len && do_exit == 0) {
++		ssize_t n = read(fd, buf + done, len - done);
++		if(n == 0) return 0;
++		if(n < 0) return -1;
++		done += (size_t)n;
++	}
++	return done == len ? 1 : 0;
++}
++
++static int listen_one(char const *spec) {
++	char *end = NULL;
++	long port = strtol(spec, &end, 10);
++	if(end == spec || *end != '\0' || port <= 0 || port > 65535) {
++		fprintf(stderr, "Invalid symbols-tcp-listen port: %s\n", spec);
++		return -1;
++	}
++	int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
++	if(listen_fd < 0) { perror("socket"); return -1; }
++	int one = 1;
++	setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++	struct sockaddr_in addr = {
++		.sin_family = AF_INET,
++		.sin_addr.s_addr = htonl(INADDR_ANY),
++		.sin_port = htons((uint16_t)port)
++	};
++	if(bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
++		perror("bind"); close(listen_fd); return -1;
++	}
++	if(listen(listen_fd, 1) < 0) {
++		perror("listen"); close(listen_fd); return -1;
++	}
++	fprintf(stderr, "Listening for Jarband VDL2 symbols on TCP port %ld\n", port);
++	int fd = accept(listen_fd, NULL, NULL);
++	close(listen_fd);
++	if(fd < 0) perror("accept");
++	return fd;
++}
++
++static vdl2_channel_t *symbol_channel(symbol_channel_t *channels, size_t *num_channels, uint32_t freq) {
++	for(size_t i = 0; i < *num_channels; i++) {
++		if(channels[i].freq == freq) return channels[i].channel;
++	}
++	if(*num_channels >= 64) return NULL;
++	vdl2_channel_t *v = vdl2_channel_init(freq, freq, SYMBOL_RATE * SPS, 1);
++	if(v == NULL) return NULL;
++	channels[*num_channels].freq = freq;
++	channels[*num_channels].channel = v;
++	(*num_channels)++;
++	return v;
++}
++
++static void update_symbol_metadata(vdl2_channel_t *v, int64_t unix_millis,
++		float frame_power_dbfs, float nf_power_dbfs, float ppm_error) {
++	v->frame_pwr = powf(10.0f, frame_power_dbfs / 10.0f);
++	v->frame_pwr_cnt = 1;
++	v->mag_nf = fmaxf(0.0f, powf(10.0f, nf_power_dbfs / 20.0f) - 0.001f);
++	v->ppm_error = ppm_error;
++	v->burst_timestamp.tv_sec = unix_millis / 1000;
++	v->burst_timestamp.tv_usec = (unix_millis % 1000) * 1000;
++}
++
++static void decoder_reset_for_symbols(vdl2_channel_t *v, int64_t unix_millis,
++		float frame_power_dbfs, float nf_power_dbfs, float ppm_error) {
++	v->decoder_state = DEC_HEADER;
++	v->requested_bits = HEADER_LEN;
++	v->num_fec_corrections = 0;
++	update_symbol_metadata(v, unix_millis, frame_power_dbfs, nf_power_dbfs, ppm_error);
++	bitstream_reset(v->bs);
++	bitstream_reset(v->frame_bs);
++}
++
++static int process_symbol_stream(char const *spec) {
++	int fd = listen_one(spec);
++	if(fd < 0) return 2;
++	uint8_t magic[4], version;
++	if(read_exact(fd, magic, 4) != 1 || memcmp(magic, SYMBOL_STREAM_MAGIC, 4) != 0 ||
++			read_exact(fd, &version, 1) != 1 || version != SYMBOL_STREAM_VERSION) {
++		fprintf(stderr, "Invalid Jarband VDL2 symbol stream header\n");
++		close(fd);
++		return 3;
++	}
++	symbol_channel_t channels[64] = { 0 };
++	size_t num_channels = 0;
++	uint8_t header[SYMBOL_HEADER_LEN];
++	uint8_t symbols[SYMBOL_MAX_BATCH];
++	while(do_exit == 0 && read_exact(fd, header, sizeof(header)) == 1) {
++		uint32_t freq = read_u32_be(header);
++		int64_t unix_millis = read_i64_be(header + 4);
++		float frame_power_dbfs = read_f32_be(header + 12);
++		float nf_power_dbfs = read_f32_be(header + 16);
++		float ppm_error = read_f32_be(header + 20);
++		uint16_t count = read_u16_be(header + 24);
++		if(count > sizeof(symbols) || read_exact(fd, symbols, count) != 1) break;
++		vdl2_channel_t *v = symbol_channel(channels, &num_channels, freq);
++		if(v == NULL) continue;
++		if(v->decoder_state == DEC_IDLE) {
++			decoder_reset_for_symbols(v, unix_millis, frame_power_dbfs, nf_power_dbfs, ppm_error);
++		} else {
++			update_symbol_metadata(v, unix_millis, frame_power_dbfs, nf_power_dbfs, ppm_error);
++		}
++		for(uint16_t i = 0; i < count; i++) {
++			uint8_t symbol = symbols[i] & 0x07;
++			if(bitstream_append_msbfirst(v->bs, &symbol, 1, BPS) < 0) {
++				v->decoder_state = DEC_IDLE;
++				break;
++			}
++			if(v->bs->end - v->bs->start >= v->requested_bits) {
++				decode_vdl2_burst(v);
++			}
++		}
++	}
++	close(fd);
++	return 0;
++}
+ 
+ static int process_frame(uint8_t *buf, size_t len) {
+ 	ASSERT(buf != NULL);
+@@ -108,6 +260,9 @@ static int input_raw_frames_file_process_unbuffered(FILE* fh) {
+ 
+ int input_raw_frames_file_process(char const *file) {
+ 	ASSERT(file != NULL);
++	if(!strncmp(file, "symbols-tcp-listen:", 19)) {
++		return process_symbol_stream(file + 19);
++	}
+ 	FILE *fh = NULL;
+ 	if(!strcmp(file, "-")) {
+ 		fh = stdin;

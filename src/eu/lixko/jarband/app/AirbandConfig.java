@@ -1,6 +1,7 @@
 package eu.lixko.jarband.app;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -35,7 +36,10 @@ public record AirbandConfig(
         int squelchCloseLookaheadMillis,
         int squelchPrerollMillis,
         boolean waterfall,
-        boolean channelWaterfall) {
+        boolean channelWaterfall,
+        boolean vdl2Enabled,
+        List<Integer> vdl2FrequenciesHz,
+        InetSocketAddress vdl2Output) {
 
     public static final Path DEFAULT_PATH = Path.of("airband-recorder.toml");
 
@@ -57,7 +61,11 @@ public record AirbandConfig(
             100,
             80,
             false,
-            false);
+            false,
+            false,
+            List.of(136_675_000, 136_725_000, 136_775_000, 136_825_000,
+                    136_875_000, 136_900_000, 136_975_000),
+            new InetSocketAddress("127.0.0.1", 45502));
 
     public static AirbandConfig load(Path path) throws IOException {
         if (!Files.exists(path)) {
@@ -74,6 +82,8 @@ public record AirbandConfig(
             throw new IllegalArgumentException("opus.sample_rate_hz must be 8000 or 16000");
         }
 
+        String vdl2Host = string(toml, "vdl2.output_host", DEFAULTS.vdl2Output.getHostString());
+        int vdl2Port = (int) number(toml, "vdl2.output_port", DEFAULTS.vdl2Output.getPort());
         return new AirbandConfig(
                 string(toml, "sdr.args", DEFAULTS.soapyArgs),
                 number(toml, "sdr.sample_rate_hz", DEFAULTS.sampleRateHz),
@@ -92,7 +102,10 @@ public record AirbandConfig(
                 (int) number(toml, "squelch.close_lookahead_millis", DEFAULTS.squelchCloseLookaheadMillis),
                 (int) number(toml, "squelch.preroll_millis", DEFAULTS.squelchPrerollMillis),
                 bool(toml, "debug.waterfall", DEFAULTS.waterfall),
-                bool(toml, "debug.channel_waterfall", DEFAULTS.channelWaterfall));
+                bool(toml, "debug.channel_waterfall", DEFAULTS.channelWaterfall),
+                bool(toml, "vdl2.enabled", DEFAULTS.vdl2Enabled),
+                intFrequencies(toml.getArray("vdl2.frequencies_hz"), DEFAULTS.vdl2FrequenciesHz),
+                new InetSocketAddress(vdl2Host, vdl2Port));
     }
 
     private static String string(TomlParseResult toml, String key, String fallback) {
@@ -136,6 +149,21 @@ public record AirbandConfig(
                 throw new IllegalArgumentException("Frequency array entries must be numbers");
             }
             frequencies.add(value);
+        }
+        return List.copyOf(frequencies);
+    }
+
+    private static List<Integer> intFrequencies(TomlArray array, List<Integer> fallback) {
+        if (array == null) {
+            return fallback;
+        }
+        var frequencies = new ArrayList<Integer>(array.size());
+        for (int i = 0; i < array.size(); i++) {
+            Double value = arrayNumber(array, i);
+            if (value == null) {
+                throw new IllegalArgumentException("Frequency array entries must be numbers");
+            }
+            frequencies.add(Math.toIntExact(Math.round(value)));
         }
         return List.copyOf(frequencies);
     }
