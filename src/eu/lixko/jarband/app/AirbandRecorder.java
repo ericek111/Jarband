@@ -3,6 +3,7 @@ package eu.lixko.jarband.app;
 import java.awt.BorderLayout;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 
 import javax.swing.JFrame;
@@ -22,6 +23,7 @@ import eu.lixko.jarband.dsp.channelizer.LiquidPfbAnalyzer;
 import eu.lixko.jarband.dsp.channelizer.LogicalChannel;
 import eu.lixko.jarband.dsp.channelizer.PfbConfig;
 import eu.lixko.jarband.dsp.vdl2.Vdl2Processor;
+import eu.lixko.jarband.dsp.vdl2.Vdl2WidebandResampler;
 import eu.lixko.jarband.gui.ChannelActivityPanel;
 import eu.lixko.jarband.gui.WaterfallPanel;
 import eu.lixko.jarband.recording.RecorderBank;
@@ -29,7 +31,9 @@ import eu.lixko.jsoapy.util.NativeUtils;
 
 public final class AirbandRecorder {
     private static final int WATERFALL_FFT_SIZE = 262_144;
+    private static final int VDL2_WATERFALL_FFT_SIZE = 32_768;
     private static final int CHANNELIZED_QUEUE_CAPACITY = 64;
+    private static final int VDL2_QUEUE_CAPACITY = 4;
 
     private AirbandRecorder() {}
 
@@ -60,6 +64,7 @@ public final class AirbandRecorder {
                 captureQueue);
         Thread captureThread = null;
         Thread channelizerThread = null;
+        Thread vdl2Thread = null;
 
         int prerollFrames = Math.max(1,
                 (int) Math.ceil(pfb.channelOutputRateHz() * config.squelchPrerollMillis() / 1000.0));
@@ -82,13 +87,15 @@ public final class AirbandRecorder {
                 config.squelchOpenDb(), config.squelchCloseDb(),
                 config.squelchOpenConfirmMillis(), config.squelchCloseLookaheadMillis());
         ChannelStatus status = processor.status();
-        DebugWindow debug = DebugWindow.open(plan, pfb, status, config.waterfall(), config.channelWaterfall());
+        DebugWindow debug = DebugWindow.open(plan, pfb, status, config.waterfall(),
+                config.channelWaterfall(), config.vdl2Waterfall(), config.vdl2FrequenciesHz());
         var channelizedQueue = new ArrayBlockingQueue<ChannelizedFrame>(CHANNELIZED_QUEUE_CAPACITY);
         CaptureStats captureStats = new CaptureStats();
         Vdl2Processor vdl2 = config.vdl2Enabled()
                 ? new Vdl2Processor(config.sampleRateHz(), config.centerFrequencyHz(),
-                        config.vdl2FrequenciesHz(), config.vdl2Output())
+                        config.vdl2FrequenciesHz(), config.vdl2Output(), debug.vdl2IqSink())
                 : null;
+        Vdl2Worker vdl2Worker = vdl2 == null ? null : new Vdl2Worker(vdl2);
         if (vdl2 != null) {
             System.out.printf("VDL2 demod enabled: %,d channels -> %s:%d%n",
                     config.vdl2FrequenciesHz().size(),
@@ -96,7 +103,7 @@ public final class AirbandRecorder {
                     config.vdl2Output().getPort());
         }
         ChannelizerWorker channelizer = new ChannelizerWorker(
-                captureQueue, channelizedQueue, pfb, preroll, debug, captureStats, vdl2);
+                captureQueue, channelizedQueue, pfb, preroll, debug, captureStats, vdl2Worker);
 
         try (AirbandFrameProcessor frameProcessor = processor;
              DebugWindow debugWindow = debug;
@@ -106,11 +113,17 @@ public final class AirbandRecorder {
             long lastStatusNanos = System.nanoTime();
             long lastRepaintNanos = 0L;
             captureThread = Thread.ofPlatform().name("jarband-capture").start(capture);
+            if (vdl2Worker != null) {
+                vdl2Thread = Thread.ofPlatform().name("jarband-vdl2").start(vdl2Worker);
+            }
             channelizerThread = Thread.ofPlatform().name("jarband-channelizer").start(channelizer);
             while (!Thread.currentThread().isInterrupted()) {
                 ChannelizedFrame channelized = channelizedQueue.take();
                 if (channelized.isPoison()) {
                     channelizer.throwIfFailed();
+                    if (vdl2Worker != null) {
+                        vdl2Worker.throwIfFailed();
+                    }
                     break;
                 }
                 frameProcessor.process(channelized, recorders);
@@ -126,10 +139,17 @@ public final class AirbandRecorder {
                     System.out.printf("Squelch open: %,d / %,d channels, above threshold: %,d, max margin: %.1f dB%n",
                             countOpen(status), plan.size(), countAboveMargin(status, config.squelchOpenDb()),
                             maxMargin(status));
+                    if (vdl2Worker != null) {
+                        vdl2Worker.throwIfFailed();
+                        System.out.println(vdl2Worker.statusAndReset());
+                    }
                 }
             }
         } finally {
             capture.stop();
+            if (vdl2Worker != null) {
+                vdl2Worker.stop();
+            }
             if (captureThread != null) {
                 captureThread.interrupt();
                 captureThread.join(1000);
@@ -137,6 +157,10 @@ public final class AirbandRecorder {
             if (channelizerThread != null) {
                 channelizerThread.interrupt();
                 channelizerThread.join(1000);
+            }
+            if (vdl2Thread != null) {
+                vdl2Thread.interrupt();
+                vdl2Thread.join(1000);
             }
         }
     }
@@ -214,43 +238,70 @@ public final class AirbandRecorder {
     }
 
     private record DebugWindow(WaterfallPanel waterfall, ChannelActivityPanel activity,
-                               ChannelSpectrumWaterfall channelSpectrum) implements AutoCloseable {
+                               ChannelSpectrumWaterfall channelSpectrum,
+                               Vdl2IqWaterfall vdl2Waterfall) implements AutoCloseable {
         static DebugWindow open(ChannelPlan plan, PfbConfig pfb, ChannelStatus status,
-                                boolean waterfallEnabled, boolean channelWaterfallEnabled) throws Exception {
-            if (!waterfallEnabled) {
-                return new DebugWindow(null, null, null);
-            }
-            WaterfallPanel waterfall = new WaterfallPanel(1800, 720);
-            waterfall.enableMouse();
-            waterfall.setMinValue(-110.0f);
-            waterfall.setMaxValue(-45.0f);
-            waterfall.setZoomLevel(1.0);
-
-            JLabel statusLabel = new JLabel("Click a channel activity segment");
-            ChannelActivityPanel activity = new ChannelActivityPanel(plan, pfb, status, waterfall, statusLabel);
-            ChannelSpectrumWaterfall channelSpectrum = channelWaterfallEnabled
-                    ? new ChannelSpectrumWaterfall(activity)
+                                boolean waterfallEnabled, boolean channelWaterfallEnabled,
+                                boolean vdl2WaterfallEnabled, List<Integer> vdl2FrequenciesHz) throws Exception {
+            WaterfallPanel waterfall = null;
+            ChannelActivityPanel activity = null;
+            ChannelSpectrumWaterfall channelSpectrum = null;
+            Vdl2IqWaterfall vdl2Waterfall = vdl2WaterfallEnabled
+                    ? new Vdl2IqWaterfall(vdl2FrequenciesHz)
                     : null;
-            SwingUtilities.invokeAndWait(() -> {
-                JFrame frame = new JFrame("Jarband Airband Debug");
-                frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-                JPanel bottom = new JPanel(new BorderLayout());
-                bottom.add(activity, BorderLayout.CENTER);
-                bottom.add(statusLabel, BorderLayout.SOUTH);
-                frame.add(waterfall, BorderLayout.CENTER);
-                frame.add(bottom, BorderLayout.SOUTH);
-                frame.pack();
-                frame.setVisible(true);
+            JLabel statusLabel = new JLabel("Click a channel activity segment");
 
-                if (channelSpectrum != null) {
+            if (waterfallEnabled) {
+                waterfall = new WaterfallPanel(1800, 720);
+                waterfall.enableMouse();
+                waterfall.setMinValue(-110.0f);
+                waterfall.setMaxValue(-45.0f);
+                waterfall.setZoomLevel(1.0);
+
+                activity = new ChannelActivityPanel(plan, pfb, status, waterfall, statusLabel);
+                channelSpectrum = channelWaterfallEnabled
+                        ? new ChannelSpectrumWaterfall(activity)
+                        : null;
+            }
+
+            if (!waterfallEnabled && vdl2Waterfall == null) {
+                return new DebugWindow(null, null, null, null);
+            }
+
+            WaterfallPanel airbandWaterfall = waterfall;
+            ChannelActivityPanel airbandActivity = activity;
+            ChannelSpectrumWaterfall airbandChannelSpectrum = channelSpectrum;
+            JLabel airbandStatusLabel = statusLabel;
+            SwingUtilities.invokeAndWait(() -> {
+                if (airbandWaterfall != null) {
+                    JFrame frame = new JFrame("Jarband Airband Debug");
+                    frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+                    JPanel bottom = new JPanel(new BorderLayout());
+                    bottom.add(airbandActivity, BorderLayout.CENTER);
+                    bottom.add(airbandStatusLabel, BorderLayout.SOUTH);
+                    frame.add(airbandWaterfall, BorderLayout.CENTER);
+                    frame.add(bottom, BorderLayout.SOUTH);
+                    frame.pack();
+                    frame.setVisible(true);
+                }
+
+                if (airbandChannelSpectrum != null) {
                     JFrame channelFrame = new JFrame("Jarband Selected Channel Spectrum");
                     channelFrame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
-                    channelFrame.add(channelSpectrum.waterfall(), BorderLayout.CENTER);
+                    channelFrame.add(airbandChannelSpectrum.waterfall(), BorderLayout.CENTER);
                     channelFrame.pack();
                     channelFrame.setVisible(true);
                 }
+
+                if (vdl2Waterfall != null) {
+                    vdl2Waterfall.open();
+                }
             });
-            return new DebugWindow(waterfall, activity, channelSpectrum);
+            return new DebugWindow(waterfall, activity, channelSpectrum, vdl2Waterfall);
+        }
+
+        Vdl2Processor.IqSink vdl2IqSink() {
+            return vdl2Waterfall;
         }
 
         void repaintActivity() {
@@ -264,6 +315,9 @@ public final class AirbandRecorder {
             if (channelSpectrum != null) {
                 channelSpectrum.close();
             }
+            if (vdl2Waterfall != null) {
+                vdl2Waterfall.close();
+            }
         }
     }
 
@@ -274,7 +328,7 @@ public final class AirbandRecorder {
         private final ChannelizedFrameRing preroll;
         private final DebugWindow debug;
         private final CaptureStats captureStats;
-        private final Vdl2Processor vdl2;
+        private final Vdl2Worker vdl2Worker;
         private volatile Throwable failure;
 
         ChannelizerWorker(ArrayBlockingQueue<NativeSampleBlock> input,
@@ -283,14 +337,14 @@ public final class AirbandRecorder {
                           ChannelizedFrameRing preroll,
                           DebugWindow debug,
                           CaptureStats captureStats,
-                          Vdl2Processor vdl2) {
+                          Vdl2Worker vdl2Worker) {
             this.input = input;
             this.output = output;
             this.pfb = pfb;
             this.preroll = preroll;
             this.debug = debug;
             this.captureStats = captureStats;
-            this.vdl2 = vdl2;
+            this.vdl2Worker = vdl2Worker;
         }
 
         @Override
@@ -304,8 +358,8 @@ public final class AirbandRecorder {
                         break;
                     }
                     captureStats.accept(block);
-                    if (vdl2 != null) {
-                        vdl2.process(block);
+                    if (vdl2Worker != null) {
+                        vdl2Worker.submit(block);
                     }
                     if (waterfallFft != null) {
                         waterfallFill = updateWaterfall(block, waterfallFft, debug.waterfall(), waterfallFill);
@@ -324,14 +378,8 @@ public final class AirbandRecorder {
             } catch (Throwable t) {
                 failure = t;
             } finally {
-                if (vdl2 != null) {
-                    try {
-                        vdl2.close();
-                    } catch (Exception e) {
-                        if (failure == null) {
-                            failure = e;
-                        }
-                    }
+                if (vdl2Worker != null) {
+                    vdl2Worker.stop();
                 }
                 signalDone();
             }
@@ -346,6 +394,79 @@ public final class AirbandRecorder {
         private void signalDone() {
             while (!output.offer(ChannelizedFrame.poison())) {
                 output.poll();
+            }
+        }
+    }
+
+    private static final class Vdl2Worker implements Runnable {
+        private final Vdl2Processor processor;
+        private final ArrayBlockingQueue<NativeSampleBlock> queue = new ArrayBlockingQueue<>(VDL2_QUEUE_CAPACITY);
+        private volatile Throwable failure;
+        private long droppedBlocks;
+
+        Vdl2Worker(Vdl2Processor processor) {
+            this.processor = processor;
+        }
+
+        void submit(NativeSampleBlock block) {
+            if (failure != null) {
+                return;
+            }
+            if (!queue.offer(block)) {
+                do {
+                    queue.poll();
+                    droppedBlocks++;
+                } while (!queue.offer(block));
+                if ((droppedBlocks & 0x3f) == 0) {
+                    System.out.printf("VDL2 dropped %,d stale blocks because demodulation is behind%n", droppedBlocks);
+                }
+            }
+        }
+
+        void stop() {
+            while (!queue.offer(NativeSampleBlock.POISON)) {
+                queue.poll();
+            }
+        }
+
+        String statusAndReset() {
+            long dropped = droppedBlocks;
+            droppedBlocks = 0;
+            String status = processor.statusAndReset();
+            if (dropped > 0) {
+                status += String.format(java.util.Locale.ROOT, "%n  VDL2 worker dropped %,d stale blocks", dropped);
+            }
+            return status;
+        }
+
+        void throwIfFailed() {
+            if (failure != null) {
+                throw new IllegalStateException("VDL2 thread failed", failure);
+            }
+        }
+
+        @Override
+        public void run() {
+            try {
+                while (!Thread.currentThread().isInterrupted()) {
+                    NativeSampleBlock block = queue.take();
+                    if (block.isPoison()) {
+                        break;
+                    }
+                    processor.process(block);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Throwable t) {
+                failure = t;
+            } finally {
+                try {
+                    processor.close();
+                } catch (Exception e) {
+                    if (failure == null) {
+                        failure = e;
+                    }
+                }
             }
         }
     }
@@ -392,6 +513,93 @@ public final class AirbandRecorder {
 
         @Override
         public void close() {
+        }
+    }
+
+    private static final class Vdl2IqWaterfall implements Vdl2Processor.IqSink, AutoCloseable {
+        private final List<Integer> frequenciesHz;
+        private final WaterfallPanel waterfall = new WaterfallPanel(900, 360);
+        private volatile JFrame frame;
+        private volatile boolean closed;
+        private FFT fft;
+        private int fill;
+
+        Vdl2IqWaterfall(List<Integer> frequenciesHz) {
+            this.frequenciesHz = List.copyOf(frequenciesHz);
+            waterfall.setMinValue(-115.0f);
+            waterfall.setMaxValue(-35.0f);
+            waterfall.setZoomLevel(1.0);
+        }
+
+        void open() {
+            frame = new JFrame("Jarband VDL2 Resampled I/Q Spectrum");
+            frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+            frame.add(waterfall, BorderLayout.CENTER);
+            frame.add(new JLabel(labelText()), BorderLayout.SOUTH);
+            frame.pack();
+            frame.setVisible(true);
+        }
+
+        @Override
+        public void accept(MemorySegment samples, int sampleCount) {
+            if (closed || sampleCount == 0) {
+                return;
+            }
+            if (fft == null) {
+                fft = new FFT(VDL2_WATERFALL_FFT_SIZE);
+            }
+            int consumed = 0;
+            while (consumed < sampleCount) {
+                int copied = Math.min(VDL2_WATERFALL_FFT_SIZE - fill, sampleCount - consumed);
+                MemorySegment source = samples.asSlice((long) consumed * 2L * Float.BYTES,
+                        (long) copied * 2L * Float.BYTES);
+                MemorySegment target = fft.fft_in.asSlice((long) fill * 2L * Float.BYTES,
+                        (long) copied * 2L * Float.BYTES);
+                target.copyFrom(source);
+                fill += copied;
+                consumed += copied;
+
+                if (fill == VDL2_WATERFALL_FFT_SIZE) {
+                    fft.execute();
+                    waterfall.addLine(fft);
+                    fill = 0;
+                }
+            }
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+            if (fft != null) {
+                try {
+                    fft.close();
+                } catch (Exception e) {
+                    // Debug display cleanup should not take down recorder shutdown.
+                }
+            }
+            JFrame currentFrame = frame;
+            if (currentFrame != null) {
+                SwingUtilities.invokeLater(currentFrame::dispose);
+            }
+        }
+
+        private String labelText() {
+            if (frequenciesHz.isEmpty()) {
+                return String.format(java.util.Locale.ROOT,
+                        "Resampled I/Q FFT: %.3f Msps; no VDL2 channels configured",
+                        Vdl2WidebandResampler.OUTPUT_RATE / 1_000_000.0);
+            }
+            StringBuilder label = new StringBuilder(String.format(java.util.Locale.ROOT,
+                    "Resampled I/Q FFT: %.3f Msps; VDL2 channels: ",
+                    Vdl2WidebandResampler.OUTPUT_RATE / 1_000_000.0));
+            for (int i = 0; i < frequenciesHz.size(); i++) {
+                if (i > 0) {
+                    label.append("  ");
+                }
+                label.append(String.format(java.util.Locale.ROOT, "%.3f",
+                        frequenciesHz.get(i) / 1_000_000.0));
+            }
+            return label.toString();
         }
     }
 

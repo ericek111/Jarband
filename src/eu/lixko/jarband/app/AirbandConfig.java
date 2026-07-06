@@ -37,6 +37,7 @@ public record AirbandConfig(
         int squelchPrerollMillis,
         boolean waterfall,
         boolean channelWaterfall,
+        boolean vdl2Waterfall,
         boolean vdl2Enabled,
         List<Integer> vdl2FrequenciesHz,
         InetSocketAddress vdl2Output) {
@@ -60,6 +61,7 @@ public record AirbandConfig(
             30,
             100,
             80,
+            false,
             false,
             false,
             false,
@@ -103,6 +105,7 @@ public record AirbandConfig(
                 (int) number(toml, "squelch.preroll_millis", DEFAULTS.squelchPrerollMillis),
                 bool(toml, "debug.waterfall", DEFAULTS.waterfall),
                 bool(toml, "debug.channel_waterfall", DEFAULTS.channelWaterfall),
+                bool(toml, "debug.vdl2_waterfall", DEFAULTS.vdl2Waterfall),
                 bool(toml, "vdl2.enabled", DEFAULTS.vdl2Enabled),
                 intFrequencies(toml.getArray("vdl2.frequencies_hz"), DEFAULTS.vdl2FrequenciesHz),
                 new InetSocketAddress(vdl2Host, vdl2Port));
