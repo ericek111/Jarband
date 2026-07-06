@@ -48,7 +48,8 @@ public class GainsPanel extends JPanel {
         for (String gainName : this.device.listGains(direction, channel)) {
             double currentVal = this.device.getGain(direction, channel, gainName);
             SoapySDRRange range = this.device.getGainRange(direction, channel, gainName);
-            System.err.println(range.getMinimum() + ", " + range.getMaximum() + " | " + currentVal);
+            System.err.println(gainName + " : " + range.getMinimum() + ", " + range.getMaximum() + " | " + currentVal);
+            currentVal = Math.clamp(currentVal, range.getMinimum(), range.getMaximum());
 	        JSlider gainSlider = new JSlider(JSlider.HORIZONTAL, (int) (range.getMinimum() * SLIDER_SCALER), (int) (range.getMaximum() * SLIDER_SCALER), (int) (currentVal * SLIDER_SCALER));
 	        JLabel gainLabel = new JLabel();
 	    	

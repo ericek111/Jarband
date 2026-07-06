@@ -120,7 +120,7 @@ public class SoapyRxFft extends JFrame {
     	Thread.ofVirtual().start(() -> {
     		// FloatBuffer fftOut = FloatBuffer.allocate((int) fftGen.getNativeBufferSize() / Float.BYTES);
     		
-    		SoapySDRDevice device = SoapySDRDevice.makeStrArgs("");
+    		SoapySDRDevice device = SoapySDRDevice.makeStrArgs("remote=10.0.34.40,remote:prot=tcp");
     		
     		JFrame settingsFrame = new JFrame();
             settingsFrame.add(new SettingsPanel(device));
@@ -146,7 +146,7 @@ public class SoapyRxFft extends JFrame {
 			int streamSampleSize = (DMA ? stream.getNativeFormat(0).format().byteSize() : stream.getFormat().byteSize());
 
 			while (true) {
-				int readElems = DMA ? stream.acquireReadBuffer(1000000) : stream.readStream(1000000);
+				int readElems = DMA ? stream.acquireReadBuffer(1048576) : stream.readStream(1048576);
 				if (readElems < 0) {
 					System.out.println("Error reading: " + Errors_h.fromCode(readElems).name());
 					continue;
