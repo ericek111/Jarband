@@ -10,6 +10,11 @@ public record ChannelPlan(PfbConfig pfb, List<LogicalChannel> channels) {
     private static final double AIRBAND_RASTER_HZ = 25_000.0 / 3.0;
 
     public static ChannelPlan visibleAirband(PfbConfig pfb, List<Double> merge25kHzFrequencies) {
+        return visibleAirband(pfb, merge25kHzFrequencies, List.of());
+    }
+
+    public static ChannelPlan visibleAirband(PfbConfig pfb, List<Double> merge25kHzFrequencies,
+                                             List<Double> skipFrequencies) {
         double receiverLowHz = pfb.centerFrequency() - pfb.sampleRate() / 2.0;
         double receiverHighHz = pfb.centerFrequency() + pfb.sampleRate() / 2.0;
         double firstChannelHz = alignUp(Math.max(AIRBAND_LOW_HZ, receiverLowHz), AIRBAND_RASTER_HZ);
@@ -19,14 +24,18 @@ public record ChannelPlan(PfbConfig pfb, List<LogicalChannel> channels) {
             throw new IllegalStateException("SDR passband does not overlap the configured airband range");
         }
 
-        return airband(pfb, firstChannelHz, lastChannelHz, merge25kHzFrequencies);
+        return airband(pfb, firstChannelHz, lastChannelHz, merge25kHzFrequencies, skipFrequencies);
     }
 
     private static ChannelPlan airband(PfbConfig pfb, double firstChannelHz, double lastChannelHz,
-                                       List<Double> merge25kHzFrequencies) {
+                                       List<Double> merge25kHzFrequencies, List<Double> skipFrequencies) {
         var mergeBins = new HashSet<Integer>();
         for (double f : merge25kHzFrequencies) {
             mergeBins.add(binForFrequency(pfb, f));
+        }
+        var skipBins = new HashSet<Integer>();
+        for (double f : skipFrequencies) {
+            skipBins.add(binForFrequency(pfb, f));
         }
 
         var channels = new ArrayList<LogicalChannel>();
@@ -34,6 +43,9 @@ public record ChannelPlan(PfbConfig pfb, List<LogicalChannel> channels) {
         for (double f = firstChannelHz; f <= lastChannelHz + AIRBAND_RASTER_HZ * 0.25; f += AIRBAND_RASTER_HZ) {
             int bin = binForFrequency(pfb, f);
             if (bin < 0 || bin >= pfb.branches()) {
+                continue;
+            }
+            if (skipBins.contains(bin)) {
                 continue;
             }
             int[] bins = mergeBins.contains(bin)

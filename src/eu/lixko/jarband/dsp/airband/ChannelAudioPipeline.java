@@ -1,6 +1,6 @@
 package eu.lixko.jarband.dsp.airband;
 
-public final class ChannelAudioPipeline {
+final class ChannelAudioPipeline {
     private static final int INPUT_BATCH = 128;
     private static final int OUTPUT_BATCH = 256;
 
@@ -21,11 +21,11 @@ public final class ChannelAudioPipeline {
         }
     }
 
-    public void acceptIq(int channel, long unixMillis, float i, float q, AudioSink sink) {
+    public void acceptIq(int channel, long unixMillis, float i, float q, AirbandFrameProcessor.AudioSink sink) {
         acceptAudio(channel, unixMillis, demods[channel].demodulate(i, q), sink);
     }
 
-    public void flush(int channel, long unixMillis, AudioSink sink) {
+    public void flush(int channel, long unixMillis, AirbandFrameProcessor.AudioSink sink) {
         int count = inputFill[channel];
         if (count == 0) {
             return;
@@ -46,7 +46,7 @@ public final class ChannelAudioPipeline {
         resampler.reset(channel);
     }
 
-    private void acceptAudio(int channel, long unixMillis, float audio, AudioSink sink) {
+    private void acceptAudio(int channel, long unixMillis, float audio, AirbandFrameProcessor.AudioSink sink) {
         float[] input = inputBatches[channel];
         input[inputFill[channel]++] = audio;
         if (inputFill[channel] == input.length) {
@@ -54,8 +54,4 @@ public final class ChannelAudioPipeline {
         }
     }
 
-    @FunctionalInterface
-    public interface AudioSink {
-        void accept(int channelId, long unixMillis, float[] audio, int length);
-    }
 }

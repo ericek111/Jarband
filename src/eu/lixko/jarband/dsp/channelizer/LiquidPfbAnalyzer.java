@@ -29,7 +29,7 @@ public final class LiquidPfbAnalyzer implements AutoCloseable {
         return block.availableSampleCount() / config.branches();
     }
 
-    public ChannelizedFrame execute(NativeSampleBlock block, int frameIndex) {
+    public ChannelizedFrame execute(NativeSampleBlock block, int frameIndex, ChannelizedFrameRing ring) {
         long sampleOffset = (long) frameIndex * config.branches();
         MemorySegment source = block.samples().asSlice(sampleOffset * 2L * Float.BYTES, input.byteSize());
         input.copyFrom(source);
@@ -37,8 +37,7 @@ public final class LiquidPfbAnalyzer implements AutoCloseable {
         if (rc != 0) {
             throw new IllegalStateException("firpfbch_crcf_analyzer_execute failed: " + rc);
         }
-        float[] bins = output.toArray(ValueLayout.JAVA_FLOAT);
-        return new ChannelizedFrame(bins, config.branches(), block.firstSampleIndex() + sampleOffset, block.capturedNanos());
+        return ring.append(output, block.firstSampleIndex() + sampleOffset, block.capturedNanos());
     }
 
     @Override

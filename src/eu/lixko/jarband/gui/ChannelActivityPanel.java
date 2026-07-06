@@ -10,7 +10,7 @@ import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.Timer;
 
-import eu.lixko.jarband.dsp.airband.ChannelStateArrays;
+import eu.lixko.jarband.dsp.airband.AirbandFrameProcessor.ChannelStatus;
 import eu.lixko.jarband.dsp.channelizer.ChannelPlan;
 import eu.lixko.jarband.dsp.channelizer.LogicalChannel;
 import eu.lixko.jarband.dsp.channelizer.PfbConfig;
@@ -23,16 +23,16 @@ public final class ChannelActivityPanel extends JPanel {
 
     private final ChannelPlan plan;
     private final PfbConfig pfb;
-    private final ChannelStateArrays state;
+    private final ChannelStatus statusSnapshot;
     private final WaterfallPanel waterfall;
     private final JLabel status;
     private volatile LogicalChannel selectedChannel;
 
-    public ChannelActivityPanel(ChannelPlan plan, PfbConfig pfb, ChannelStateArrays state,
+    public ChannelActivityPanel(ChannelPlan plan, PfbConfig pfb, ChannelStatus statusSnapshot,
                                 WaterfallPanel waterfall, JLabel status) {
         this.plan = plan;
         this.pfb = pfb;
-        this.state = state;
+        this.statusSnapshot = statusSnapshot;
         this.waterfall = waterfall;
         this.status = status;
         this.selectedChannel = plan.channels().isEmpty() ? null : plan.channels().getFirst();
@@ -67,7 +67,7 @@ public final class ChannelActivityPanel extends JPanel {
             }
             x0 = Math.max(0, x0);
             x1 = Math.min(width, x1);
-            g.setColor(state.squelchState[channel.id()] == ChannelStateArrays.OPEN ? ACTIVE : INACTIVE);
+            g.setColor(statusSnapshot.squelchState[channel.id()] == ChannelStatus.OPEN ? ACTIVE : INACTIVE);
             g.fillRect(x0, 0, Math.max(1, x1 - x0), height);
             if (x1 - x0 > 3) {
                 g.setColor(GRID);
@@ -84,8 +84,8 @@ public final class ChannelActivityPanel extends JPanel {
         }
         int id = channel.id();
         selectedChannel = channel;
-        float margin = Float.isFinite(state.power[id]) && Float.isFinite(state.noiseFloor[id])
-                ? state.power[id] - state.noiseFloor[id]
+        float margin = Float.isFinite(statusSnapshot.power[id]) && Float.isFinite(statusSnapshot.noiseFloor[id])
+                ? statusSnapshot.power[id] - statusSnapshot.noiseFloor[id]
                 : Float.NaN;
         int bin = channel.pfbBins()[channel.pfbBins().length / 2];
         status.setText(String.format(java.util.Locale.ROOT,
@@ -93,9 +93,9 @@ public final class ChannelActivityPanel extends JPanel {
                 channel.frequencyHz() / 1_000_000.0,
                 bin,
                 ChannelPlan.frequencyForBin(pfb, bin) / 1_000_000.0,
-                state.squelchState[id] == ChannelStateArrays.OPEN ? "OPEN" : "closed",
-                state.power[id],
-                state.noiseFloor[id],
+                statusSnapshot.squelchState[id] == ChannelStatus.OPEN ? "OPEN" : "closed",
+                statusSnapshot.power[id],
+                statusSnapshot.noiseFloor[id],
                 margin));
     }
 

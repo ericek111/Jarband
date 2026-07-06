@@ -50,7 +50,9 @@ public final class SoapyCaptureReader implements Runnable {
         stream.activateStream();
         long firstSample = 0;
         pendingFirstSampleIndex = firstSample;
-        try {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment converted = MemorySegment.NULL;
+            int convertedCapacitySamples = 0;
             while (running) {
                 int read = stream.acquireReadBuffer(1_000_000);
                 if (read <= 0) {
@@ -59,11 +61,14 @@ public final class SoapyCaptureReader implements Runnable {
                     }
                     continue;
                 }
-                try (Arena arena = Arena.ofConfined()) {
-                    MemorySegment converted = arena.allocate((long) read * 2L * Float.BYTES, ValueLayout.JAVA_FLOAT.byteAlignment());
+                try {
+                    if (read > convertedCapacitySamples) {
+                        converted = arena.allocate((long) read * 2L * Float.BYTES,
+                                ValueLayout.JAVA_FLOAT.byteAlignment());
+                        convertedCapacitySamples = read;
+                    }
                     converter.invokeLongs(stream.getDirectBuffer(0).address(), converted.address(), read, 1.0);
-                    float[] ownedSamples = converted.toArray(ValueLayout.JAVA_FLOAT);
-                    appendConverted(ownedSamples, read, firstSample, System.nanoTime());
+                    appendConverted(converted, read, firstSample, System.nanoTime());
                     firstSample += read;
                 } finally {
                     stream.releaseReadBuffer();
@@ -77,14 +82,18 @@ public final class SoapyCaptureReader implements Runnable {
         }
     }
 
-    private void appendConverted(float[] samples, int sampleCount, long firstSampleIndex, long capturedNanos) {
+    private void appendConverted(MemorySegment samples, int sampleCount, long firstSampleIndex, long capturedNanos) {
         int consumed = 0;
         while (consumed < sampleCount) {
             if (pendingSampleCount == 0) {
                 pendingFirstSampleIndex = firstSampleIndex + consumed;
             }
             int copied = Math.min(OUTPUT_BLOCK_SAMPLES - pendingSampleCount, sampleCount - consumed);
-            System.arraycopy(samples, consumed * 2, pendingSamples, pendingSampleCount * 2, copied * 2);
+            MemorySegment target = MemorySegment.ofArray(pendingSamples);
+            target.asSlice((long) pendingSampleCount * 2L * Float.BYTES,
+                    (long) copied * 2L * Float.BYTES)
+                    .copyFrom(samples.asSlice((long) consumed * 2L * Float.BYTES,
+                            (long) copied * 2L * Float.BYTES));
             pendingSampleCount += copied;
             consumed += copied;
             pendingCapturedNanos = capturedNanos;

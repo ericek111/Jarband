@@ -1,8 +1,10 @@
 package eu.lixko.jarband.dsp.channelizer;
 
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+
 public final class ChannelizedFrameRing {
-    private final float[][] frames;
-    private final long[] capturedNanos;
+    private final ChannelizedFrame[] frames;
     private final int branchCount;
     private long nextSequence;
     private int size;
@@ -11,21 +13,22 @@ public final class ChannelizedFrameRing {
         if (capacityFrames <= 0) {
             throw new IllegalArgumentException("capacityFrames must be positive");
         }
-        this.frames = new float[capacityFrames][branchCount * 2];
-        this.capturedNanos = new long[capacityFrames];
         this.branchCount = branchCount;
+        this.frames = new ChannelizedFrame[capacityFrames];
+        for (int i = 0; i < frames.length; i++) {
+            frames[i] = new ChannelizedFrame(new float[branchCount * 2], branchCount);
+        }
     }
 
-    public long append(ChannelizedFrame frame) {
-        if (frame.branchCount() != branchCount) {
-            throw new IllegalArgumentException("Frame branch count changed from " + branchCount + " to " + frame.branchCount());
-        }
+    public ChannelizedFrame append(MemorySegment interleavedIqByBin, long sourceSampleIndex, long capturedNanos) {
         int slot = slot(nextSequence);
-        System.arraycopy(frame.interleavedIqByBin(), 0, frames[slot], 0, frames[slot].length);
-        capturedNanos[slot] = frame.capturedNanos();
+        ChannelizedFrame frame = frames[slot];
+        MemorySegment.copy(interleavedIqByBin, ValueLayout.JAVA_FLOAT, 0,
+                frame.interleavedIqByBin(), 0, branchCount * 2);
         long sequence = nextSequence++;
+        frame.reset(sequence, sourceSampleIndex, capturedNanos);
         size = Math.min(size + 1, frames.length);
-        return sequence;
+        return frame;
     }
 
     public long oldestSequence() {
@@ -37,15 +40,16 @@ public final class ChannelizedFrameRing {
         long last = Math.min(lastSequenceExclusive, nextSequence);
         for (long sequence = first; sequence < last; sequence++) {
             int slot = slot(sequence);
-            float[] frame = frames[slot];
+            ChannelizedFrame frame = frames[slot];
+            float[] iq = frame.interleavedIqByBin();
             float i = 0.0f;
             float q = 0.0f;
             int[] bins = channel.pfbBins();
             for (int bin : bins) {
-                i += frame[bin * 2];
-                q += frame[bin * 2 + 1];
+                i += iq[bin * 2];
+                q += iq[bin * 2 + 1];
             }
-            sink.accept(i / bins.length, q / bins.length, capturedNanos[slot]);
+            sink.accept(i / bins.length, q / bins.length, frame.capturedNanos());
         }
     }
 

@@ -2,6 +2,7 @@ open module Jarband {
 	requires java.desktop;
 	requires jdk.incubator.vector;
 	requires JSoapy;
+	requires org.tomlj;
 	exports eu.lixko.jarband.app;
 	exports eu.lixko.jarband.capture;
 	exports eu.lixko.jarband.dsp.airband;

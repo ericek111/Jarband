@@ -4,8 +4,6 @@ import java.awt.BorderLayout;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
 import java.time.Clock;
-import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 
 import javax.swing.JFrame;
@@ -17,8 +15,7 @@ import eu.lixko.jarband.FFT;
 import eu.lixko.jarband.capture.NativeSampleBlock;
 import eu.lixko.jarband.capture.SoapyCaptureReader;
 import eu.lixko.jarband.dsp.airband.AirbandFrameProcessor;
-import eu.lixko.jarband.dsp.airband.ChannelStateArrays;
-import eu.lixko.jarband.dsp.airband.PowerSquelch;
+import eu.lixko.jarband.dsp.airband.AirbandFrameProcessor.ChannelStatus;
 import eu.lixko.jarband.dsp.channelizer.ChannelPlan;
 import eu.lixko.jarband.dsp.channelizer.ChannelizedFrameRing;
 import eu.lixko.jarband.dsp.channelizer.ChannelizedFrame;
@@ -31,64 +28,56 @@ import eu.lixko.jarband.recording.RecorderBank;
 import eu.lixko.jsoapy.util.NativeUtils;
 
 public final class AirbandRecorder {
-    private static final String SDR_ARGS = "remote=10.0.34.40,remote:prot=tcp";
-    private static final double SDR_SAMPLE_RATE_HZ = 8_000_000.0;
-    private static final double SDR_CENTER_FREQUENCY_HZ = 133_000_005.0;
-    // private static final Map<String, Double> SDR_GAINS = Map.of("LNA", 1d, "Baseband", 23d, "Mixer", 0d, "Mixbuffer", 0d);
-    private static final Map<String, Double> SDR_GAINS = Map.of("LNA", 0d, "Baseband", 25d, "Mixer", 19d, "Mixbuffer", 0d);
-
     private static final int WATERFALL_FFT_SIZE = 262_144;
-    private static final boolean ENABLE_CHANNEL_WATERFALL = false;
 
     private static final float SQUELCH_OPEN_DB = 18.0f;
-    private static final float SQUELCH_CLOSE_DB = 15.0f;
-    private static final int SQUELCH_HANG_MILLIS = 0;
-    private static final int PREROLL_MILLIS = 500;
-
-    private static final Path OUTPUT_DIRECTORY = Path.of("recordings");
+    private static final float SQUELCH_CLOSE_DB = 18.0f;
+    private static final int PREROLL_MILLIS = 80;
 
     private AirbandRecorder() {}
 
     public static void main(String[] args) throws Exception {
         NativeUtils.loadLibrary();
 
-        PfbConfig pfb = PfbConfig.forAirband(SDR_SAMPLE_RATE_HZ, SDR_CENTER_FREQUENCY_HZ);
+        Path configPath = args.length == 0 ? AirbandConfig.DEFAULT_PATH : Path.of(args[0]);
+        AirbandConfig config = AirbandConfig.load(configPath);
+
+        PfbConfig pfb = PfbConfig.forAirband(config.sampleRateHz(), config.centerFrequencyHz());
         ChannelPlan plan = ChannelPlan.visibleAirband(
                 pfb,
-                List.of());
+                config.merge25kHzFrequencies(),
+                config.skipFrequencies());
 
         System.out.printf("Jarband airband recorder: %,d logical channels, %.3f Hz PFB spacing%n",
                 plan.size(), pfb.branchSpacingHz());
         System.out.printf("PFB channel output rate: %.3f Hz%n", pfb.channelOutputRateHz());
         System.out.printf("SDR: center %.6f MHz, bandwidth %.3f MHz%n",
-                SDR_CENTER_FREQUENCY_HZ / 1_000_000.0,
-                SDR_SAMPLE_RATE_HZ / 1_000_000.0);
+                config.centerFrequencyHz() / 1_000_000.0,
+                config.sampleRateHz() / 1_000_000.0);
         printChannelMap(pfb, plan);
 
         var captureQueue = new ArrayBlockingQueue<NativeSampleBlock>(8);
         var capture = new SoapyCaptureReader(
-                new SoapyCaptureReader.Settings(SDR_ARGS, SDR_SAMPLE_RATE_HZ, SDR_CENTER_FREQUENCY_HZ, SDR_GAINS),
+                new SoapyCaptureReader.Settings(config.soapyArgs(), config.sampleRateHz(),
+                        config.centerFrequencyHz(), config.gains()),
                 captureQueue);
         Thread captureThread = null;
 
-        ChannelStateArrays state = new ChannelStateArrays(plan.size());
-        DebugWindow debug = DebugWindow.open(plan, pfb, state);
-        PowerSquelch squelch = new PowerSquelch(
-                state,
-                SQUELCH_OPEN_DB,
-                SQUELCH_CLOSE_DB,
-                SQUELCH_HANG_MILLIS);
         int prerollFrames = Math.max(1, (int) Math.ceil(pfb.channelOutputRateHz() * PREROLL_MILLIS / 1000.0));
         int closeLookaheadFrames = Math.max(1, (int) Math.ceil(pfb.channelOutputRateHz() * 100.0 / 1000.0));
         ChannelizedFrameRing preroll = new ChannelizedFrameRing(prerollFrames + closeLookaheadFrames + 16, pfb.branches());
         AirbandFrameProcessor processor = new AirbandFrameProcessor(
-                plan, state, squelch, preroll, prerollFrames, pfb.channelOutputRateHz(), 8_000, Clock.systemUTC());
+                plan, preroll, prerollFrames, pfb.channelOutputRateHz(), config.opusSampleRateHz(),
+                SQUELCH_OPEN_DB, SQUELCH_CLOSE_DB, Clock.systemUTC());
+        ChannelStatus status = processor.status();
+        DebugWindow debug = DebugWindow.open(plan, pfb, status, config.waterfall(), config.channelWaterfall());
 
         try (DebugWindow debugWindow = debug;
              LiquidPfbAnalyzer analyzer = new LiquidPfbAnalyzer(pfb);
-             FFT waterfallFft = new FFT(WATERFALL_FFT_SIZE);
-             RecorderBank recorders = new RecorderBank(OUTPUT_DIRECTORY, plan, true,
-                     8_000, 16_000, 20, 3)) {
+             RecorderBank recorders = new RecorderBank(config.outputDirectory(), plan, true,
+                     config.opusSampleRateHz(), config.opusBitrateBps(),
+                     config.opusFrameMillis(), config.opusComplexity())) {
+            FFT waterfallFft = debugWindow.waterfall() == null ? null : new FFT(WATERFALL_FFT_SIZE);
             float[] oneSample = new float[1];
             int waterfallFill = 0;
             long lastStatusNanos = System.nanoTime();
@@ -100,10 +89,12 @@ public final class AirbandRecorder {
                     break;
                 }
                 captureStats.accept(block);
-                waterfallFill = updateWaterfall(block, waterfallFft, debugWindow.waterfall(), waterfallFill);
+                if (waterfallFft != null) {
+                    waterfallFill = updateWaterfall(block, waterfallFft, debugWindow.waterfall(), waterfallFill);
+                }
                 int frames = analyzer.framesIn(block);
                 for (int i = 0; i < frames; i++) {
-                    var channelized = analyzer.execute(block, i);
+                    var channelized = analyzer.execute(block, i, preroll);
                     if (debugWindow.channelSpectrum() != null) {
                         debugWindow.channelSpectrum().accept(channelized);
                     }
@@ -115,7 +106,7 @@ public final class AirbandRecorder {
                     lastStatusNanos = now;
                     System.out.println(captureStats.statusAndReset());
                     System.out.printf("Squelch open: %,d / %,d channels, above threshold: %,d, max margin: %.1f dB%n",
-                            countOpen(state), plan.size(), countAboveMargin(state, SQUELCH_OPEN_DB), maxMargin(state));
+                            countOpen(status), plan.size(), countAboveMargin(status, SQUELCH_OPEN_DB), maxMargin(status));
                 }
             }
         } finally {
@@ -168,31 +159,31 @@ public final class AirbandRecorder {
                 ChannelPlan.frequencyForBin(pfb, bin) / 1_000_000.0);
     }
 
-    private static int countOpen(ChannelStateArrays state) {
+    private static int countOpen(ChannelStatus status) {
         int open = 0;
-        for (byte squelch : state.squelchState) {
-            if (squelch == ChannelStateArrays.OPEN) {
+        for (byte squelch : status.squelchState) {
+            if (squelch == ChannelStatus.OPEN) {
                 open++;
             }
         }
         return open;
     }
 
-    private static float maxMargin(ChannelStateArrays state) {
+    private static float maxMargin(ChannelStatus status) {
         float max = Float.NEGATIVE_INFINITY;
-        for (int i = 0; i < state.power.length; i++) {
-            if (Float.isFinite(state.power[i]) && Float.isFinite(state.noiseFloor[i])) {
-                max = Math.max(max, state.power[i] - state.noiseFloor[i]);
+        for (int i = 0; i < status.power.length; i++) {
+            if (Float.isFinite(status.power[i]) && Float.isFinite(status.noiseFloor[i])) {
+                max = Math.max(max, status.power[i] - status.noiseFloor[i]);
             }
         }
         return Float.isFinite(max) ? max : Float.NaN;
     }
 
-    private static int countAboveMargin(ChannelStateArrays state, float marginDb) {
+    private static int countAboveMargin(ChannelStatus status, float marginDb) {
         int count = 0;
-        for (int i = 0; i < state.power.length; i++) {
-            if (Float.isFinite(state.power[i]) && Float.isFinite(state.noiseFloor[i])
-                    && state.power[i] - state.noiseFloor[i] >= marginDb) {
+        for (int i = 0; i < status.power.length; i++) {
+            if (Float.isFinite(status.power[i]) && Float.isFinite(status.noiseFloor[i])
+                    && status.power[i] - status.noiseFloor[i] >= marginDb) {
                 count++;
             }
         }
@@ -201,16 +192,20 @@ public final class AirbandRecorder {
 
     private record DebugWindow(WaterfallPanel waterfall, ChannelActivityPanel activity,
                                ChannelSpectrumWaterfall channelSpectrum) implements AutoCloseable {
-        static DebugWindow open(ChannelPlan plan, PfbConfig pfb, ChannelStateArrays state) throws Exception {
+        static DebugWindow open(ChannelPlan plan, PfbConfig pfb, ChannelStatus status,
+                                boolean waterfallEnabled, boolean channelWaterfallEnabled) throws Exception {
+            if (!waterfallEnabled) {
+                return new DebugWindow(null, null, null);
+            }
             WaterfallPanel waterfall = new WaterfallPanel(1800, 720);
             waterfall.enableMouse();
             waterfall.setMinValue(-110.0f);
             waterfall.setMaxValue(-45.0f);
             waterfall.setZoomLevel(1.0);
 
-            JLabel status = new JLabel("Click a channel activity segment");
-            ChannelActivityPanel activity = new ChannelActivityPanel(plan, pfb, state, waterfall, status);
-            ChannelSpectrumWaterfall channelSpectrum = ENABLE_CHANNEL_WATERFALL
+            JLabel statusLabel = new JLabel("Click a channel activity segment");
+            ChannelActivityPanel activity = new ChannelActivityPanel(plan, pfb, status, waterfall, statusLabel);
+            ChannelSpectrumWaterfall channelSpectrum = channelWaterfallEnabled
                     ? new ChannelSpectrumWaterfall(activity)
                     : null;
             SwingUtilities.invokeAndWait(() -> {
@@ -218,7 +213,7 @@ public final class AirbandRecorder {
                 frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
                 JPanel bottom = new JPanel(new BorderLayout());
                 bottom.add(activity, BorderLayout.CENTER);
-                bottom.add(status, BorderLayout.SOUTH);
+                bottom.add(statusLabel, BorderLayout.SOUTH);
                 frame.add(waterfall, BorderLayout.CENTER);
                 frame.add(bottom, BorderLayout.SOUTH);
                 frame.pack();
@@ -236,7 +231,9 @@ public final class AirbandRecorder {
         }
 
         void repaintActivity() {
-            SwingUtilities.invokeLater(activity::repaint);
+            if (activity != null) {
+                SwingUtilities.invokeLater(activity::repaint);
+            }
         }
 
         @Override
@@ -297,6 +294,7 @@ public final class AirbandRecorder {
         private long nearFullScale;
         private double sumSquares;
         private float peak;
+        private static final float NEAR_FULL_SCALE_SQUARED = 0.98f * 0.98f;
 
         void accept(NativeSampleBlock block) {
             MemorySegment samplesSegment = block.samples();
@@ -304,11 +302,12 @@ public final class AirbandRecorder {
             for (int n = 0; n < availableSamples; n++) {
                 float i = samplesSegment.getAtIndex(java.lang.foreign.ValueLayout.JAVA_FLOAT, n * 2L);
                 float q = samplesSegment.getAtIndex(java.lang.foreign.ValueLayout.JAVA_FLOAT, n * 2L + 1L);
-                float mag = (float) Math.hypot(i, q);
+                float magnitudeSquared = i * i + q * q;
                 samples++;
-                sumSquares += i * i + q * q;
+                sumSquares += magnitudeSquared;
                 peak = Math.max(peak, Math.max(Math.abs(i), Math.abs(q)));
-                if (Math.abs(i) >= 0.98f || Math.abs(q) >= 0.98f || mag >= 0.98f) {
+                if (Math.abs(i) >= 0.98f || Math.abs(q) >= 0.98f
+                        || magnitudeSquared >= NEAR_FULL_SCALE_SQUARED) {
                     nearFullScale++;
                 }
             }
