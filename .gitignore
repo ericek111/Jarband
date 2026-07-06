@@ -1,3 +1,5 @@
 /.settings
 /hs_err_*
 /bin/
+/target/
+/recordings/

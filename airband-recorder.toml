@@ -1,0 +1,29 @@
+[sdr]
+args = "remote=10.0.34.40,remote:prot=tcp"
+sample_rate_hz = 8_000_000.0
+center_frequency_hz = 133_000_005.0
+
+[gains]
+LNA = 0.0
+Baseband = 25.0
+Mixer = 1.0
+Mixbuffer = 0.0
+
+[channels]
+# Frequencies are in Hz and matched to the nearest PFB bin.
+merge_25khz = []
+skip = [ 133_000_000 ]
+
+[recording]
+output_directory = "recordings"
+
+[opus]
+# 8000 gives narrowband speech; 16000 keeps more upper-frequency audio.
+sample_rate_hz = 16000
+bitrate_bps = 24000
+frame_millis = 20
+complexity = 5
+
+[debug]
+waterfall = false
+channel_waterfall = false
