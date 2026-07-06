@@ -69,7 +69,8 @@ public final class Vdl2SymbolSocket implements Vdl2SymbolSink, Closeable {
             drop(batch);
             return;
         }
-        ByteBuffer header = ByteBuffer.allocate(HEADER_BYTES).order(ByteOrder.BIG_ENDIAN);
+        ByteBuffer header = batch.header;
+        header.clear();
         header.putInt(frequencyHz);
         header.putLong(batch.firstUnixMillis);
         header.putFloat(batch.framePowerDbfs);
@@ -78,7 +79,7 @@ public final class Vdl2SymbolSocket implements Vdl2SymbolSink, Closeable {
         header.putShort((short) batch.count);
         header.putInt(batch.flags);
         try {
-            output.write(header.array());
+            output.write(batch.headerBytes);
             output.write(batch.symbols, 0, batch.count);
             batchesSent++;
             symbolsSent += batch.count;
@@ -173,6 +174,8 @@ public final class Vdl2SymbolSocket implements Vdl2SymbolSink, Closeable {
 
     private static final class Batch {
         final byte[] symbols = new byte[MAX_SYMBOLS_PER_BATCH];
+        final byte[] headerBytes = new byte[HEADER_BYTES];
+        final ByteBuffer header = ByteBuffer.wrap(headerBytes).order(ByteOrder.BIG_ENDIAN);
         long firstUnixMillis;
         float framePowerDbfs;
         float noiseFloorDbfs;

@@ -11,43 +11,37 @@ public final class Vdl2ChannelProcessor implements AutoCloseable {
     private static final float CHANNEL_FILTER_CUTOFF_HZ = 7_000.0f;
     private static final float CHANNEL_FILTER_STOPBAND_DB = 80.0f;
     private static final int OVERSAMPLE = Vdl2WidebandResampler.OUTPUT_RATE / Vdl2Demodulator.SAMPLE_RATE;
-    private static final float TWO_PI = (float) (2.0 * Math.PI);
-    private static final float[] SIN_LUT = new float[257];
-    private static final float[] COS_LUT = new float[257];
-
-    static {
-        for (int i = 0; i < 256; i++) {
-            float phase = TWO_PI * i / 256.0f;
-            SIN_LUT[i] = (float) Math.sin(phase);
-            COS_LUT[i] = (float) Math.cos(phase);
-        }
-        SIN_LUT[256] = SIN_LUT[0];
-        COS_LUT[256] = COS_LUT[0];
-    }
 
     private final int frequencyHz;
     private final Vdl2Demodulator demodulator;
     private final boolean offsetTuning;
-    private final int downmixDphi;
     private final Arena arena = Arena.ofShared();
-    private final MemorySegment channelFilter = LiquidDsp.firfilt_crcf_create_kaiser(
-            CHANNEL_FILTER_TAPS,
-            CHANNEL_FILTER_CUTOFF_HZ / Vdl2WidebandResampler.OUTPUT_RATE,
-            CHANNEL_FILTER_STOPBAND_DB,
-            0.0f);
-    private MemorySegment mixed;
-    private MemorySegment filtered;
+    private final MemorySegment nco;
+    private final MemorySegment channelDecimator;
+    private final MemorySegment residual = arena.allocate((long) OVERSAMPLE * 2L * Float.BYTES,
+            ValueLayout.JAVA_FLOAT.byteAlignment());
+    private MemorySegment decimInput;
+    private MemorySegment decimated;
     private int capacity;
-    private int downmixPhi;
-    private int decimator;
+    private int outputCapacity;
+    private int residualSamples;
+    private long residualStartNanos;
     private long unixMillisBase = System.currentTimeMillis();
     private long nanosBase = System.nanoTime();
 
     public Vdl2ChannelProcessor(int frequencyHz, double centerFrequencyHz, Vdl2SymbolSink sink) {
         this.frequencyHz = frequencyHz;
         this.offsetTuning = Math.round(centerFrequencyHz) != frequencyHz;
-        this.downmixDphi = (int) (((float) centerFrequencyHz - frequencyHz)
-                / Vdl2WidebandResampler.OUTPUT_RATE * 256.0f * 65_536.0f);
+        this.nco = LiquidDsp.nco_crcf_create(0);
+        LiquidDsp.nco_crcf_set_frequency(nco,
+                (float) (2.0 * Math.PI * (centerFrequencyHz - frequencyHz) / Vdl2WidebandResampler.OUTPUT_RATE));
+        MemorySegment taps = arena.allocate((long) CHANNEL_FILTER_TAPS * Float.BYTES,
+                ValueLayout.JAVA_FLOAT.byteAlignment());
+        LiquidDsp.liquid_firdes_kaiser(taps,
+                CHANNEL_FILTER_CUTOFF_HZ / Vdl2WidebandResampler.OUTPUT_RATE,
+                CHANNEL_FILTER_STOPBAND_DB,
+                0.0f);
+        this.channelDecimator = LiquidDsp.firdecim_crcf_create(OVERSAMPLE, taps, CHANNEL_FILTER_TAPS);
         this.demodulator = new Vdl2Demodulator(frequencyHz, sink);
     }
 
@@ -61,50 +55,71 @@ public final class Vdl2ChannelProcessor implements AutoCloseable {
 
     public void process(MemorySegment samples, int sampleCount, long blockStartNanos) {
         ensureCapacity(sampleCount);
-        mixBlock(samples, sampleCount);
-        int rc = LiquidDsp.firfilt_crcf_execute_block(channelFilter, mixed, sampleCount, filtered);
+        int combinedSamples = residualSamples + sampleCount;
+        long combinedStartNanos = residualSamples == 0 ? blockStartNanos : residualStartNanos;
+        if (residualSamples > 0) {
+            decimInput.asSlice(0, (long) residualSamples * 2L * Float.BYTES)
+                    .copyFrom(residual.asSlice(0, (long) residualSamples * 2L * Float.BYTES));
+        }
+        mixBlock(samples, sampleCount, residualSamples);
+
+        int outputSamples = combinedSamples / OVERSAMPLE;
+        if (outputSamples == 0) {
+            saveResidual(0, combinedSamples, combinedStartNanos);
+            return;
+        }
+        int rc = LiquidDsp.firdecim_crcf_execute_block(channelDecimator, decimInput, outputSamples, decimated);
         if (rc != 0) {
-            throw new IllegalStateException("firfilt_crcf_execute_block failed: " + rc);
+            throw new IllegalStateException("firdecim_crcf_execute_block failed: " + rc);
         }
 
-        for (int n = 0; n < sampleCount; n++) {
-            float filteredRe = filtered.getAtIndex(ValueLayout.JAVA_FLOAT, n * 2L);
-            float filteredIm = filtered.getAtIndex(ValueLayout.JAVA_FLOAT, n * 2L + 1L);
-            if (++decimator == OVERSAMPLE) {
-                decimator = 0;
-                long nanos = blockStartNanos
-                        + Math.round(n / (double) Vdl2WidebandResampler.OUTPUT_RATE * 1_000_000_000.0);
-                demodulator.accept(filteredRe, filteredIm, unixMillisForNanos(nanos));
-            }
+        for (int n = 0; n < outputSamples; n++) {
+            float filteredRe = decimated.getAtIndex(ValueLayout.JAVA_FLOAT, n * 2L);
+            float filteredIm = decimated.getAtIndex(ValueLayout.JAVA_FLOAT, n * 2L + 1L);
+            long nanos = combinedStartNanos
+                    + Math.round(((long) n * OVERSAMPLE + (OVERSAMPLE - 1))
+                    / (double) Vdl2WidebandResampler.OUTPUT_RATE * 1_000_000_000.0);
+            demodulator.accept(filteredRe, filteredIm, unixMillisForNanos(nanos));
         }
+        saveResidual(outputSamples * OVERSAMPLE, combinedSamples - outputSamples * OVERSAMPLE,
+                combinedStartNanos + Math.round(outputSamples * OVERSAMPLE
+                / (double) Vdl2WidebandResampler.OUTPUT_RATE * 1_000_000_000.0));
     }
 
     private void ensureCapacity(int sampleCount) {
-        if (sampleCount <= capacity) {
-            return;
+        int needed = sampleCount + OVERSAMPLE;
+        if (needed > capacity) {
+            decimInput = arena.allocate((long) needed * 2L * Float.BYTES, ValueLayout.JAVA_FLOAT.byteAlignment());
+            capacity = needed;
         }
-        mixed = arena.allocate((long) sampleCount * 2L * Float.BYTES, ValueLayout.JAVA_FLOAT.byteAlignment());
-        filtered = arena.allocate((long) sampleCount * 2L * Float.BYTES, ValueLayout.JAVA_FLOAT.byteAlignment());
-        capacity = sampleCount;
+        int outputNeeded = (needed + OVERSAMPLE - 1) / OVERSAMPLE;
+        if (outputNeeded > outputCapacity) {
+            decimated = arena.allocate((long) outputNeeded * 2L * Float.BYTES, ValueLayout.JAVA_FLOAT.byteAlignment());
+            outputCapacity = outputNeeded;
+        }
     }
 
-    private void mixBlock(MemorySegment samples, int sampleCount) {
+    private void mixBlock(MemorySegment samples, int sampleCount, int outputOffsetSamples) {
+        MemorySegment target = decimInput.asSlice((long) outputOffsetSamples * 2L * Float.BYTES,
+                (long) sampleCount * 2L * Float.BYTES);
         if (!offsetTuning) {
-            mixed.asSlice(0, (long) sampleCount * 2L * Float.BYTES)
-                    .copyFrom(samples.asSlice(0, (long) sampleCount * 2L * Float.BYTES));
+            target.copyFrom(samples.asSlice(0, (long) sampleCount * 2L * Float.BYTES));
             return;
         }
-        int phi = downmixPhi;
-        for (int n = 0; n < sampleCount; n++) {
-            float re = samples.getAtIndex(ValueLayout.JAVA_FLOAT, n * 2L);
-            float im = samples.getAtIndex(ValueLayout.JAVA_FLOAT, n * 2L + 1L);
-            float sine = sinLut(phi);
-            float cosine = cosLut(phi);
-            mixed.setAtIndex(ValueLayout.JAVA_FLOAT, n * 2L, re * cosine - im * sine);
-            mixed.setAtIndex(ValueLayout.JAVA_FLOAT, n * 2L + 1L, im * cosine + re * sine);
-            phi = (phi + downmixDphi) & 0x00ff_ffff;
+        int rc = LiquidDsp.nco_crcf_mix_block_up(nco, samples, target, sampleCount);
+        if (rc != 0) {
+            throw new IllegalStateException("nco_crcf_mix_block_up failed: " + rc);
         }
-        downmixPhi = phi;
+    }
+
+    private void saveResidual(int sourceOffsetSamples, int newResidualSamples, long newResidualStartNanos) {
+        residualSamples = newResidualSamples;
+        residualStartNanos = newResidualStartNanos;
+        if (residualSamples > 0) {
+            residual.asSlice(0, (long) residualSamples * 2L * Float.BYTES)
+                    .copyFrom(decimInput.asSlice((long) sourceOffsetSamples * 2L * Float.BYTES,
+                            (long) residualSamples * 2L * Float.BYTES));
+        }
     }
 
     private long unixMillisForNanos(long nanos) {
@@ -112,21 +127,10 @@ public final class Vdl2ChannelProcessor implements AutoCloseable {
         return unixMillisBase + Math.round(elapsedNanos / 1_000_000.0);
     }
 
-    private static float sinLut(int phi) {
-        int idx = phi >>> 16;
-        float fract = (phi & 0xffff) / 65_536.0f;
-        return SIN_LUT[idx] + (SIN_LUT[idx + 1] - SIN_LUT[idx]) * fract;
-    }
-
-    private static float cosLut(int phi) {
-        int idx = phi >>> 16;
-        float fract = (phi & 0xffff) / 65_536.0f;
-        return COS_LUT[idx] + (COS_LUT[idx + 1] - COS_LUT[idx]) * fract;
-    }
-
     @Override
     public void close() {
-        LiquidDsp.firfilt_crcf_destroy(channelFilter);
+        LiquidDsp.firdecim_crcf_destroy(channelDecimator);
+        LiquidDsp.nco_crcf_destroy(nco);
         arena.close();
     }
 }

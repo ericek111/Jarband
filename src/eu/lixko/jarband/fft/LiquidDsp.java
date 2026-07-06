@@ -310,6 +310,42 @@ public class LiquidDsp {
         return (int) NativeUtils.call(firfilt_crcf_set_scale, q, scale);
     }
 
+    // ========== FIR Decimator (firdecim_crcf) - Complex input, complex output ==========
+
+    private static ApiMethod firdecim_crcf_create = new ApiMethod("firdecim_crcf_create", FunctionDescriptor.of(
+        ValueLayout.ADDRESS,
+        ValueLayout.JAVA_INT,
+        ValueLayout.ADDRESS,
+        ValueLayout.JAVA_INT
+    ));
+    public static MemorySegment firdecim_crcf_create(int m, MemorySegment h, int hLen) {
+        return (MemorySegment) NativeUtils.call(firdecim_crcf_create, m, h, hLen);
+    }
+
+    private static ApiMethod firdecim_crcf_destroy = new ApiMethod("firdecim_crcf_destroy", FunctionDescriptor.of(
+        ValueLayout.JAVA_INT,
+        ValueLayout.ADDRESS
+    ));
+    public static int firdecim_crcf_destroy(MemorySegment q) {
+        return (int) NativeUtils.call(firdecim_crcf_destroy, q);
+    }
+
+    private static ApiMethod firdecim_crcf_execute_block = new ApiMethod("firdecim_crcf_execute_block", FunctionDescriptor.of(
+        ValueLayout.JAVA_INT,
+        ValueLayout.ADDRESS,
+        ValueLayout.ADDRESS,
+        ValueLayout.JAVA_INT,
+        ValueLayout.ADDRESS
+    ));
+    public static int firdecim_crcf_execute_block(MemorySegment q, MemorySegment x, int n, MemorySegment y) {
+        try {
+            return (int) firdecim_crcf_execute_block.HANDLE.invokeExact(q, x, n, y);
+        } catch (Throwable e) {
+            e.printStackTrace();
+            return -1;
+        }
+    }
+
     // ========== FIR Filter (firfilt_cccf) - Complex coefficients, complex input/output ==========
     // Used for asymmetric filters such as the SSB channel bandpass, where the
     // passband is one-sided around DC and cannot be expressed with real-symmetric taps.

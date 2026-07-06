@@ -28,6 +28,7 @@ public final class Vdl2Demodulator {
     private final int frequencyHz;
     private final Vdl2SymbolSink sink;
     private final float[] syncBuffer = new float[SYNC_BUFFER_LENGTH];
+    private final float[] syncError = new float[PREAMBLE_SYMBOLS];
     private final float[] phaseError = new float[3];
     private State state = State.SEARCHING;
     private int syncBufferIndex;
@@ -130,12 +131,11 @@ public final class Vdl2Demodulator {
     }
 
     private boolean gotSync() {
-        float[] error = new float[PREAMBLE_SYMBOLS];
         float errorMean = 0.0f;
         float unwrap = 0.0f;
         float previousError = syncBuffer[(syncBufferIndex + SAMPLES_PER_SYMBOL) % SYNC_BUFFER_LENGTH]
                 - PREAMBLE_PHASE[0];
-        error[0] = previousError;
+        syncError[0] = previousError;
         errorMean += previousError;
         for (int i = 1; i < PREAMBLE_SYMBOLS; i++) {
             float currentError = syncBuffer[(syncBufferIndex + (i + 1) * SAMPLES_PER_SYMBOL) % SYNC_BUFFER_LENGTH]
@@ -147,21 +147,21 @@ public final class Vdl2Demodulator {
             } else if (diff < -Math.PI) {
                 unwrap += TWO_PI;
             }
-            error[i] = currentError + unwrap;
-            errorMean += error[i];
+            syncError[i] = currentError + unwrap;
+            errorMean += syncError[i];
         }
         errorMean /= PREAMBLE_SYMBOLS;
 
         float frequencyError = 0.0f;
         for (int i = 0; i < PREAMBLE_SYMBOLS; i++) {
-            error[i] -= errorMean;
-            frequencyError += LR_X[i] * error[i];
+            syncError[i] -= errorMean;
+            frequencyError += LR_X[i] * syncError[i];
         }
         frequencyError /= LR_DENOM;
 
         phaseError[0] = 0.0f;
         for (int i = 0; i < PREAMBLE_SYMBOLS; i++) {
-            float corrected = error[i] - frequencyError * LR_X[i];
+            float corrected = syncError[i] - frequencyError * LR_X[i];
             phaseError[0] += corrected * corrected;
         }
         lastSyncError = phaseError[0];
