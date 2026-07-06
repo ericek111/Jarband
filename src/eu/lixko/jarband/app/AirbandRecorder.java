@@ -28,7 +28,7 @@ import eu.lixko.jsoapy.util.NativeUtils;
 
 public final class AirbandRecorder {
     private static final int WATERFALL_FFT_SIZE = 262_144;
-    private static final int CHANNELIZED_QUEUE_CAPACITY = 1024;
+    private static final int CHANNELIZED_QUEUE_CAPACITY = 64;
 
     private AirbandRecorder() {}
 
@@ -64,9 +64,18 @@ public final class AirbandRecorder {
                 (int) Math.ceil(pfb.channelOutputRateHz() * config.squelchPrerollMillis() / 1000.0));
         int closeLookaheadFrames = Math.max(1,
                 (int) Math.ceil(pfb.channelOutputRateHz() * config.squelchCloseLookaheadMillis() / 1000.0));
-        ChannelizedFrameRing preroll = new ChannelizedFrameRing(
-                prerollFrames + closeLookaheadFrames + CHANNELIZED_QUEUE_CAPACITY + 16,
-                pfb.branches());
+        int ringFrames = prerollFrames + closeLookaheadFrames + CHANNELIZED_QUEUE_CAPACITY + 16;
+        long ringBytes = (long) ringFrames * pfb.branches() * 2L * Float.BYTES;
+        long maxHeap = Runtime.getRuntime().maxMemory();
+        if (ringBytes > maxHeap / 2) {
+            throw new IllegalStateException(String.format(java.util.Locale.ROOT,
+                    "Channelized replay ring would need %.1f MiB, more than half of the %.1f MiB max heap. "
+                            + "Reduce sample rate/PFB branches or increase -Xmx.",
+                    ringBytes / 1024.0 / 1024.0, maxHeap / 1024.0 / 1024.0));
+        }
+        System.out.printf("Channelized replay ring: %,d frames, %.1f MiB%n",
+                ringFrames, ringBytes / 1024.0 / 1024.0);
+        ChannelizedFrameRing preroll = new ChannelizedFrameRing(ringFrames, pfb.branches());
         AirbandFrameProcessor processor = new AirbandFrameProcessor(
                 plan, preroll, prerollFrames, pfb.channelOutputRateHz(), config.opusSampleRateHz(),
                 config.squelchOpenDb(), config.squelchCloseDb(),

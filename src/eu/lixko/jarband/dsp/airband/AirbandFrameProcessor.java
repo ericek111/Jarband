@@ -11,6 +11,7 @@ public final class AirbandFrameProcessor implements AutoCloseable {
     private static final float POWER_ALPHA = 0.005f;
     private static final int STATUS_DB_UPDATE_MASK = 0x7f;
     private static final int NOISE_FLOOR_UPDATE_MASK = 0x0f;
+    private static final int SAMPLED_NOISE_STRIDE = 4;
 
     private final ChannelPlan plan;
     private final ChannelStatus status;
@@ -73,7 +74,7 @@ public final class AirbandFrameProcessor implements AutoCloseable {
         int active = 0;
         float bandNoiseFloor = channels.bandNoiseFloor;
         if (!Float.isFinite(bandNoiseFloor) || (sequence & NOISE_FLOOR_UPDATE_MASK) == 0) {
-            bandNoiseFloor = median(channels.power, channels.medianScratch);
+            bandNoiseFloor = median(channels.power, channels.noiseScratch);
             channels.bandNoiseFloor = bandNoiseFloor;
         }
         boolean updateStatusDb = (sequence & STATUS_DB_UPDATE_MASK) == 0;
@@ -247,7 +248,7 @@ public final class AirbandFrameProcessor implements AutoCloseable {
         final float[] i;
         final float[] q;
         final float[] power;
-        final float[] medianScratch;
+        final float[] noiseScratch;
         float bandNoiseFloor = Float.NaN;
 
         ChannelRuntimeState(int channelCount) {
@@ -260,7 +261,7 @@ public final class AirbandFrameProcessor implements AutoCloseable {
             i = new float[channelCount];
             q = new float[channelCount];
             power = new float[channelCount];
-            medianScratch = new float[channelCount];
+            noiseScratch = new float[channelCount];
             Arrays.fill(candidateStartSequence, -1L);
             Arrays.fill(lastSignalSequence, -1L);
             Arrays.fill(nextEmitSequence, -1L);
@@ -273,6 +274,25 @@ public final class AirbandFrameProcessor implements AutoCloseable {
         // per-channel isFinite branch in this hot path.
         System.arraycopy(values, 0, scratch, 0, values.length);
         return select(scratch, 0, values.length - 1, values.length / 2);
+    }
+
+    @SuppressWarnings("unused")
+    private static float sampledMedian(float[] values, float[] scratch, long sequence) {
+        if (values.length == 0) {
+            return 1.0e-20f;
+        }
+        // An exact median of every channel is robust but costs a full-array copy
+        // plus quickselect. Sampling every fourth channel keeps the same
+        // carrier-resistant behavior for sparse airband activity at lower cost.
+        // Noise updates happen every 16 frames, so rotate the sampled phase using
+        // higher sequence bits; the low four bits are zero on every update.
+        int stride = values.length >= 512 ? SAMPLED_NOISE_STRIDE : 2;
+        int offset = (int) ((sequence >>> 4) & (stride - 1));
+        int count = 0;
+        for (int i = offset; i < values.length; i += stride) {
+            scratch[count++] = values[i];
+        }
+        return select(scratch, 0, count - 1, count / 2);
     }
 
     private static float select(float[] values, int left, int right, int k) {
