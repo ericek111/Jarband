@@ -1,7 +1,7 @@
 package eu.lixko.jarband.dsp.airband;
 
 public final class PowerSquelch {
-    private static final int MIN_OPEN_SAMPLES = 250;
+    private static final int MIN_OPEN_SAMPLES = 120;
     private static final float POWER_ALPHA = 0.005f;
 
     private final ChannelStateArrays state;

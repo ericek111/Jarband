@@ -34,14 +34,15 @@ public final class AirbandRecorder {
     private static final String SDR_ARGS = "remote=10.0.34.40,remote:prot=tcp";
     private static final double SDR_SAMPLE_RATE_HZ = 8_000_000.0;
     private static final double SDR_CENTER_FREQUENCY_HZ = 133_000_005.0;
-    private static final Map<String, Double> SDR_GAINS = Map.of("LNA", 1d, "Baseband", 23d, "Mixer", 0d, "Mixbuffer", 0d);
+    // private static final Map<String, Double> SDR_GAINS = Map.of("LNA", 1d, "Baseband", 23d, "Mixer", 0d, "Mixbuffer", 0d);
+    private static final Map<String, Double> SDR_GAINS = Map.of("LNA", 0d, "Baseband", 25d, "Mixer", 19d, "Mixbuffer", 0d);
 
     private static final int WATERFALL_FFT_SIZE = 262_144;
     private static final boolean ENABLE_CHANNEL_WATERFALL = false;
 
-    private static final float SQUELCH_OPEN_DB = 12.0f;
-    private static final float SQUELCH_CLOSE_DB = 8.0f;
-    private static final int SQUELCH_HANG_MILLIS = 800;
+    private static final float SQUELCH_OPEN_DB = 18.0f;
+    private static final float SQUELCH_CLOSE_DB = 15.0f;
+    private static final int SQUELCH_HANG_MILLIS = 150;
     private static final int PREROLL_MILLIS = 500;
     private static final int UTTERANCE_MERGE_MILLIS = 2_500;
 
@@ -87,7 +88,6 @@ public final class AirbandRecorder {
         try (DebugWindow debugWindow = debug;
              LiquidPfbAnalyzer analyzer = new LiquidPfbAnalyzer(pfb);
              FFT waterfallFft = new FFT(WATERFALL_FFT_SIZE);
-             AirbandFrameProcessor frameProcessor = processor;
              RecorderBank recorders = new RecorderBank(OUTPUT_DIRECTORY, plan, true,
                      8_000, 16_000, 20, 3)) {
             float[] oneSample = new float[1];
@@ -108,7 +108,7 @@ public final class AirbandRecorder {
                     if (debugWindow.channelSpectrum() != null) {
                         debugWindow.channelSpectrum().accept(channelized);
                     }
-                    frameProcessor.process(channelized, oneSample, recorders::accept);
+                    processor.process(channelized, oneSample, recorders::accept);
                 }
                 debugWindow.repaintActivity();
                 long now = System.nanoTime();

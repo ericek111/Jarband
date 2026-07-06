@@ -3,6 +3,8 @@ package eu.lixko.jarband.dsp.airband;
 public final class AirbandAmDemodulator {
     public static final double DEFAULT_IF_SAMPLE_RATE = 15_000.0;
     public static final double DEFAULT_BANDWIDTH = 10_000.0;
+    private static final float OUTPUT_GAIN = 0.4f;
+    private static final float OUTPUT_LIMIT = 0.8f;
 
     private final DcBlocker dcBlock;
     private final AudioAgc audioAgc;
@@ -15,7 +17,7 @@ public final class AirbandAmDemodulator {
     public AirbandAmDemodulator(double sampleRate, double bandwidth) {
         double usableBandwidth = Math.min(bandwidth, sampleRate * 0.9);
         this.dcBlock = new DcBlocker(100.0 / sampleRate);
-        this.audioAgc = new AudioAgc(50.0 / sampleRate, 5.0 / sampleRate);
+        this.audioAgc = new AudioAgc(120.0 / sampleRate, 20.0 / sampleRate);
         // SDR++ builds lowPass(bandwidth / 2, (bandwidth / 2) * 0.1, sampleRate).
         // That is a narrow post-envelope filter, so keep the same transition width here.
         this.lowPass = FirFilter.lowPass(usableBandwidth * 0.5, usableBandwidth * 0.05, sampleRate);
@@ -27,7 +29,7 @@ public final class AirbandAmDemodulator {
         audio = dcBlock.process(audio);
         audio = audioAgc.process(audio);
         audio = lowPass.process(audio);
-        return clamp(audio, -1.0f, 1.0f);
+        return clamp(audio * OUTPUT_GAIN, -OUTPUT_LIMIT, OUTPUT_LIMIT);
     }
 
     private static float clamp(float value, float min, float max) {
@@ -51,9 +53,9 @@ public final class AirbandAmDemodulator {
     }
 
     private static final class AudioAgc {
-        private static final float SET_POINT = 1.0f;
+        private static final float SET_POINT = 0.65f;
         private static final float MAX_GAIN = 10_000_000.0f;
-        private static final float MAX_OUTPUT_AMP = 10.0f;
+        private static final float MAX_OUTPUT_AMP = 0.8f;
 
         private final float attack;
         private final float invAttack;

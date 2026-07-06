@@ -7,9 +7,7 @@ import eu.lixko.jarband.dsp.channelizer.ChannelizedFrame;
 import eu.lixko.jarband.dsp.channelizer.ChannelizedFrameRing;
 import eu.lixko.jarband.dsp.channelizer.LogicalChannel;
 
-public final class AirbandFrameProcessor implements AutoCloseable {
-    private static final int AUDIO_RESAMPLE_BATCH = 128;
-
+public final class AirbandFrameProcessor {
     private final ChannelPlan plan;
     private final ChannelStateArrays state;
     private final PowerSquelch squelch;
@@ -22,10 +20,7 @@ public final class AirbandFrameProcessor implements AutoCloseable {
     private final float[] channelQ;
     private final float[] channelPower;
     private final float[] medianScratch;
-    private final AirbandAmDemodulator[] demods;
-    private final AudioResampler[] audioResamplers;
-    private final float[][] audioBatches;
-    private final int[] audioBatchFill;
+    private final ChannelAudioPipeline audio;
     private final Clock clock;
 
     public AirbandFrameProcessor(ChannelPlan plan, ChannelStateArrays state, PowerSquelch squelch,
@@ -44,18 +39,11 @@ public final class AirbandFrameProcessor implements AutoCloseable {
         this.channelQ = new float[plan.size()];
         this.channelPower = new float[plan.size()];
         this.medianScratch = new float[plan.size()];
-        this.demods = new AirbandAmDemodulator[plan.size()];
-        this.audioResamplers = new AudioResampler[plan.size()];
-        this.audioBatches = new float[plan.size()][AUDIO_RESAMPLE_BATCH];
-        this.audioBatchFill = new int[plan.size()];
-        for (int channel = 0; channel < demods.length; channel++) {
-            demods[channel] = new AirbandAmDemodulator(channelSampleRate);
-            audioResamplers[channel] = new AudioResampler(channelSampleRate, audioSampleRate, AUDIO_RESAMPLE_BATCH);
-        }
+        this.audio = new ChannelAudioPipeline(plan.size(), channelSampleRate, audioSampleRate);
         this.clock = clock;
     }
 
-    public int process(ChannelizedFrame frame, float[] activeAudioScratch, ActiveAudioSink sink) {
+    public int process(ChannelizedFrame frame, float[] activeAudioScratch, ChannelAudioPipeline.AudioSink sink) {
         long now = clock.millis();
         long sequence = preroll.append(frame);
         int active = 0;
@@ -85,9 +73,7 @@ public final class AirbandFrameProcessor implements AutoCloseable {
                     replayPreroll(channel, sequence, frame.capturedNanos(), now, activeAudioScratch, sink);
                 }
                 pendingCloseMillis[channelId] = 0;
-                emitAudio(channelId, now,
-                        demods[channelId].demodulate(channelI[channelId], channelQ[channelId]),
-                        activeAudioScratch, sink);
+                audio.acceptIq(channelId, now, channelI[channelId], channelQ[channelId], sink);
                 active++;
             } else {
                 maybeCloseRecording(channelId, now, activeAudioScratch, sink);
@@ -134,7 +120,8 @@ public final class AirbandFrameProcessor implements AutoCloseable {
         return values[left];
     }
 
-    private void maybeCloseRecording(int channelId, long nowMillis, float[] activeAudioScratch, ActiveAudioSink sink) {
+    private void maybeCloseRecording(int channelId, long nowMillis, float[] activeAudioScratch,
+                                     ChannelAudioPipeline.AudioSink sink) {
         if (!recordingOpen[channelId]) {
             return;
         }
@@ -143,7 +130,8 @@ public final class AirbandFrameProcessor implements AutoCloseable {
             return;
         }
         if (nowMillis - pendingCloseMillis[channelId] >= utteranceMergeMillis) {
-            flushAudio(channelId, nowMillis, activeAudioScratch, sink);
+            audio.flush(channelId, nowMillis, sink);
+            audio.reset(channelId);
             recordingOpen[channelId] = false;
             pendingCloseMillis[channelId] = 0;
             sink.accept(channelId, nowMillis, activeAudioScratch, 0);
@@ -151,44 +139,11 @@ public final class AirbandFrameProcessor implements AutoCloseable {
     }
 
     private void replayPreroll(LogicalChannel channel, long currentSequence, long currentNanos, long nowMillis,
-                               float[] activeAudioScratch, ActiveAudioSink sink) {
+                               float[] activeAudioScratch, ChannelAudioPipeline.AudioSink sink) {
         long firstSequence = currentSequence - prerollFrames;
         preroll.replay(channel, firstSequence, currentSequence, (i, q, capturedNanos) -> {
             long sampleMillis = nowMillis - Math.max(0L, currentNanos - capturedNanos) / 1_000_000L;
-            emitAudio(channel.id(), sampleMillis, demods[channel.id()].demodulate(i, q), activeAudioScratch, sink);
+            audio.acceptIq(channel.id(), sampleMillis, i, q, sink);
         });
-    }
-
-    private void emitAudio(int channelId, long unixMillis, float audio,
-                           float[] activeAudioScratch, ActiveAudioSink sink) {
-        float[] batch = audioBatches[channelId];
-        batch[audioBatchFill[channelId]++] = audio;
-        if (audioBatchFill[channelId] == batch.length) {
-            flushAudio(channelId, unixMillis, activeAudioScratch, sink);
-        }
-    }
-
-    private void flushAudio(int channelId, long unixMillis, float[] activeAudioScratch, ActiveAudioSink sink) {
-        int count = audioBatchFill[channelId];
-        if (count == 0) {
-            return;
-        }
-        float[] resampled = audioResamplers[channelId].process(audioBatches[channelId], count);
-        audioBatchFill[channelId] = 0;
-        if (resampled.length > 0) {
-            sink.accept(channelId, unixMillis, resampled, resampled.length);
-        }
-    }
-
-    @Override
-    public void close() {
-        for (AudioResampler resampler : audioResamplers) {
-            resampler.close();
-        }
-    }
-
-    @FunctionalInterface
-    public interface ActiveAudioSink {
-        void accept(int channelId, long unixMillis, float[] audio, int length);
     }
 }
