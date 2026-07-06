@@ -16,11 +16,12 @@ public final class AirbandFrameProcessor {
     // carrier drop and trim the tail instead of committing post-squelch noise.
     private static final int CLOSE_LOOKAHEAD_MILLIS = 100;
     private static final float POWER_ALPHA = 0.005f;
+    private static final int STATUS_DB_UPDATE_MASK = 0x7f;
 
     private final ChannelPlan plan;
     private final ChannelStatus status;
-    private final float squelchOpenDb;
-    private final float squelchCloseDb;
+    private final float squelchOpenRatio;
+    private final float squelchCloseRatio;
     private final ChannelizedFrameRing preroll;
     private final int prerollFrames;
     private final int openConfirmFrames;
@@ -34,8 +35,8 @@ public final class AirbandFrameProcessor {
                                  float squelchOpenDb, float squelchCloseDb, Clock clock) {
         this.plan = plan;
         this.status = new ChannelStatus(plan.size());
-        this.squelchOpenDb = squelchOpenDb;
-        this.squelchCloseDb = squelchCloseDb;
+        this.squelchOpenRatio = dbToPowerRatio(squelchOpenDb);
+        this.squelchCloseRatio = dbToPowerRatio(squelchCloseDb);
         this.preroll = preroll;
         this.prerollFrames = prerollFrames;
         this.openConfirmFrames = Math.max(1, (int) Math.ceil(channelSampleRate * OPEN_CONFIRM_MILLIS / 1000.0));
@@ -65,15 +66,18 @@ public final class AirbandFrameProcessor {
             }
             channels.i[channelId] = i / bins.length;
             channels.q[channelId] = q / bins.length;
-            channels.power[channelId] = measurePower(channelId, channels.i[channelId], channels.q[channelId]);
+            channels.power[channelId] = measurePower(channels.i[channelId], channels.q[channelId]);
         }
 
         int active = 0;
-        float bandNoiseFloorDb = median(channels.power, channels.medianScratch);
+        float bandNoiseFloor = median(channels.power, channels.medianScratch);
+        boolean updateStatusDb = (sequence & STATUS_DB_UPDATE_MASK) == 0;
         for (LogicalChannel channel : plan.channels()) {
             int channelId = channel.id();
-            status.noiseFloor[channelId] = bandNoiseFloorDb;
-            if (updateGate(channel, sequence, frame.capturedNanos(), now, bandNoiseFloorDb, activeAudioScratch, sink)) {
+            if (updateStatusDb) {
+                updateStatusPower(channelId, bandNoiseFloor);
+            }
+            if (updateGate(channel, sequence, frame.capturedNanos(), now, bandNoiseFloor, activeAudioScratch, sink)) {
                 active++;
             }
         }
@@ -81,12 +85,12 @@ public final class AirbandFrameProcessor {
     }
 
     private boolean updateGate(LogicalChannel channel, long sequence, long currentNanos, long nowMillis,
-                               float bandNoiseFloorDb, float[] activeAudioScratch,
+                               float bandNoiseFloor, float[] activeAudioScratch,
                                AudioSink sink) {
         int channelId = channel.id();
-        float marginDb = channels.power[channelId] - bandNoiseFloorDb;
-        boolean aboveOpen = marginDb >= squelchOpenDb;
-        boolean aboveClose = marginDb >= squelchCloseDb;
+        float thresholdBase = Math.max(bandNoiseFloor, 1.0e-20f);
+        boolean aboveOpen = channels.power[channelId] >= thresholdBase * squelchOpenRatio;
+        boolean aboveClose = channels.power[channelId] >= thresholdBase * squelchCloseRatio;
 
         if (!channels.gateOpen[channelId]) {
             status.squelchState[channelId] = ChannelStatus.CLOSED;
@@ -171,15 +175,26 @@ public final class AirbandFrameProcessor {
         channels.nextEmitSequence[channelId] = lastSequenceExclusive;
     }
 
-    private float measurePower(int channel, float i, float q) {
-        float linear = i * i + q * q + 1.0e-20f;
-        float instantDb = 10.0f * (float) Math.log10(linear);
+    private static float measurePower(float i, float q) {
+        return i * i + q * q + 1.0e-20f;
+    }
+
+    private void updateStatusPower(int channel, float bandNoiseFloor) {
+        float instantDb = powerToDb(channels.power[channel]);
         if (!Float.isFinite(status.power[channel])) {
             status.power[channel] = instantDb;
         } else {
             status.power[channel] += POWER_ALPHA * (instantDb - status.power[channel]);
         }
-        return instantDb;
+        status.noiseFloor[channel] = powerToDb(bandNoiseFloor);
+    }
+
+    private static float dbToPowerRatio(float db) {
+        return (float) Math.pow(10.0, db / 10.0);
+    }
+
+    private static float powerToDb(float power) {
+        return 10.0f * (float) Math.log10(Math.max(power, 1.0e-20f));
     }
 
     @FunctionalInterface

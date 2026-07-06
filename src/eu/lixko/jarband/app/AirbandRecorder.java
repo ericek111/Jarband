@@ -290,16 +290,18 @@ public final class AirbandRecorder {
     }
 
     private static final class CaptureStats {
+        private static final int SAMPLE_STRIDE = 16;
+        private static final float NEAR_FULL_SCALE_SQUARED = 0.98f * 0.98f;
+
         private long samples;
         private long nearFullScale;
         private double sumSquares;
         private float peak;
-        private static final float NEAR_FULL_SCALE_SQUARED = 0.98f * 0.98f;
 
         void accept(NativeSampleBlock block) {
             MemorySegment samplesSegment = block.samples();
             int availableSamples = block.availableSampleCount();
-            for (int n = 0; n < availableSamples; n++) {
+            for (int n = 0; n < availableSamples; n += SAMPLE_STRIDE) {
                 float i = samplesSegment.getAtIndex(java.lang.foreign.ValueLayout.JAVA_FLOAT, n * 2L);
                 float q = samplesSegment.getAtIndex(java.lang.foreign.ValueLayout.JAVA_FLOAT, n * 2L + 1L);
                 float magnitudeSquared = i * i + q * q;
@@ -317,7 +319,7 @@ public final class AirbandRecorder {
             double rms = samples == 0 ? 0.0 : Math.sqrt(sumSquares / samples);
             double clippedPercent = samples == 0 ? 0.0 : nearFullScale * 100.0 / samples;
             String status = String.format(java.util.Locale.ROOT,
-                    "RF input rms %.4f peak %.4f near-full-scale %.3f%%",
+                    "RF input sampled-rms %.4f peak %.4f sampled-near-full-scale %.3f%%",
                     rms, peak, clippedPercent);
             samples = 0;
             nearFullScale = 0;
