@@ -16,7 +16,7 @@ public final class LiquidPfbAnalyzer implements AutoCloseable {
 
     public LiquidPfbAnalyzer(PfbConfig config) {
         this.config = config;
-        this.analyzer = LiquidDsp.firpfbch2_crcf_create_kaiser(
+        this.analyzer = LiquidDsp.firpfbch_crcf_create_kaiser(
                 LiquidDsp.LIQUID_ANALYZER,
                 config.branches(),
                 config.semiLength(),
@@ -33,9 +33,9 @@ public final class LiquidPfbAnalyzer implements AutoCloseable {
         long sampleOffset = (long) frameIndex * config.branches();
         MemorySegment source = block.samples().asSlice(sampleOffset * 2L * Float.BYTES, input.byteSize());
         input.copyFrom(source);
-        int rc = LiquidDsp.firpfbch2_crcf_execute(analyzer, input, output);
+        int rc = LiquidDsp.firpfbch_crcf_analyzer_execute(analyzer, input, output);
         if (rc != 0) {
-            throw new IllegalStateException("firpfbch2_crcf_execute failed: " + rc);
+            throw new IllegalStateException("firpfbch_crcf_analyzer_execute failed: " + rc);
         }
         float[] bins = output.toArray(ValueLayout.JAVA_FLOAT);
         return new ChannelizedFrame(bins, config.branches(), block.firstSampleIndex() + sampleOffset, block.capturedNanos());
@@ -43,7 +43,7 @@ public final class LiquidPfbAnalyzer implements AutoCloseable {
 
     @Override
     public void close() {
-        LiquidDsp.firpfbch2_crcf_destroy(analyzer);
+        LiquidDsp.firpfbch_crcf_destroy(analyzer);
         arena.close();
     }
 }

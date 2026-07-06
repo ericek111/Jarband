@@ -1,8 +1,13 @@
 package eu.lixko.jarband.capture;
 
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 
+import eu.lixko.jsoapy.soapy.Converters;
+import eu.lixko.jsoapy.soapy.Errors_h;
 import eu.lixko.jsoapy.soapy.SoapySDRDevice;
 import eu.lixko.jsoapy.soapy.SoapySDRDeviceDirection;
 import eu.lixko.jsoapy.soapy.SoapySDRStream;
@@ -10,9 +15,16 @@ import eu.lixko.jsoapy.soapy.StreamFormat;
 import eu.lixko.jsoapy.util.NativeUtils;
 
 public final class SoapyCaptureReader implements Runnable {
+    private static final int OUTPUT_BLOCK_SAMPLES = 65_280;
+
     private final Settings settings;
     private final BlockingQueue<NativeSampleBlock> output;
     private volatile boolean running = true;
+    private long droppedBlocks;
+    private float[] pendingSamples = new float[OUTPUT_BLOCK_SAMPLES * 2];
+    private int pendingSampleCount;
+    private long pendingFirstSampleIndex;
+    private long pendingCapturedNanos;
 
     public SoapyCaptureReader(Settings settings, BlockingQueue<NativeSampleBlock> output) {
         this.settings = settings;
@@ -33,24 +45,79 @@ public final class SoapyCaptureReader implements Runnable {
             device.setGain(SoapySDRDeviceDirection.RX, 0, gain.getKey(), gain.getValue());
         }
 
-        SoapySDRStream stream = device.setupStream(SoapySDRDeviceDirection.RX, StreamFormat.CF32, null, null);
+        SoapySDRStream stream = device.setupStream(SoapySDRDeviceDirection.RX, StreamFormat.CS16, null, null);
+        var converter = Converters.getFunction(stream.getNativeFormat(0).format(), StreamFormat.CF32);
         stream.activateStream();
         long firstSample = 0;
+        pendingFirstSampleIndex = firstSample;
         try {
             while (running) {
-                int read = stream.readStream(1_000_000);
+                int read = stream.acquireReadBuffer(1_000_000);
                 if (read <= 0) {
+                    if (read < 0) {
+                        System.out.println("SDR read error: " + Errors_h.fromCode(read).name());
+                    }
                     continue;
                 }
-                NativeSampleBlock block = new NativeSampleBlock(stream.getNormalBuffer(0), read, firstSample, System.nanoTime());
-                output.put(block);
-                firstSample += block.availableSampleCount();
+                try (Arena arena = Arena.ofConfined()) {
+                    MemorySegment converted = arena.allocate((long) read * 2L * Float.BYTES, ValueLayout.JAVA_FLOAT.byteAlignment());
+                    converter.invokeLongs(stream.getDirectBuffer(0).address(), converted.address(), read, 1.0);
+                    float[] ownedSamples = converted.toArray(ValueLayout.JAVA_FLOAT);
+                    appendConverted(ownedSamples, read, firstSample, System.nanoTime());
+                    firstSample += read;
+                } finally {
+                    stream.releaseReadBuffer();
+                }
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
         } finally {
+            if (pendingSampleCount > 0) {
+                emitPendingBlock(true);
+            }
             output.offer(NativeSampleBlock.POISON);
         }
+    }
+
+    private void appendConverted(float[] samples, int sampleCount, long firstSampleIndex, long capturedNanos) {
+        int consumed = 0;
+        while (consumed < sampleCount) {
+            if (pendingSampleCount == 0) {
+                pendingFirstSampleIndex = firstSampleIndex + consumed;
+            }
+            int copied = Math.min(OUTPUT_BLOCK_SAMPLES - pendingSampleCount, sampleCount - consumed);
+            System.arraycopy(samples, consumed * 2, pendingSamples, pendingSampleCount * 2, copied * 2);
+            pendingSampleCount += copied;
+            consumed += copied;
+            pendingCapturedNanos = capturedNanos;
+            if (pendingSampleCount == OUTPUT_BLOCK_SAMPLES) {
+                emitPendingBlock(false);
+            }
+        }
+    }
+
+    private void emitPendingBlock(boolean partial) {
+        float[] blockSamples;
+        if (!partial && pendingSampleCount == OUTPUT_BLOCK_SAMPLES) {
+            blockSamples = pendingSamples;
+            pendingSamples = new float[OUTPUT_BLOCK_SAMPLES * 2];
+        } else {
+            blockSamples = java.util.Arrays.copyOf(pendingSamples, pendingSampleCount * 2);
+        }
+        NativeSampleBlock block = new NativeSampleBlock(
+                MemorySegment.ofArray(blockSamples),
+                pendingSampleCount,
+                pendingFirstSampleIndex,
+                pendingCapturedNanos);
+        if (!output.offer(block)) {
+            output.poll();
+            droppedBlocks++;
+            if (!output.offer(block)) {
+                droppedBlocks++;
+            }
+        }
+        if (droppedBlocks > 0 && (droppedBlocks & 0x3f) == 0) {
+            System.out.printf("Capture dropped %,d stale aggregated blocks because processing is behind%n", droppedBlocks);
+        }
+        pendingSampleCount = 0;
     }
 
     public record Settings(String args, double sampleRateHz, double centerFrequencyHz, Map<String, Double> gains) {}

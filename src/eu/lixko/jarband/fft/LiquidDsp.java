@@ -64,7 +64,7 @@ public class LiquidDsp {
     public static MemorySegment firpfbch_crcf_create(int _type, int _M, int _p, MemorySegment _h) {
         return (MemorySegment) NativeUtils.call(firpfbch_crcf_create, _type, _M, _p, _h);
     }
-    
+
     private static ApiMethod firpfbch_crcf_create_kaiser = new ApiMethod("firpfbch_crcf_create_kaiser", FunctionDescriptor.of(
         ValueLayout.ADDRESS,
         ValueLayout.JAVA_INT,

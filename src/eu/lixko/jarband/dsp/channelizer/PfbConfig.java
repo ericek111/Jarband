@@ -6,10 +6,14 @@ public record PfbConfig(int branches, int semiLength, float stopbandAttenuation,
 
     public static PfbConfig forAirband(double sampleRate, double centerFrequency) {
         int branches = Math.max(1, (int) Math.round(sampleRate / AIRBAND_CHANNEL_RASTER_HZ));
-        return new PfbConfig(branches, 12, 80.0f, sampleRate, centerFrequency);
+        return new PfbConfig(branches, 16, 80.0f, sampleRate, centerFrequency);
     }
 
     public double branchSpacingHz() {
         return sampleRate / branches;
+    }
+
+    public double channelOutputRateHz() {
+        return branchSpacingHz();
     }
 }

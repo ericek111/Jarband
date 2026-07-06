@@ -148,6 +148,29 @@ public class WaterfallPanel extends JPanel implements ComponentListener, MouseMo
 			resizingLock.readLock().unlock();
 		}
 	}
+
+    public void addLine(float[] values) {
+    	resizingLock.readLock().lock();
+		try {
+	    	WritableRaster raster = waterfallImage.getRaster();
+	    	DataBuffer rasterBuf = raster.getDataBuffer();
+	    	int[] imageData = ((DataBufferInt) rasterBuf).getData();
+
+        	System.arraycopy(imageData, 0, imageData, raster.getWidth(), raster.getWidth() * (raster.getHeight() - 1));
+
+	    	currentLine %= this.fftData.length;
+	    	if (this.fftData[currentLine].length != values.length) {
+	    		this.fftData[currentLine] = new float[values.length];
+	    	}
+	    	System.arraycopy(values, 0, this.fftData[currentLine], 0, values.length);
+	    	fftSizes[currentLine] = values.length;
+	    	drawFftLine(imageData, currentLine, 0, 0, waterfallImage.getWidth());
+	    	currentLine = (currentLine + 1) % this.fftData.length;
+	    	repaint();
+		} finally {
+			resizingLock.readLock().unlock();
+		}
+	}
     
     private void drawFftLine(int imageData[], int fftIdx, int yPos, int startPx, int endPx) {
     	float dataRange = waterfallMax - waterfallMin;

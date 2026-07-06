@@ -18,11 +18,10 @@ import eu.lixko.jarband.capture.NativeSampleBlock;
 import eu.lixko.jarband.capture.SoapyCaptureReader;
 import eu.lixko.jarband.dsp.airband.AirbandFrameProcessor;
 import eu.lixko.jarband.dsp.airband.ChannelStateArrays;
-import eu.lixko.jarband.dsp.airband.ForcedChannelDemod;
 import eu.lixko.jarband.dsp.airband.PowerSquelch;
-import eu.lixko.jarband.dsp.airband.WidebandChannelDebugDemod;
 import eu.lixko.jarband.dsp.channelizer.ChannelPlan;
 import eu.lixko.jarband.dsp.channelizer.ChannelizedFrameRing;
+import eu.lixko.jarband.dsp.channelizer.ChannelizedFrame;
 import eu.lixko.jarband.dsp.channelizer.LiquidPfbAnalyzer;
 import eu.lixko.jarband.dsp.channelizer.LogicalChannel;
 import eu.lixko.jarband.dsp.channelizer.PfbConfig;
@@ -34,11 +33,11 @@ import eu.lixko.jsoapy.util.NativeUtils;
 public final class AirbandRecorder {
     private static final String SDR_ARGS = "remote=10.0.34.40,remote:prot=tcp";
     private static final double SDR_SAMPLE_RATE_HZ = 8_000_000.0;
-    private static final double SDR_CENTER_FREQUENCY_HZ = 133_000_000.0;
+    private static final double SDR_CENTER_FREQUENCY_HZ = 133_000_005.0;
     private static final Map<String, Double> SDR_GAINS = Map.of("LNA", 1d, "Baseband", 23d, "Mixer", 0d, "Mixbuffer", 0d);
-    private static final double DEBUG_ATIS_FREQUENCY_HZ = 133_880_000.0;
 
-    private static final int WATERFALL_FFT_SIZE = 65_536;
+    private static final int WATERFALL_FFT_SIZE = 262_144;
+    private static final boolean ENABLE_CHANNEL_WATERFALL = false;
 
     private static final float SQUELCH_OPEN_DB = 12.0f;
     private static final float SQUELCH_CLOSE_DB = 8.0f;
@@ -60,6 +59,7 @@ public final class AirbandRecorder {
 
         System.out.printf("Jarband airband recorder: %,d logical channels, %.3f Hz PFB spacing%n",
                 plan.size(), pfb.branchSpacingHz());
+        System.out.printf("PFB channel output rate: %.3f Hz%n", pfb.channelOutputRateHz());
         System.out.printf("SDR: center %.6f MHz, bandwidth %.3f MHz%n",
                 SDR_CENTER_FREQUENCY_HZ / 1_000_000.0,
                 SDR_SAMPLE_RATE_HZ / 1_000_000.0);
@@ -69,7 +69,7 @@ public final class AirbandRecorder {
         var capture = new SoapyCaptureReader(
                 new SoapyCaptureReader.Settings(SDR_ARGS, SDR_SAMPLE_RATE_HZ, SDR_CENTER_FREQUENCY_HZ, SDR_GAINS),
                 captureQueue);
-        Thread captureThread = Thread.ofPlatform().name("jarband-capture").start(capture);
+        Thread captureThread = null;
 
         ChannelStateArrays state = new ChannelStateArrays(plan.size());
         DebugWindow debug = DebugWindow.open(plan, pfb, state);
@@ -78,61 +78,53 @@ public final class AirbandRecorder {
                 SQUELCH_OPEN_DB,
                 SQUELCH_CLOSE_DB,
                 SQUELCH_HANG_MILLIS);
-        int prerollFrames = Math.max(1, (int) Math.ceil(pfb.branchSpacingHz() * PREROLL_MILLIS / 1000.0));
+        int prerollFrames = Math.max(1, (int) Math.ceil(pfb.channelOutputRateHz() * PREROLL_MILLIS / 1000.0));
         ChannelizedFrameRing preroll = new ChannelizedFrameRing(prerollFrames + 1, pfb.branches());
         AirbandFrameProcessor processor = new AirbandFrameProcessor(
                 plan, state, squelch, preroll, prerollFrames, UTTERANCE_MERGE_MILLIS,
-                pfb.branchSpacingHz(), Clock.systemUTC());
-        ForcedChannelDemod debugAtis = createDebugAtisDemod(pfb, plan);
-        WidebandChannelDebugDemod directDebugAtis = createDirectDebugAtisDemod();
+                pfb.channelOutputRateHz(), 8_000, Clock.systemUTC());
 
-        try (LiquidPfbAnalyzer analyzer = new LiquidPfbAnalyzer(pfb);
+        try (DebugWindow debugWindow = debug;
+             LiquidPfbAnalyzer analyzer = new LiquidPfbAnalyzer(pfb);
              FFT waterfallFft = new FFT(WATERFALL_FFT_SIZE);
-             ForcedChannelDemod forcedDemod = debugAtis;
-             WidebandChannelDebugDemod directDemod = directDebugAtis;
+             AirbandFrameProcessor frameProcessor = processor;
              RecorderBank recorders = new RecorderBank(OUTPUT_DIRECTORY, plan, true,
                      8_000, 16_000, 20, 3)) {
             float[] oneSample = new float[1];
             int waterfallFill = 0;
             long lastStatusNanos = System.nanoTime();
             CaptureStats captureStats = new CaptureStats();
+            captureThread = Thread.ofPlatform().name("jarband-capture").start(capture);
             while (!Thread.currentThread().isInterrupted()) {
                 NativeSampleBlock block = captureQueue.take();
                 if (block.isPoison()) {
                     break;
                 }
                 captureStats.accept(block);
-                waterfallFill = updateWaterfall(block, waterfallFft, debug.waterfall(), waterfallFill);
-                if (directDemod != null) {
-                    directDemod.accept(block);
-                }
+                waterfallFill = updateWaterfall(block, waterfallFft, debugWindow.waterfall(), waterfallFill);
                 int frames = analyzer.framesIn(block);
                 for (int i = 0; i < frames; i++) {
                     var channelized = analyzer.execute(block, i);
-                    if (forcedDemod != null) {
-                        forcedDemod.accept(channelized);
+                    if (debugWindow.channelSpectrum() != null) {
+                        debugWindow.channelSpectrum().accept(channelized);
                     }
-                    processor.process(channelized, oneSample, recorders::accept);
+                    frameProcessor.process(channelized, oneSample, recorders::accept);
                 }
-                debug.repaintActivity();
+                debugWindow.repaintActivity();
                 long now = System.nanoTime();
                 if (now - lastStatusNanos > 1_000_000_000L) {
                     lastStatusNanos = now;
                     System.out.println(captureStats.statusAndReset());
                     System.out.printf("Squelch open: %,d / %,d channels, above threshold: %,d, max margin: %.1f dB%n",
                             countOpen(state), plan.size(), countAboveMargin(state, SQUELCH_OPEN_DB), maxMargin(state));
-                    if (forcedDemod != null) {
-                        System.out.println(forcedDemod.statusAndReset());
-                    }
-                    if (directDemod != null) {
-                        System.out.println(directDemod.statusAndReset());
-                    }
                 }
             }
         } finally {
             capture.stop();
-            captureThread.interrupt();
-            captureThread.join(1000);
+            if (captureThread != null) {
+                captureThread.interrupt();
+                captureThread.join(1000);
+            }
         }
     }
 
@@ -157,51 +149,6 @@ public final class AirbandRecorder {
             }
         }
         return fill;
-    }
-
-    private static ForcedChannelDemod createDebugAtisDemod(PfbConfig pfb, ChannelPlan plan) throws Exception {
-        if (DEBUG_ATIS_FREQUENCY_HZ <= 0.0) {
-            return null;
-        }
-        LogicalChannel channel = nearestChannel(plan, DEBUG_ATIS_FREQUENCY_HZ);
-        int bin = channel.pfbBins()[channel.pfbBins().length / 2];
-        System.out.printf("Forced ATIS debug: requested %.6f MHz, using %.6f MHz -> bin %,d (%.6f MHz), output %s%n",
-                DEBUG_ATIS_FREQUENCY_HZ / 1_000_000.0,
-                channel.frequencyHz() / 1_000_000.0,
-                bin,
-                ChannelPlan.frequencyForBin(pfb, bin) / 1_000_000.0,
-                OUTPUT_DIRECTORY.resolve("debug-atis.opus"));
-        return new ForcedChannelDemod(channel, pfb.branchSpacingHz(),
-                OUTPUT_DIRECTORY.resolve("debug-atis.opus"),
-                OUTPUT_DIRECTORY.resolve("debug-atis.wav"),
-                8_000, 16_000, 20, 3);
-    }
-
-    private static WidebandChannelDebugDemod createDirectDebugAtisDemod() throws Exception {
-        if (DEBUG_ATIS_FREQUENCY_HZ <= 0.0) {
-            return null;
-        }
-        System.out.printf("Direct ATIS debug: %.6f MHz -> %s%n",
-                DEBUG_ATIS_FREQUENCY_HZ / 1_000_000.0,
-                OUTPUT_DIRECTORY.resolve("debug-atis-direct.wav"));
-        return new WidebandChannelDebugDemod(
-                SDR_SAMPLE_RATE_HZ,
-                SDR_CENTER_FREQUENCY_HZ,
-                DEBUG_ATIS_FREQUENCY_HZ,
-                OUTPUT_DIRECTORY.resolve("debug-atis-direct.wav"));
-    }
-
-    private static LogicalChannel nearestChannel(ChannelPlan plan, double frequencyHz) {
-        LogicalChannel best = plan.channels().getFirst();
-        double bestError = Math.abs(best.frequencyHz() - frequencyHz);
-        for (LogicalChannel channel : plan.channels()) {
-            double error = Math.abs(channel.frequencyHz() - frequencyHz);
-            if (error < bestError) {
-                best = channel;
-                bestError = error;
-            }
-        }
-        return best;
     }
 
     private static void printChannelMap(PfbConfig pfb, ChannelPlan plan) {
@@ -253,7 +200,8 @@ public final class AirbandRecorder {
         return count;
     }
 
-    private record DebugWindow(WaterfallPanel waterfall, ChannelActivityPanel activity) {
+    private record DebugWindow(WaterfallPanel waterfall, ChannelActivityPanel activity,
+                               ChannelSpectrumWaterfall channelSpectrum) implements AutoCloseable {
         static DebugWindow open(ChannelPlan plan, PfbConfig pfb, ChannelStateArrays state) throws Exception {
             WaterfallPanel waterfall = new WaterfallPanel(1800, 720);
             waterfall.enableMouse();
@@ -263,6 +211,9 @@ public final class AirbandRecorder {
 
             JLabel status = new JLabel("Click a channel activity segment");
             ChannelActivityPanel activity = new ChannelActivityPanel(plan, pfb, state, waterfall, status);
+            ChannelSpectrumWaterfall channelSpectrum = ENABLE_CHANNEL_WATERFALL
+                    ? new ChannelSpectrumWaterfall(activity)
+                    : null;
             SwingUtilities.invokeAndWait(() -> {
                 JFrame frame = new JFrame("Jarband Airband Debug");
                 frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
@@ -273,12 +224,72 @@ public final class AirbandRecorder {
                 frame.add(bottom, BorderLayout.SOUTH);
                 frame.pack();
                 frame.setVisible(true);
+
+                if (channelSpectrum != null) {
+                    JFrame channelFrame = new JFrame("Jarband Selected Channel Spectrum");
+                    channelFrame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+                    channelFrame.add(channelSpectrum.waterfall(), BorderLayout.CENTER);
+                    channelFrame.pack();
+                    channelFrame.setVisible(true);
+                }
             });
-            return new DebugWindow(waterfall, activity);
+            return new DebugWindow(waterfall, activity, channelSpectrum);
         }
 
         void repaintActivity() {
             SwingUtilities.invokeLater(activity::repaint);
+        }
+
+        @Override
+        public void close() throws Exception {
+            if (channelSpectrum != null) {
+                channelSpectrum.close();
+            }
+        }
+    }
+
+    private static final class ChannelSpectrumWaterfall implements AutoCloseable {
+        private static final int NEIGHBOR_BINS = 129;
+
+        private final ChannelActivityPanel activity;
+        private final WaterfallPanel waterfall = new WaterfallPanel(900, 360);
+        private final float[] line = new float[NEIGHBOR_BINS];
+        private int channelId = -1;
+
+        ChannelSpectrumWaterfall(ChannelActivityPanel activity) {
+            this.activity = activity;
+            waterfall.setMinValue(-80.0f);
+            waterfall.setMaxValue(20.0f);
+            waterfall.setZoomLevel(1.0);
+        }
+
+        WaterfallPanel waterfall() {
+            return waterfall;
+        }
+
+        void accept(ChannelizedFrame frame) {
+            LogicalChannel channel = activity.selectedChannel();
+            if (channel == null) {
+                return;
+            }
+            if (channel.id() != channelId) {
+                channelId = channel.id();
+            }
+
+            int centerBin = channel.pfbBins()[channel.pfbBins().length / 2];
+            int half = NEIGHBOR_BINS / 2;
+            for (int x = 0; x < line.length; x++) {
+                int relativeBin = x - half;
+                int bin = Math.floorMod(centerBin + relativeBin, frame.branchCount());
+                float i = frame.i(bin);
+                float q = frame.q(bin);
+                line[x] = 10.0f * (float) Math.log10(i * i + q * q + 1.0e-20f);
+            }
+            waterfall.addLine(line);
+        }
+
+        @Override
+        public void close() {
         }
     }
 

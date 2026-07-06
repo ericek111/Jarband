@@ -26,6 +26,7 @@ public final class ChannelActivityPanel extends JPanel {
     private final ChannelStateArrays state;
     private final WaterfallPanel waterfall;
     private final JLabel status;
+    private volatile LogicalChannel selectedChannel;
 
     public ChannelActivityPanel(ChannelPlan plan, PfbConfig pfb, ChannelStateArrays state,
                                 WaterfallPanel waterfall, JLabel status) {
@@ -34,6 +35,7 @@ public final class ChannelActivityPanel extends JPanel {
         this.state = state;
         this.waterfall = waterfall;
         this.status = status;
+        this.selectedChannel = plan.channels().isEmpty() ? null : plan.channels().getFirst();
         setPreferredSize(new Dimension(1800, 14));
         setMinimumSize(new Dimension(64, 10));
         addMouseListener(new MouseAdapter() {
@@ -81,6 +83,7 @@ public final class ChannelActivityPanel extends JPanel {
             return;
         }
         int id = channel.id();
+        selectedChannel = channel;
         float margin = Float.isFinite(state.power[id]) && Float.isFinite(state.noiseFloor[id])
                 ? state.power[id] - state.noiseFloor[id]
                 : Float.NaN;
@@ -94,6 +97,10 @@ public final class ChannelActivityPanel extends JPanel {
                 state.power[id],
                 state.noiseFloor[id],
                 margin));
+    }
+
+    public LogicalChannel selectedChannel() {
+        return selectedChannel;
     }
 
     private LogicalChannel channelAt(int x) {
