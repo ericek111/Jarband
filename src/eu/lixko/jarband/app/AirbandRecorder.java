@@ -20,6 +20,7 @@ import eu.lixko.jarband.dsp.airband.AirbandFrameProcessor;
 import eu.lixko.jarband.dsp.airband.ChannelStateArrays;
 import eu.lixko.jarband.dsp.airband.ForcedChannelDemod;
 import eu.lixko.jarband.dsp.airband.PowerSquelch;
+import eu.lixko.jarband.dsp.airband.WidebandChannelDebugDemod;
 import eu.lixko.jarband.dsp.channelizer.ChannelPlan;
 import eu.lixko.jarband.dsp.channelizer.ChannelizedFrameRing;
 import eu.lixko.jarband.dsp.channelizer.LiquidPfbAnalyzer;
@@ -33,7 +34,7 @@ import eu.lixko.jsoapy.util.NativeUtils;
 public final class AirbandRecorder {
     private static final String SDR_ARGS = "remote=10.0.34.40,remote:prot=tcp";
     private static final double SDR_SAMPLE_RATE_HZ = 8_000_000.0;
-    private static final double SDR_CENTER_FREQUENCY_HZ = 133_000_005.0;
+    private static final double SDR_CENTER_FREQUENCY_HZ = 133_000_000.0;
     private static final Map<String, Double> SDR_GAINS = Map.of("LNA", 1d, "Baseband", 23d, "Mixer", 0d, "Mixbuffer", 0d);
     private static final double DEBUG_ATIS_FREQUENCY_HZ = 133_880_000.0;
 
@@ -80,23 +81,31 @@ public final class AirbandRecorder {
         int prerollFrames = Math.max(1, (int) Math.ceil(pfb.branchSpacingHz() * PREROLL_MILLIS / 1000.0));
         ChannelizedFrameRing preroll = new ChannelizedFrameRing(prerollFrames + 1, pfb.branches());
         AirbandFrameProcessor processor = new AirbandFrameProcessor(
-                plan, state, squelch, preroll, prerollFrames, UTTERANCE_MERGE_MILLIS, Clock.systemUTC());
+                plan, state, squelch, preroll, prerollFrames, UTTERANCE_MERGE_MILLIS,
+                pfb.branchSpacingHz(), Clock.systemUTC());
         ForcedChannelDemod debugAtis = createDebugAtisDemod(pfb, plan);
+        WidebandChannelDebugDemod directDebugAtis = createDirectDebugAtisDemod();
 
         try (LiquidPfbAnalyzer analyzer = new LiquidPfbAnalyzer(pfb);
              FFT waterfallFft = new FFT(WATERFALL_FFT_SIZE);
              ForcedChannelDemod forcedDemod = debugAtis;
+             WidebandChannelDebugDemod directDemod = directDebugAtis;
              RecorderBank recorders = new RecorderBank(OUTPUT_DIRECTORY, plan, true,
                      8_000, 16_000, 20, 3)) {
             float[] oneSample = new float[1];
             int waterfallFill = 0;
             long lastStatusNanos = System.nanoTime();
+            CaptureStats captureStats = new CaptureStats();
             while (!Thread.currentThread().isInterrupted()) {
                 NativeSampleBlock block = captureQueue.take();
                 if (block.isPoison()) {
                     break;
                 }
+                captureStats.accept(block);
                 waterfallFill = updateWaterfall(block, waterfallFft, debug.waterfall(), waterfallFill);
+                if (directDemod != null) {
+                    directDemod.accept(block);
+                }
                 int frames = analyzer.framesIn(block);
                 for (int i = 0; i < frames; i++) {
                     var channelized = analyzer.execute(block, i);
@@ -109,10 +118,14 @@ public final class AirbandRecorder {
                 long now = System.nanoTime();
                 if (now - lastStatusNanos > 1_000_000_000L) {
                     lastStatusNanos = now;
+                    System.out.println(captureStats.statusAndReset());
                     System.out.printf("Squelch open: %,d / %,d channels, above threshold: %,d, max margin: %.1f dB%n",
                             countOpen(state), plan.size(), countAboveMargin(state, SQUELCH_OPEN_DB), maxMargin(state));
                     if (forcedDemod != null) {
                         System.out.println(forcedDemod.statusAndReset());
+                    }
+                    if (directDemod != null) {
+                        System.out.println(directDemod.statusAndReset());
                     }
                 }
             }
@@ -125,9 +138,10 @@ public final class AirbandRecorder {
 
     private static int updateWaterfall(NativeSampleBlock block, FFT fft, WaterfallPanel waterfall, int fill) {
         int consumed = 0;
+        int availableSamples = block.availableSampleCount();
         int fftSize = (int) fft.getSize();
-        while (consumed < block.sampleCount()) {
-            int copied = Math.min(fftSize - fill, block.sampleCount() - consumed);
+        while (consumed < availableSamples) {
+            int copied = Math.min(fftSize - fill, availableSamples - consumed);
             MemorySegment source = block.samples().asSlice((long) consumed * 2L * Float.BYTES,
                     (long) copied * 2L * Float.BYTES);
             MemorySegment target = fft.fft_in.asSlice((long) fill * 2L * Float.BYTES,
@@ -161,6 +175,20 @@ public final class AirbandRecorder {
                 OUTPUT_DIRECTORY.resolve("debug-atis.opus"),
                 OUTPUT_DIRECTORY.resolve("debug-atis.wav"),
                 8_000, 16_000, 20, 3);
+    }
+
+    private static WidebandChannelDebugDemod createDirectDebugAtisDemod() throws Exception {
+        if (DEBUG_ATIS_FREQUENCY_HZ <= 0.0) {
+            return null;
+        }
+        System.out.printf("Direct ATIS debug: %.6f MHz -> %s%n",
+                DEBUG_ATIS_FREQUENCY_HZ / 1_000_000.0,
+                OUTPUT_DIRECTORY.resolve("debug-atis-direct.wav"));
+        return new WidebandChannelDebugDemod(
+                SDR_SAMPLE_RATE_HZ,
+                SDR_CENTER_FREQUENCY_HZ,
+                DEBUG_ATIS_FREQUENCY_HZ,
+                OUTPUT_DIRECTORY.resolve("debug-atis-direct.wav"));
     }
 
     private static LogicalChannel nearestChannel(ChannelPlan plan, double frequencyHz) {
@@ -251,6 +279,42 @@ public final class AirbandRecorder {
 
         void repaintActivity() {
             SwingUtilities.invokeLater(activity::repaint);
+        }
+    }
+
+    private static final class CaptureStats {
+        private long samples;
+        private long nearFullScale;
+        private double sumSquares;
+        private float peak;
+
+        void accept(NativeSampleBlock block) {
+            MemorySegment samplesSegment = block.samples();
+            int availableSamples = block.availableSampleCount();
+            for (int n = 0; n < availableSamples; n++) {
+                float i = samplesSegment.getAtIndex(java.lang.foreign.ValueLayout.JAVA_FLOAT, n * 2L);
+                float q = samplesSegment.getAtIndex(java.lang.foreign.ValueLayout.JAVA_FLOAT, n * 2L + 1L);
+                float mag = (float) Math.hypot(i, q);
+                samples++;
+                sumSquares += i * i + q * q;
+                peak = Math.max(peak, Math.max(Math.abs(i), Math.abs(q)));
+                if (Math.abs(i) >= 0.98f || Math.abs(q) >= 0.98f || mag >= 0.98f) {
+                    nearFullScale++;
+                }
+            }
+        }
+
+        String statusAndReset() {
+            double rms = samples == 0 ? 0.0 : Math.sqrt(sumSquares / samples);
+            double clippedPercent = samples == 0 ? 0.0 : nearFullScale * 100.0 / samples;
+            String status = String.format(java.util.Locale.ROOT,
+                    "RF input rms %.4f peak %.4f near-full-scale %.3f%%",
+                    rms, peak, clippedPercent);
+            samples = 0;
+            nearFullScale = 0;
+            sumSquares = 0.0;
+            peak = 0.0f;
+            return status;
         }
     }
 }

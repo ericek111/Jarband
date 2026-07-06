@@ -42,8 +42,9 @@ public final class SoapyCaptureReader implements Runnable {
                 if (read <= 0) {
                     continue;
                 }
-                output.put(new NativeSampleBlock(stream.getNormalBuffer(0), read, firstSample, System.nanoTime()));
-                firstSample += read;
+                NativeSampleBlock block = new NativeSampleBlock(stream.getNormalBuffer(0), read, firstSample, System.nanoTime());
+                output.put(block);
+                firstSample += block.availableSampleCount();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

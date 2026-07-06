@@ -26,7 +26,7 @@ public final class LiquidPfbAnalyzer implements AutoCloseable {
     }
 
     public int framesIn(NativeSampleBlock block) {
-        return block.sampleCount() / config.branches();
+        return block.availableSampleCount() / config.branches();
     }
 
     public ChannelizedFrame execute(NativeSampleBlock block, int frameIndex) {

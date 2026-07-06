@@ -1,99 +1,155 @@
 package eu.lixko.jarband.dsp.airband;
 
 public final class AirbandAmDemodulator {
-    private final float carrierAlpha;
-    private final float levelAlpha;
-    private final Biquad highPass;
-    private final Biquad lowPass1;
-    private final Biquad lowPass2;
-    private float carrier;
-    private float level = 0.02f;
+    public static final double DEFAULT_IF_SAMPLE_RATE = 15_000.0;
+    public static final double DEFAULT_BANDWIDTH = 10_000.0;
+
+    private final DcBlocker dcBlock;
+    private final AudioAgc audioAgc;
+    private final FirFilter lowPass;
 
     public AirbandAmDemodulator(double sampleRate) {
-        this.carrierAlpha = onePoleAlpha(sampleRate, 8.0);
-        this.levelAlpha = onePoleAlpha(sampleRate, 3.0);
-        this.highPass = Biquad.highPass(sampleRate, 120.0, 0.707);
-        this.lowPass1 = Biquad.lowPass(sampleRate, 2_350.0, 0.707);
-        this.lowPass2 = Biquad.lowPass(sampleRate, 2_350.0, 0.707);
+        this(sampleRate, Math.min(DEFAULT_BANDWIDTH, sampleRate * 0.9));
+    }
+
+    public AirbandAmDemodulator(double sampleRate, double bandwidth) {
+        double usableBandwidth = Math.min(bandwidth, sampleRate * 0.9);
+        this.dcBlock = new DcBlocker(100.0 / sampleRate);
+        this.audioAgc = new AudioAgc(50.0 / sampleRate, 5.0 / sampleRate);
+        // SDR++ builds lowPass(bandwidth / 2, (bandwidth / 2) * 0.1, sampleRate).
+        // That is a narrow post-envelope filter, so keep the same transition width here.
+        this.lowPass = FirFilter.lowPass(usableBandwidth * 0.5, usableBandwidth * 0.05, sampleRate);
     }
 
     public float demodulate(float i, float q) {
-        float envelope = (float) Math.sqrt(i * i + q * q);
-        carrier += carrierAlpha * (envelope - carrier);
-        float normalized = carrier > 1.0e-6f ? envelope / carrier - 1.0f : 0.0f;
-
-        float audio = highPass.process(normalized);
-        audio = lowPass1.process(audio);
-        audio = lowPass2.process(audio);
-
-        level += levelAlpha * (Math.abs(audio) - level);
-        float gain = 0.18f / Math.max(level, 0.002f);
-        return clamp(audio * gain, -1.0f, 1.0f);
-    }
-
-    private static float onePoleAlpha(double sampleRate, double cutoffHz) {
-        double dt = 1.0 / sampleRate;
-        double rc = 1.0 / (2.0 * Math.PI * cutoffHz);
-        return (float) (dt / (rc + dt));
+        // SDR++ AM with carrierAgc=false: magnitude -> DC blocker -> audio AGC -> LPF.
+        float audio = (float) Math.sqrt(i * i + q * q);
+        audio = dcBlock.process(audio);
+        audio = audioAgc.process(audio);
+        audio = lowPass.process(audio);
+        return clamp(audio, -1.0f, 1.0f);
     }
 
     private static float clamp(float value, float min, float max) {
         return Math.max(min, Math.min(max, value));
     }
 
-    private static final class Biquad {
-        private final float b0;
-        private final float b1;
-        private final float b2;
-        private final float a1;
-        private final float a2;
-        private float z1;
-        private float z2;
+    private static final class DcBlocker {
+        private final float rate;
+        private float average;
 
-        private Biquad(float b0, float b1, float b2, float a1, float a2) {
-            this.b0 = b0;
-            this.b1 = b1;
-            this.b2 = b2;
-            this.a1 = a1;
-            this.a2 = a2;
+        DcBlocker(double rate) {
+            this.rate = (float) rate;
         }
 
-        static Biquad lowPass(double sampleRate, double cutoffHz, double q) {
-            double w0 = 2.0 * Math.PI * cutoffHz / sampleRate;
-            double cos = Math.cos(w0);
-            double alpha = Math.sin(w0) / (2.0 * q);
-            double b0 = (1.0 - cos) * 0.5;
-            double b1 = 1.0 - cos;
-            double b2 = (1.0 - cos) * 0.5;
-            double a0 = 1.0 + alpha;
-            double a1 = -2.0 * cos;
-            double a2 = 1.0 - alpha;
-            return normalized(b0, b1, b2, a0, a1, a2);
+        float process(float sample) {
+            float corrected = sample - average;
+            // SDR++ integrates the corrected sample, not the raw input error.
+            average += corrected * rate;
+            return corrected;
+        }
+    }
+
+    private static final class AudioAgc {
+        private static final float SET_POINT = 1.0f;
+        private static final float MAX_GAIN = 10_000_000.0f;
+        private static final float MAX_OUTPUT_AMP = 10.0f;
+
+        private final float attack;
+        private final float invAttack;
+        private final float decay;
+        private final float invDecay;
+        private float amp = 1.0f;
+
+        AudioAgc(double attack, double decay) {
+            this.attack = (float) attack;
+            this.invAttack = 1.0f - this.attack;
+            this.decay = (float) decay;
+            this.invDecay = 1.0f - this.decay;
         }
 
-        static Biquad highPass(double sampleRate, double cutoffHz, double q) {
-            double w0 = 2.0 * Math.PI * cutoffHz / sampleRate;
-            double cos = Math.cos(w0);
-            double alpha = Math.sin(w0) / (2.0 * q);
-            double b0 = (1.0 + cos) * 0.5;
-            double b1 = -(1.0 + cos);
-            double b2 = (1.0 + cos) * 0.5;
-            double a0 = 1.0 + alpha;
-            double a1 = -2.0 * cos;
-            double a2 = 1.0 - alpha;
-            return normalized(b0, b1, b2, a0, a1, a2);
+        float process(float sample) {
+            float inAmp = Math.abs(sample);
+            float gain;
+            if (inAmp != 0.0f) {
+                amp = inAmp > amp
+                        ? amp * invAttack + inAmp * attack
+                        : amp * invDecay + inAmp * decay;
+                gain = Math.min(SET_POINT / amp, MAX_GAIN);
+            } else {
+                gain = 1.0f;
+            }
+
+            // The C++ block can scan ahead inside a buffer before a clip. With one-sample
+            // streaming we can only correct the current sample, but we preserve the limit.
+            if (inAmp * gain > MAX_OUTPUT_AMP) {
+                amp = inAmp;
+                gain = Math.min(SET_POINT / amp, MAX_GAIN);
+            }
+            return sample * gain;
+        }
+    }
+
+    private static final class FirFilter {
+        private final float[] taps;
+        private final float[] delay;
+        private int pos;
+
+        private FirFilter(float[] taps) {
+            this.taps = taps;
+            this.delay = new float[taps.length];
         }
 
-        private static Biquad normalized(double b0, double b1, double b2, double a0, double a1, double a2) {
-            return new Biquad((float) (b0 / a0), (float) (b1 / a0), (float) (b2 / a0),
-                    (float) (a1 / a0), (float) (a2 / a0));
+        static FirFilter lowPass(double cutoff, double transitionWidth, double sampleRate) {
+            int count = Math.max(31, (int) (3.8 * sampleRate / transitionWidth));
+            float[] taps = new float[count];
+            double omega = 2.0 * Math.PI * cutoff / sampleRate;
+            double half = count / 2.0;
+            double correction = omega / Math.PI;
+            double sum = 0.0;
+            for (int n = 0; n < count; n++) {
+                // SDR++ centers even-length filters on a half-sample, so this is not
+                // the usual integer-centered sinc used in many textbook FIR examples.
+                double t = n - half + 0.5;
+                double sinc = sinc(t * omega);
+                double window = nuttall(t - half, count);
+                taps[n] = (float) (sinc * window);
+                taps[n] *= (float) correction;
+                sum += taps[n];
+            }
+            for (int n = 0; n < count; n++) {
+                taps[n] /= (float) sum;
+            }
+            return new FirFilter(taps);
         }
 
-        float process(float x) {
-            float y = b0 * x + z1;
-            z1 = b1 * x - a1 * y + z2;
-            z2 = b2 * x - a2 * y;
-            return y;
+        float process(float sample) {
+            delay[pos] = sample;
+            float acc = 0.0f;
+            int idx = pos;
+            for (float tap : taps) {
+                acc += tap * delay[idx];
+                if (--idx < 0) {
+                    idx = delay.length - 1;
+                }
+            }
+            if (++pos == delay.length) {
+                pos = 0;
+            }
+            return acc;
+        }
+
+        private static double sinc(double x) {
+            return Math.abs(x) < 1.0e-12 ? 1.0 : Math.sin(x) / x;
+        }
+
+        private static double nuttall(double n, int count) {
+            double a0 = 0.355768;
+            double a1 = 0.487396;
+            double a2 = 0.144232;
+            double a3 = 0.012604;
+            double x = 2.0 * Math.PI * n / count;
+            return a0 - a1 * Math.cos(x) + a2 * Math.cos(2.0 * x) - a3 * Math.cos(3.0 * x);
         }
     }
 }

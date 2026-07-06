@@ -20,12 +20,12 @@ public final class AirbandFrameProcessor {
     private final float[] channelQ;
     private final float[] channelPower;
     private final float[] medianScratch;
-    private final AmDemodulator am = new AmDemodulator();
+    private final AirbandAmDemodulator[] demods;
     private final Clock clock;
 
     public AirbandFrameProcessor(ChannelPlan plan, ChannelStateArrays state, PowerSquelch squelch,
                                  ChannelizedFrameRing preroll, int prerollFrames,
-                                 int utteranceMergeMillis, Clock clock) {
+                                 int utteranceMergeMillis, double channelSampleRate, Clock clock) {
         this.plan = plan;
         this.state = state;
         this.squelch = squelch;
@@ -38,6 +38,10 @@ public final class AirbandFrameProcessor {
         this.channelQ = new float[plan.size()];
         this.channelPower = new float[plan.size()];
         this.medianScratch = new float[plan.size()];
+        this.demods = new AirbandAmDemodulator[plan.size()];
+        for (int channel = 0; channel < demods.length; channel++) {
+            demods[channel] = new AirbandAmDemodulator(channelSampleRate);
+        }
         this.clock = clock;
     }
 
@@ -71,7 +75,7 @@ public final class AirbandFrameProcessor {
                     replayPreroll(channel, sequence, frame.capturedNanos(), now, activeAudioScratch, sink);
                 }
                 pendingCloseMillis[channelId] = 0;
-                activeAudioScratch[0] = am.demodulate(channelI[channelId], channelQ[channelId], channelId, state);
+                activeAudioScratch[0] = demods[channelId].demodulate(channelI[channelId], channelQ[channelId]);
                 sink.accept(channelId, now, activeAudioScratch, 1);
                 active++;
             } else {
@@ -139,7 +143,7 @@ public final class AirbandFrameProcessor {
         long firstSequence = currentSequence - prerollFrames;
         preroll.replay(channel, firstSequence, currentSequence, (i, q, capturedNanos) -> {
             long sampleMillis = nowMillis - Math.max(0L, currentNanos - capturedNanos) / 1_000_000L;
-            activeAudioScratch[0] = am.demodulate(i, q, channel.id(), state);
+            activeAudioScratch[0] = demods[channel.id()].demodulate(i, q);
             sink.accept(channel.id(), sampleMillis, activeAudioScratch, 1);
         });
     }

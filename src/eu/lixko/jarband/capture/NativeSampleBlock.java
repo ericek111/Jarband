@@ -8,4 +8,12 @@ public record NativeSampleBlock(MemorySegment samples, int sampleCount, long fir
     public boolean isPoison() {
         return sampleCount < 0;
     }
+
+    public int availableSampleCount() {
+        if (isPoison()) {
+            return sampleCount;
+        }
+        long completeComplexSamples = samples.byteSize() / (2L * Float.BYTES);
+        return (int) Math.min(sampleCount, completeComplexSamples);
+    }
 }
