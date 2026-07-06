@@ -42,9 +42,8 @@ public final class AirbandRecorder {
 
     private static final float SQUELCH_OPEN_DB = 18.0f;
     private static final float SQUELCH_CLOSE_DB = 15.0f;
-    private static final int SQUELCH_HANG_MILLIS = 150;
+    private static final int SQUELCH_HANG_MILLIS = 0;
     private static final int PREROLL_MILLIS = 500;
-    private static final int UTTERANCE_MERGE_MILLIS = 2_500;
 
     private static final Path OUTPUT_DIRECTORY = Path.of("recordings");
 
@@ -80,10 +79,10 @@ public final class AirbandRecorder {
                 SQUELCH_CLOSE_DB,
                 SQUELCH_HANG_MILLIS);
         int prerollFrames = Math.max(1, (int) Math.ceil(pfb.channelOutputRateHz() * PREROLL_MILLIS / 1000.0));
-        ChannelizedFrameRing preroll = new ChannelizedFrameRing(prerollFrames + 1, pfb.branches());
+        int closeLookaheadFrames = Math.max(1, (int) Math.ceil(pfb.channelOutputRateHz() * 100.0 / 1000.0));
+        ChannelizedFrameRing preroll = new ChannelizedFrameRing(prerollFrames + closeLookaheadFrames + 16, pfb.branches());
         AirbandFrameProcessor processor = new AirbandFrameProcessor(
-                plan, state, squelch, preroll, prerollFrames, UTTERANCE_MERGE_MILLIS,
-                pfb.channelOutputRateHz(), 8_000, Clock.systemUTC());
+                plan, state, squelch, preroll, prerollFrames, pfb.channelOutputRateHz(), 8_000, Clock.systemUTC());
 
         try (DebugWindow debugWindow = debug;
              LiquidPfbAnalyzer analyzer = new LiquidPfbAnalyzer(pfb);

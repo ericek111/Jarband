@@ -24,6 +24,9 @@ public final class LinearAudioResampler {
                 continue;
             }
 
+            // phase is measured in input-sample intervals. For 8333.333 -> 8000 Hz,
+            // inputSamplesPerOutput is just over 1, so this usually emits one output
+            // sample per input sample and occasionally skips one.
             while (phase[channel] <= 1.0 && produced < output.length) {
                 float t = (float) phase[channel];
                 output[produced++] = previous[channel] + (current - previous[channel]) * t;

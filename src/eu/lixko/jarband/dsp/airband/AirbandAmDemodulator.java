@@ -5,7 +5,9 @@ public final class AirbandAmDemodulator {
     public static final double DEFAULT_BANDWIDTH = 10_000.0;
     private static final float OUTPUT_GAIN = 0.4f;
     private static final float OUTPUT_LIMIT = 0.8f;
+    private static final boolean CARRIER_AGC = true;
 
+    private final ComplexAgc carrierAgc;
     private final DcBlocker dcBlock;
     private final AudioAgc audioAgc;
     private final FirFilter lowPass;
@@ -16,6 +18,7 @@ public final class AirbandAmDemodulator {
 
     public AirbandAmDemodulator(double sampleRate, double bandwidth) {
         double usableBandwidth = Math.min(bandwidth, sampleRate * 0.9);
+        this.carrierAgc = new ComplexAgc(120.0 / sampleRate, 20.0 / sampleRate);
         this.dcBlock = new DcBlocker(100.0 / sampleRate);
         this.audioAgc = new AudioAgc(120.0 / sampleRate, 20.0 / sampleRate);
         // SDR++ builds lowPass(bandwidth / 2, (bandwidth / 2) * 0.1, sampleRate).
@@ -24,10 +27,18 @@ public final class AirbandAmDemodulator {
     }
 
     public float demodulate(float i, float q) {
-        // SDR++ AM with carrierAgc=false: magnitude -> DC blocker -> audio AGC -> LPF.
+        // SDR++ AM: carrier AGC, when enabled, runs on complex IQ before envelope detection.
+        // In carrier-AGC mode SDR++ skips the post-envelope audio AGC, so this port does too.
+        if (CARRIER_AGC) {
+            float gain = carrierAgc.gain(i, q);
+            i *= gain;
+            q *= gain;
+        }
         float audio = (float) Math.sqrt(i * i + q * q);
         audio = dcBlock.process(audio);
-        audio = audioAgc.process(audio);
+        if (!CARRIER_AGC) {
+            audio = audioAgc.process(audio);
+        }
         audio = lowPass.process(audio);
         return clamp(audio * OUTPUT_GAIN, -OUTPUT_LIMIT, OUTPUT_LIMIT);
     }
@@ -89,6 +100,49 @@ public final class AirbandAmDemodulator {
                 gain = Math.min(SET_POINT / amp, MAX_GAIN);
             }
             return sample * gain;
+        }
+    }
+
+    private static final class ComplexAgc {
+        private static final float SET_POINT = 1.0f;
+        private static final float MAX_GAIN = 10_000_000.0f;
+        private static final float MAX_OUTPUT_AMP = 10.0f;
+
+        private final float attack;
+        private final float invAttack;
+        private final float decay;
+        private final float invDecay;
+        private float amp;
+
+        ComplexAgc(double attack, double decay) {
+            this.attack = (float) attack;
+            this.invAttack = 1.0f - this.attack;
+            this.decay = (float) decay;
+            this.invDecay = 1.0f - this.decay;
+        }
+
+        float gain(float i, float q) {
+            float inAmp = (float) Math.sqrt(i * i + q * q);
+            if (inAmp == 0.0f) {
+                return 1.0f;
+            }
+
+            if (amp == 0.0f) {
+                amp = inAmp;
+            } else {
+                amp = inAmp > amp
+                        ? amp * invAttack + inAmp * attack
+                        : amp * invDecay + inAmp * decay;
+            }
+            float gain = Math.min(SET_POINT / amp, MAX_GAIN);
+
+            // SDR++ scans the rest of the current buffer before clipping; this streaming
+            // port can only clamp against the current complex sample.
+            if (inAmp * gain > MAX_OUTPUT_AMP) {
+                amp = inAmp;
+                gain = Math.min(SET_POINT / amp, MAX_GAIN);
+            }
+            return gain;
         }
     }
 

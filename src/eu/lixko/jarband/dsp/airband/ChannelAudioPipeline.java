@@ -30,6 +30,8 @@ public final class ChannelAudioPipeline {
         if (count == 0) {
             return;
         }
+        // Resample in small batches to keep the recorder path allocation-free and
+        // avoid one native/resampler call per demodulated channel sample.
         int produced = resampler.process(channel, inputBatches[channel], count, outputBatches[channel]);
         inputFill[channel] = 0;
         if (produced > 0) {
@@ -38,6 +40,8 @@ public final class ChannelAudioPipeline {
     }
 
     public void reset(int channel) {
+        // Called when squelch closes. Any unflushed input is tail/noise by then,
+        // so drop it instead of writing a final noisy fragment.
         inputFill[channel] = 0;
         resampler.reset(channel);
     }

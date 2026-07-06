@@ -19,13 +19,14 @@ public final class PowerSquelch {
     public float measure(int channel, float i, float q) {
         float linear = i * i + q * q + 1.0e-20f;
         float instantDb = 10.0f * (float) Math.log10(linear);
-        return updatePower(channel, instantDb);
+        updatePower(channel, instantDb);
+        return instantDb;
     }
 
     public boolean update(int channel, float db, float bandNoiseFloorDb, long nowMillis) {
         state.noiseFloor[channel] = bandNoiseFloorDb;
         state.noiseSamples[channel]++;
-        float marginDb = db - bandNoiseFloorDb;
+        float marginDb = marginDb(db, bandNoiseFloorDb);
 
         if (state.squelchState[channel] == ChannelStateArrays.CLOSED) {
             if (marginDb >= openDb) {
@@ -41,12 +42,27 @@ public final class PowerSquelch {
             }
         } else if (marginDb >= closeDb) {
             state.lastOpenMillis[channel] = nowMillis;
+        } else if (hangMillis <= 0) {
+            state.squelchState[channel] = ChannelStateArrays.CLOSED;
+            state.openSamples[channel] = 0;
         } else if (nowMillis - state.lastOpenMillis[channel] > hangMillis) {
             state.squelchState[channel] = ChannelStateArrays.CLOSED;
             state.openSamples[channel] = 0;
         }
 
         return state.squelchState[channel] == ChannelStateArrays.OPEN;
+    }
+
+    public float marginDb(float db, float bandNoiseFloorDb) {
+        return db - bandNoiseFloorDb;
+    }
+
+    public boolean aboveOpen(float db, float bandNoiseFloorDb) {
+        return marginDb(db, bandNoiseFloorDb) >= openDb;
+    }
+
+    public boolean aboveClose(float db, float bandNoiseFloorDb) {
+        return marginDb(db, bandNoiseFloorDb) >= closeDb;
     }
 
     private float updatePower(int channel, float instantDb) {
