@@ -8,10 +8,10 @@ import eu.lixko.jarband.capture.NativeSampleBlock;
 import eu.lixko.jarband.fft.LiquidDsp;
 
 public final class Vdl2WidebandResampler implements AutoCloseable {
-    public static final int OUTPUT_RATE = Vdl2Demodulator.SAMPLE_RATE * 10;
     private static final float RESAMPLER_STOPBAND_ATTENUATION = 80.0f;
 
     private final double inputRateHz;
+    private final int outputRateHz;
     private final double inputCenterFrequencyHz;
     private final double outputCenterFrequencyHz;
     private final boolean offsetTuning;
@@ -25,8 +25,10 @@ public final class Vdl2WidebandResampler implements AutoCloseable {
     private int inputCapacity;
     private int outputCapacity;
 
-    public Vdl2WidebandResampler(double inputRateHz, double inputCenterFrequencyHz, double outputCenterFrequencyHz) {
+    public Vdl2WidebandResampler(double inputRateHz, int outputRateHz,
+                                 double inputCenterFrequencyHz, double outputCenterFrequencyHz) {
         this.inputRateHz = inputRateHz;
+        this.outputRateHz = outputRateHz;
         this.inputCenterFrequencyHz = inputCenterFrequencyHz;
         this.outputCenterFrequencyHz = outputCenterFrequencyHz;
         this.offsetTuning = Math.round(inputCenterFrequencyHz) != Math.round(outputCenterFrequencyHz);
@@ -34,7 +36,7 @@ public final class Vdl2WidebandResampler implements AutoCloseable {
         LiquidDsp.nco_crcf_set_frequency(nco,
                 (float) (2.0 * Math.PI * (inputCenterFrequencyHz - outputCenterFrequencyHz) / inputRateHz));
         this.resampler = LiquidDsp.msresamp_crcf_create(
-                (float) (OUTPUT_RATE / inputRateHz),
+                (float) (outputRateHz / inputRateHz),
                 RESAMPLER_STOPBAND_ATTENUATION);
         this.outputCount = arena.allocate(ValueLayout.JAVA_INT);
     }
@@ -72,13 +74,17 @@ public final class Vdl2WidebandResampler implements AutoCloseable {
         return outputCenterFrequencyHz;
     }
 
+    public int outputRateHz() {
+        return outputRateHz;
+    }
+
     private void ensureCapacity(int inputSamples) {
         if (inputSamples > inputCapacity) {
             nativeInput = arena.allocate((long) inputSamples * 2L * Float.BYTES, ValueLayout.JAVA_FLOAT.byteAlignment());
             input = arena.allocate((long) inputSamples * 2L * Float.BYTES, ValueLayout.JAVA_FLOAT.byteAlignment());
             inputCapacity = inputSamples;
         }
-        int needed = (int) Math.ceil(inputSamples * (OUTPUT_RATE / inputRateHz)) + 512;
+        int needed = (int) Math.ceil(inputSamples * (outputRateHz / inputRateHz)) + 512;
         if (needed > outputCapacity) {
             output = arena.allocate((long) needed * 2L * Float.BYTES, ValueLayout.JAVA_FLOAT.byteAlignment());
             outputCapacity = needed;

@@ -2,6 +2,7 @@ package eu.lixko.jarband.app;
 
 import java.awt.BorderLayout;
 import java.lang.foreign.MemorySegment;
+import java.net.InetSocketAddress;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -22,8 +23,8 @@ import eu.lixko.jarband.dsp.channelizer.ChannelizedFrame;
 import eu.lixko.jarband.dsp.channelizer.LiquidPfbAnalyzer;
 import eu.lixko.jarband.dsp.channelizer.LogicalChannel;
 import eu.lixko.jarband.dsp.channelizer.PfbConfig;
+import eu.lixko.jarband.dsp.vdl2.IqTcpStreamer;
 import eu.lixko.jarband.dsp.vdl2.Vdl2Processor;
-import eu.lixko.jarband.dsp.vdl2.Vdl2WidebandResampler;
 import eu.lixko.jarband.gui.ChannelActivityPanel;
 import eu.lixko.jarband.gui.WaterfallPanel;
 import eu.lixko.jarband.recording.RecorderBank;
@@ -33,7 +34,12 @@ public final class AirbandRecorder {
     private static final int WATERFALL_FFT_SIZE = 262_144;
     private static final int VDL2_WATERFALL_FFT_SIZE = 32_768;
     private static final int CHANNELIZED_QUEUE_CAPACITY = 64;
-    private static final int VDL2_QUEUE_CAPACITY = 4;
+    private static final int VDL2_QUEUE_CAPACITY = 512;
+    private static final boolean IQ_TCP_STREAM_ENABLED = true;
+    private static final double IQ_TCP_STREAM_CENTER_HZ = 136_990_000.0;
+    private static final int IQ_TCP_STREAM_SAMPLE_RATE_HZ = 1_050_000;
+    private static final InetSocketAddress IQ_TCP_STREAM_ADDRESS = new InetSocketAddress("127.0.0.1", 21401);
+    private static final int IQ_TCP_STREAM_QUEUE_CAPACITY = 4;
 
     private AirbandRecorder() {}
 
@@ -65,6 +71,7 @@ public final class AirbandRecorder {
         Thread captureThread = null;
         Thread channelizerThread = null;
         Thread vdl2Thread = null;
+        Thread iqStreamThread = null;
 
         int prerollFrames = Math.max(1,
                 (int) Math.ceil(pfb.channelOutputRateHz() * config.squelchPrerollMillis() / 1000.0));
@@ -102,8 +109,19 @@ public final class AirbandRecorder {
                     config.vdl2Output().getHostString(),
                     config.vdl2Output().getPort());
         }
+        IqTcpStreamWorker iqStreamWorker = IQ_TCP_STREAM_ENABLED
+                ? new IqTcpStreamWorker(new IqTcpStreamer(config.sampleRateHz(), config.centerFrequencyHz(),
+                        IQ_TCP_STREAM_CENTER_HZ, IQ_TCP_STREAM_SAMPLE_RATE_HZ, IQ_TCP_STREAM_ADDRESS))
+                : null;
+        if (iqStreamWorker != null) {
+            System.out.printf("I/Q S16_LE stream enabled: center %.6f MHz, %.3f MSps -> %s:%d%n",
+                    IQ_TCP_STREAM_CENTER_HZ / 1_000_000.0,
+                    IQ_TCP_STREAM_SAMPLE_RATE_HZ / 1_000_000.0,
+                    IQ_TCP_STREAM_ADDRESS.getHostString(),
+                    IQ_TCP_STREAM_ADDRESS.getPort());
+        }
         ChannelizerWorker channelizer = new ChannelizerWorker(
-                captureQueue, channelizedQueue, pfb, preroll, debug, captureStats, vdl2Worker);
+                captureQueue, channelizedQueue, pfb, preroll, debug, captureStats, vdl2Worker, iqStreamWorker);
 
         try (AirbandFrameProcessor frameProcessor = processor;
              DebugWindow debugWindow = debug;
@@ -115,6 +133,9 @@ public final class AirbandRecorder {
             captureThread = Thread.ofPlatform().name("jarband-capture").start(capture);
             if (vdl2Worker != null) {
                 vdl2Thread = Thread.ofPlatform().name("jarband-vdl2").start(vdl2Worker);
+            }
+            if (iqStreamWorker != null) {
+                iqStreamThread = Thread.ofPlatform().name("jarband-iq-stream").start(iqStreamWorker);
             }
             channelizerThread = Thread.ofPlatform().name("jarband-channelizer").start(channelizer);
             while (!Thread.currentThread().isInterrupted()) {
@@ -143,12 +164,19 @@ public final class AirbandRecorder {
                         vdl2Worker.throwIfFailed();
                         System.out.println(vdl2Worker.statusAndReset());
                     }
+                    if (iqStreamWorker != null) {
+                        iqStreamWorker.throwIfFailed();
+                        System.out.println(iqStreamWorker.statusAndReset());
+                    }
                 }
             }
         } finally {
             capture.stop();
             if (vdl2Worker != null) {
                 vdl2Worker.stop();
+            }
+            if (iqStreamWorker != null) {
+                iqStreamWorker.stop();
             }
             if (captureThread != null) {
                 captureThread.interrupt();
@@ -161,6 +189,10 @@ public final class AirbandRecorder {
             if (vdl2Thread != null) {
                 vdl2Thread.interrupt();
                 vdl2Thread.join(1000);
+            }
+            if (iqStreamThread != null) {
+                iqStreamThread.interrupt();
+                iqStreamThread.join(1000);
             }
         }
     }
@@ -301,7 +333,7 @@ public final class AirbandRecorder {
         }
 
         Vdl2Processor.IqSink vdl2IqSink() {
-            return vdl2Waterfall;
+            return vdl2Waterfall == null ? null : vdl2Waterfall::accept;
         }
 
         void repaintActivity() {
@@ -329,6 +361,7 @@ public final class AirbandRecorder {
         private final DebugWindow debug;
         private final CaptureStats captureStats;
         private final Vdl2Worker vdl2Worker;
+        private final IqTcpStreamWorker iqStreamWorker;
         private volatile Throwable failure;
 
         ChannelizerWorker(ArrayBlockingQueue<NativeSampleBlock> input,
@@ -337,7 +370,8 @@ public final class AirbandRecorder {
                           ChannelizedFrameRing preroll,
                           DebugWindow debug,
                           CaptureStats captureStats,
-                          Vdl2Worker vdl2Worker) {
+                          Vdl2Worker vdl2Worker,
+                          IqTcpStreamWorker iqStreamWorker) {
             this.input = input;
             this.output = output;
             this.pfb = pfb;
@@ -345,6 +379,7 @@ public final class AirbandRecorder {
             this.debug = debug;
             this.captureStats = captureStats;
             this.vdl2Worker = vdl2Worker;
+            this.iqStreamWorker = iqStreamWorker;
         }
 
         @Override
@@ -358,11 +393,14 @@ public final class AirbandRecorder {
                         break;
                     }
                     captureStats.accept(block);
+                    if (waterfallFft != null) {
+                        waterfallFill = updateWaterfall(block, waterfallFft, debug.waterfall(), waterfallFill);
+                    }
                     if (vdl2Worker != null) {
                         vdl2Worker.submit(block);
                     }
-                    if (waterfallFft != null) {
-                        waterfallFill = updateWaterfall(block, waterfallFft, debug.waterfall(), waterfallFill);
+                    if (iqStreamWorker != null) {
+                        iqStreamWorker.submit(block);
                     }
                     int frames = analyzer.framesIn(block);
                     for (int i = 0; i < frames; i++) {
@@ -381,6 +419,9 @@ public final class AirbandRecorder {
                 if (vdl2Worker != null) {
                     vdl2Worker.stop();
                 }
+                if (iqStreamWorker != null) {
+                    iqStreamWorker.stop();
+                }
                 signalDone();
             }
         }
@@ -394,6 +435,80 @@ public final class AirbandRecorder {
         private void signalDone() {
             while (!output.offer(ChannelizedFrame.poison())) {
                 output.poll();
+            }
+        }
+    }
+
+    private static final class IqTcpStreamWorker implements Runnable {
+        private final IqTcpStreamer streamer;
+        private final ArrayBlockingQueue<NativeSampleBlock> queue =
+                new ArrayBlockingQueue<>(IQ_TCP_STREAM_QUEUE_CAPACITY);
+        private volatile Throwable failure;
+        private long droppedBlocks;
+
+        IqTcpStreamWorker(IqTcpStreamer streamer) {
+            this.streamer = streamer;
+        }
+
+        void submit(NativeSampleBlock block) {
+            if (failure != null) {
+                return;
+            }
+            if (!queue.offer(block)) {
+                do {
+                    queue.poll();
+                    droppedBlocks++;
+                } while (!queue.offer(block));
+                if ((droppedBlocks & 0x3f) == 0) {
+                    System.out.printf("I/Q stream dropped %,d stale blocks because streaming is behind%n",
+                            droppedBlocks);
+                }
+            }
+        }
+
+        void stop() {
+            while (!queue.offer(NativeSampleBlock.POISON)) {
+                queue.poll();
+            }
+        }
+
+        String statusAndReset() {
+            long queueDropped = droppedBlocks;
+            droppedBlocks = 0;
+            IqTcpStreamer.Counters counters = streamer.countersAndReset();
+            return String.format(java.util.Locale.ROOT,
+                    "I/Q stream: %,d blocks, %,d samples, dropped %,d/%,d blocks, reconnects %,d, failures %,d, %s",
+                    counters.blocksSent(),
+                    counters.samplesSent(),
+                    counters.blocksDropped(),
+                    queueDropped,
+                    counters.reconnects(),
+                    counters.connectionFailures(),
+                    counters.connected() ? "connected" : "offline");
+        }
+
+        void throwIfFailed() {
+            if (failure != null) {
+                throw new IllegalStateException("I/Q stream thread failed", failure);
+            }
+        }
+
+        @Override
+        public void run() {
+            try {
+                while (!Thread.currentThread().isInterrupted()) {
+                    NativeSampleBlock block = queue.take();
+                    if (block.isPoison()) {
+                        break;
+                    }
+                    streamer.process(block);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Throwable t) {
+                failure = t;
+            } finally {
+                streamer.close();
             }
         }
     }
@@ -516,7 +631,7 @@ public final class AirbandRecorder {
         }
     }
 
-    private static final class Vdl2IqWaterfall implements Vdl2Processor.IqSink, AutoCloseable {
+    private static final class Vdl2IqWaterfall implements AutoCloseable {
         private final List<Integer> frequenciesHz;
         private final WaterfallPanel waterfall = new WaterfallPanel(900, 360);
         private volatile JFrame frame;
@@ -540,7 +655,6 @@ public final class AirbandRecorder {
             frame.setVisible(true);
         }
 
-        @Override
         public void accept(MemorySegment samples, int sampleCount) {
             if (closed || sampleCount == 0) {
                 return;
@@ -585,13 +699,9 @@ public final class AirbandRecorder {
 
         private String labelText() {
             if (frequenciesHz.isEmpty()) {
-                return String.format(java.util.Locale.ROOT,
-                        "Resampled I/Q FFT: %.3f Msps; no VDL2 channels configured",
-                        Vdl2WidebandResampler.OUTPUT_RATE / 1_000_000.0);
+                return "Resampled VDL2 I/Q FFT; no VDL2 channels configured";
             }
-            StringBuilder label = new StringBuilder(String.format(java.util.Locale.ROOT,
-                    "Resampled I/Q FFT: %.3f Msps; VDL2 channels: ",
-                    Vdl2WidebandResampler.OUTPUT_RATE / 1_000_000.0));
+            StringBuilder label = new StringBuilder("Resampled VDL2 I/Q FFT; VDL2 channels: ");
             for (int i = 0; i < frequenciesHz.size(); i++) {
                 if (i > 0) {
                     label.append("  ");

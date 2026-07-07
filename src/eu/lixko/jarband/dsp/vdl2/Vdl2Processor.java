@@ -25,12 +25,14 @@ public final class Vdl2Processor implements AutoCloseable {
     public Vdl2Processor(double inputSampleRateHz, double centerFrequencyHz, List<Integer> frequenciesHz,
                          InetSocketAddress output, IqSink iqSink) throws IOException {
         this.windowPlan = WindowPlan.select(centerFrequencyHz, inputSampleRateHz, frequenciesHz);
-        this.wideband = new Vdl2WidebandResampler(inputSampleRateHz, centerFrequencyHz, windowPlan.centerHz());
+        this.wideband = new Vdl2WidebandResampler(inputSampleRateHz, windowPlan.outputRateHz(),
+                centerFrequencyHz, windowPlan.centerHz());
         this.sink = new Vdl2SymbolSocket(output);
         this.channels = new ArrayList<>(frequenciesHz.size());
         this.iqSink = iqSink;
         for (int frequencyHz : frequenciesHz) {
-            channels.add(new Vdl2ChannelProcessor(frequencyHz, windowPlan.centerHz(), sink));
+            channels.add(new Vdl2ChannelProcessor(frequencyHz, windowPlan.centerHz(),
+                    windowPlan.outputRateHz(), sink));
         }
         System.out.print(windowPlan.describe());
     }
@@ -76,10 +78,6 @@ public final class Vdl2Processor implements AutoCloseable {
         return status.toString();
     }
 
-    public synchronized double windowCenterFrequencyHz() {
-        return windowPlan.centerHz();
-    }
-
     @Override
     public synchronized void close() throws Exception {
         Exception failure = null;
@@ -107,12 +105,15 @@ public final class Vdl2Processor implements AutoCloseable {
 
     private record WindowPlan(double centerHz, double sdrLowHz, double sdrHighHz,
                               double outputLowHz, double outputHighHz,
+                              int outputRateHz, int channelDecimationFactor,
                               int configuredChannels, int coveredChannels,
                               List<Integer> cutOffFrequenciesHz) {
         static WindowPlan select(double sdrCenterHz, double sdrSampleRateHz, List<Integer> frequenciesHz) {
             double sdrLow = sdrCenterHz - sdrSampleRateHz / 2.0;
             double sdrHigh = sdrCenterHz + sdrSampleRateHz / 2.0;
-            double halfOutput = Vdl2WidebandResampler.OUTPUT_RATE / 2.0;
+            int channelDecimationFactor = channelDecimationFactor(sdrSampleRateHz, frequenciesHz);
+            int outputRateHz = channelDecimationFactor * Vdl2Demodulator.SAMPLE_RATE;
+            double halfOutput = outputRateHz / 2.0;
             double allowedLow = sdrLow + halfOutput;
             double allowedHigh = sdrHigh - halfOutput;
             if (allowedLow > allowedHigh) {
@@ -160,7 +161,20 @@ public final class Vdl2Processor implements AutoCloseable {
                 }
             }
             return new WindowPlan(bestCenter, sdrLow, sdrHigh, outputLow, outputHigh,
+                    outputRateHz, channelDecimationFactor,
                     frequenciesHz.size(), bestCount, List.copyOf(cutOff));
+        }
+
+        private static int channelDecimationFactor(double sdrSampleRateHz, List<Integer> frequenciesHz) {
+            double requiredSpan = Vdl2Demodulator.SAMPLE_RATE * 2.0;
+            if (!frequenciesHz.isEmpty()) {
+                double min = frequenciesHz.stream().mapToDouble(Integer::doubleValue).min().orElse(0.0);
+                double max = frequenciesHz.stream().mapToDouble(Integer::doubleValue).max().orElse(0.0);
+                requiredSpan = Math.max(requiredSpan, max - min + 2.0 * VDL2_CHANNEL_GUARD_HZ);
+            }
+            int factor = Math.max(2, (int) Math.ceil(requiredSpan / Vdl2Demodulator.SAMPLE_RATE));
+            int maxFactor = Math.max(2, (int) Math.floor(sdrSampleRateHz / Vdl2Demodulator.SAMPLE_RATE));
+            return Math.min(factor, maxFactor);
         }
 
         private static boolean fits(int frequencyHz, double centerHz, double sdrLowHz,
@@ -184,10 +198,12 @@ public final class Vdl2Processor implements AutoCloseable {
         String describe() {
             StringBuilder message = new StringBuilder();
             message.append(String.format(Locale.ROOT,
-                    "VDL2 resampler window: center %.6f MHz, span %.6f-%.6f MHz, SDR span %.6f-%.6f MHz, covers %,d/%,d configured channels%n",
+                    "VDL2 resampler window: center %.6f MHz, span %.6f-%.6f MHz, rate %.0f ksps, channel decim %,d, SDR span %.6f-%.6f MHz, covers %,d/%,d configured channels%n",
                     centerHz / 1_000_000.0,
                     outputLowHz / 1_000_000.0,
                     outputHighHz / 1_000_000.0,
+                    outputRateHz / 1_000.0,
+                    channelDecimationFactor,
                     sdrLowHz / 1_000_000.0,
                     sdrHighHz / 1_000_000.0,
                     coveredChannels,

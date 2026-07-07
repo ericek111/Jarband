@@ -7,5 +7,6 @@ open module Jarband {
 	exports eu.lixko.jarband.capture;
 	exports eu.lixko.jarband.dsp.airband;
 	exports eu.lixko.jarband.dsp.channelizer;
+	exports eu.lixko.jarband.dsp.vdl2;
 	exports eu.lixko.jarband.recording;
 }
