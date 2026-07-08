@@ -3,12 +3,17 @@ const channelsEl = document.querySelector("#channels");
 const recentEl = document.querySelector("#recent");
 const filterEl = document.querySelector("#filter");
 const historyEl = document.querySelector("#history");
+const filterChipsEl = document.querySelector("#filter-chips");
+const realtimeGapsEl = document.querySelector("#realtime-gaps");
 const channelsDetails = document.querySelector("details");
 const selected = new Set();
 const live = new Set();
 const decoders = new Map();
 const packetQueues = new Map();
 const playClocks = new Map();
+const playbackModes = new Map();
+const playbackTimers = new Map();
+const rowPlaybackTimers = new Map();
 const channelNodes = new WeakMap();
 let channels = [];
 let recentUtterances = [];
@@ -69,10 +74,21 @@ function handleJson(message) {
     renderHistory(message);
   } else if (message.type === "history_started") {
     if (!ensureAudio()) return;
+    const modeKey = `history:${message.playbackId}`;
+    playbackModes.set(modeKey, {
+      realtime: Boolean(message.realtime),
+      originMillis: message.fromMillis,
+      originAudioTime: audioContext.currentTime + 0.15
+    });
+    armPlaybackExpiry(message.playbackId, message);
     statusEl.textContent = `Streaming ${message.frames} historical packets...`;
   } else if (message.type === "history_finished") {
     statusEl.textContent = "Historical playback finished";
   } else if (message.type === "history_stopped") {
+    playbackModes.clear();
+    for (const timer of playbackTimers.values()) clearTimeout(timer);
+    playbackTimers.clear();
+    clearPlayingRows();
     statusEl.textContent = "Historical playback stopped";
   } else if (message.type === "error") {
     statusEl.textContent = message.message;
@@ -99,6 +115,7 @@ function channelTile(channel) {
     if (selected.has(channel.name)) selected.delete(channel.name);
     else selected.add(channel.name);
     updateAllTileButtons();
+    renderFilterChips();
     loadRecentHistory(0);
   };
   listen.onclick = () => toggleLive(channel.name);
@@ -236,9 +253,22 @@ function playFrame(name, frame) {
   source.connect(audioContext.destination);
   const targetMillis = frame.timestamp / 1000;
   let startTime;
-  startTime = liveStartTime(name, targetMillis, frame.duration ? frame.duration / 1_000_000 : audio.duration);
+  const mode = playbackModeFor(name);
+  if (mode?.realtime) {
+    startTime = mode.originAudioTime + (targetMillis - mode.originMillis) / 1000;
+  } else {
+    startTime = liveStartTime(name, targetMillis, frame.duration ? frame.duration / 1_000_000 : audio.duration);
+  }
   source.start(Math.max(audioContext.currentTime, startTime));
   frame.close();
+}
+
+function playbackModeFor(streamKey) {
+  if (!streamKey.startsWith("history:")) {
+    return null;
+  }
+  const parts = streamKey.split(":");
+  return playbackModes.get(`${parts[0]}:${parts[1]}`);
 }
 
 function liveStartTime(name, targetMillis, durationSeconds) {
@@ -354,14 +384,26 @@ function lastActiveText(channel) {
 
 function renderHistory(message) {
   historyEl.replaceChildren();
+  updateRangeInputs(message.utterances);
   const list = document.createElement("div");
   list.className = "history-list";
   for (const utterance of message.utterances) {
     const row = document.createElement("button");
     row.type = "button";
     row.className = "utterance";
-    row.textContent = `${utterance.channel}  ${zulu(utterance.startMillis)}  ${duration(utterance)}s`;
-    row.onclick = () => playUtterance(utterance);
+    const channel = document.createElement("strong");
+    channel.textContent = utterance.channel;
+    const time = document.createElement("span");
+    time.textContent = zulu(utterance.startMillis);
+    const length = document.createElement("span");
+    length.textContent = `${duration(utterance)}s`;
+    const action = document.createElement("span");
+    action.className = "utterance-action";
+    action.textContent = "Play";
+    row.append(channel, time, length);
+    row.append(action);
+    row.dataset.utteranceKey = utteranceKey(utterance);
+    row.onclick = () => playUtterance(utterance, row);
     list.append(row);
   }
   const pager = document.createElement("div");
@@ -382,18 +424,114 @@ function renderHistory(message) {
   historyEl.append(list, pager);
 }
 
+function updateRangeInputs(utterances) {
+  if (utterances.length === 0) {
+    return;
+  }
+  const from = Math.min(...utterances.map(utterance => utterance.startMillis));
+  const to = Math.max(...utterances.map(utterance => utterance.endMillis));
+  document.querySelector("#from").value = localDateTime(from);
+  document.querySelector("#to").value = localDateTime(to);
+}
+
+function localDateTime(millis) {
+  const date = new Date(millis);
+  const offsetMillis = date.getTimezoneOffset() * 60_000;
+  return new Date(millis - offsetMillis).toISOString().slice(0, 16);
+}
+
+function renderFilterChips() {
+  filterChipsEl.replaceChildren();
+  if (selected.size === 0) {
+    const empty = document.createElement("span");
+    empty.className = "filter-empty";
+    empty.textContent = "History filter: all channels";
+    filterChipsEl.append(empty);
+    return;
+  }
+  for (const name of [...selected].sort()) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "filter-chip";
+    chip.textContent = `${name} x`;
+    chip.onclick = () => {
+      selected.delete(name);
+      updateAllTileButtons();
+      renderFilterChips();
+      loadRecentHistory(0);
+    };
+    filterChipsEl.append(chip);
+  }
+}
+
+function armPlaybackExpiry(id, playback) {
+  const oldTimer = playbackTimers.get(id);
+  if (oldTimer) clearTimeout(oldTimer);
+  const realtimeMillis = Math.max(0, playback.toMillis - playback.fromMillis);
+  const compactMillis = Math.max(0, playback.frames * 20);
+  const playbackMillis = playback.realtime ? realtimeMillis : compactMillis;
+  const timer = setTimeout(() => {
+    playbackModes.delete(`history:${id}`);
+    playbackTimers.delete(id);
+  }, Math.min(Math.max(playbackMillis + 750, 1000), 3_600_000));
+  playbackTimers.set(id, timer);
+}
+
 function duration(utterance) {
   return Math.max(0, (utterance.endMillis - utterance.startMillis) / 1000).toFixed(1);
 }
 
-function playUtterance(utterance) {
+function playUtterance(utterance, row) {
   if (!ensureAudio()) return;
+  markUtterancePlaying(utterance, row);
   send({
     type: "play_utterance",
     channels: [utterance.channel],
     fromMillis: utterance.startMillis,
-    toMillis: utterance.endMillis
+    toMillis: utterance.endMillis,
+    realtime: false
   });
+}
+
+function utteranceKey(utterance) {
+  return `${utterance.channel}:${utterance.startMillis}:${utterance.endMillis}`;
+}
+
+function markUtterancePlaying(utterance, row) {
+  const key = utteranceKey(utterance);
+  for (const existing of utteranceRows(key)) {
+    existing.classList.add("playing-row");
+    const action = existing.querySelector(".utterance-action");
+    if (action) action.textContent = "Playing";
+  }
+  const oldTimer = rowPlaybackTimers.get(key);
+  if (oldTimer) clearTimeout(oldTimer);
+  const timer = setTimeout(() => clearPlayingRow(key), Math.max(1000, utterance.endMillis - utterance.startMillis + 750));
+  rowPlaybackTimers.set(key, timer);
+}
+
+function clearPlayingRow(key) {
+  rowPlaybackTimers.delete(key);
+  for (const row of utteranceRows(key)) {
+    row.classList.remove("playing-row");
+    const action = row.querySelector(".utterance-action");
+    if (action) action.textContent = "Play";
+  }
+}
+
+function utteranceRows(key) {
+  return [...historyEl.querySelectorAll(".utterance")]
+    .filter(row => row.dataset.utteranceKey === key);
+}
+
+function clearPlayingRows() {
+  for (const timer of rowPlaybackTimers.values()) clearTimeout(timer);
+  rowPlaybackTimers.clear();
+  for (const row of historyEl.querySelectorAll(".playing-row")) {
+    row.classList.remove("playing-row");
+    const action = row.querySelector(".utterance-action");
+    if (action) action.textContent = "Play";
+  }
 }
 
 function refreshDisplay() {
@@ -415,21 +553,21 @@ document.querySelector("#refresh").onclick = () => {
   send({ type: "list_channels" });
   loadRecentHistory(historyPage);
 };
-document.querySelector("#index").onclick = () => send({
-  type: "history_index",
-  channels: [...selected],
-  fromMillis: localMillis("#from"),
-  toMillis: localMillis("#to") || Date.now()
-});
 document.querySelector("#play-history").onclick = () => {
   if (!ensureAudio()) return;
   send({
     type: "play_history",
-    channels: [...selected],
+    channels: historyChannels(),
     fromMillis: localMillis("#from"),
-    toMillis: localMillis("#to") || Date.now()
+    toMillis: localMillis("#to") || Date.now(),
+    realtime: realtimeGapsEl.checked
   });
 };
 document.querySelector("#stop-history").onclick = () => send({ type: "stop_history" });
 
+renderFilterChips();
 connect();
+
+function historyChannels() {
+  return selected.size > 0 ? [...selected] : channels.map(channel => channel.name);
+}

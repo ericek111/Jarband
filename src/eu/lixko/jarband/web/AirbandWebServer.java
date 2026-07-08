@@ -36,6 +36,7 @@ public final class AirbandWebServer implements AutoCloseable {
     private static final Pattern TO = Pattern.compile("\"toMillis\"\\s*:\\s*(\\d+)");
     private static final Pattern PAGE = Pattern.compile("\"page\"\\s*:\\s*(\\d+)");
     private static final Pattern PAGE_SIZE = Pattern.compile("\"pageSize\"\\s*:\\s*(\\d+)");
+    private static final Pattern REALTIME = Pattern.compile("\"realtime\"\\s*:\\s*true");
 
     private final Undertow undertow;
     private final LiveAudioHub hub;
@@ -165,9 +166,9 @@ public final class AirbandWebServer implements AutoCloseable {
                             history.recentJson(channels(json),
                                     (int) millis(json, PAGE, 0), (int) millis(json, PAGE_SIZE, 20)));
                     case "play_history" -> playHistory(client, channels(json),
-                            millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE), true);
+                            millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE), true, realtime(json));
                     case "play_utterance" -> playHistory(client, channels(json),
-                            millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE), false);
+                            millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE), false, realtime(json));
                     case "stop_history" -> {
                         stopPlayback(client);
                         sendText(channel, "{\"type\":\"history_stopped\"}");
@@ -181,11 +182,12 @@ public final class AirbandWebServer implements AutoCloseable {
     }
 
     private void playHistory(LiveAudioHub.Client client, List<String> channels, long fromMillis, long toMillis,
-                             boolean replaceExisting) {
+                             boolean replaceExisting, boolean realtime) {
         if (replaceExisting) {
             stopPlayback(client);
         }
-        HistoryTask task = new HistoryTask(client, channels, fromMillis, toMillis, playbackIds.incrementAndGet());
+        HistoryTask task = new HistoryTask(client, channels, fromMillis, toMillis, playbackIds.incrementAndGet(),
+                realtime);
         client.addPlayback(task);
         historyExecutor.execute(task);
     }
@@ -200,15 +202,17 @@ public final class AirbandWebServer implements AutoCloseable {
         private final long fromMillis;
         private final long toMillis;
         private final long playbackId;
+        private final boolean realtime;
         private volatile boolean stopped;
 
         HistoryTask(LiveAudioHub.Client client, List<String> channels, long fromMillis, long toMillis,
-                    long playbackId) {
+                    long playbackId, boolean realtime) {
             this.client = client;
             this.channels = List.copyOf(channels);
             this.fromMillis = fromMillis;
             this.toMillis = toMillis;
             this.playbackId = playbackId;
+            this.realtime = realtime;
         }
 
         @Override
@@ -216,7 +220,11 @@ public final class AirbandWebServer implements AutoCloseable {
             try {
                 List<EncodedOpusFrame> frames = history.packets(channels, fromMillis, toMillis);
                 sendText(client.channel(), "{\"type\":\"history_started\",\"frames\":" + frames.size()
-                        + ",\"fromMillis\":" + fromMillis + ",\"playbackId\":" + playbackId + "}");
+                        + ",\"fromMillis\":" + fromMillis
+                        + ",\"toMillis\":" + toMillis
+                        + ",\"playbackId\":" + playbackId
+                        + ",\"realtime\":" + realtime
+                        + ",\"channels\":" + channelsJson(channels) + "}");
                 for (EncodedOpusFrame frame : frames) {
                     if (stopped || !client.channel().isOpen()) {
                         break;
@@ -264,6 +272,19 @@ public final class AirbandWebServer implements AutoCloseable {
     private static long millis(String json, Pattern pattern, long fallback) {
         Matcher matcher = pattern.matcher(json);
         return matcher.find() ? Long.parseLong(matcher.group(1)) : fallback;
+    }
+
+    private static boolean realtime(String json) {
+        return REALTIME.matcher(json).find();
+    }
+
+    private static String channelsJson(List<String> channels) {
+        StringBuilder json = new StringBuilder("[");
+        for (int i = 0; i < channels.size(); i++) {
+            if (i > 0) json.append(',');
+            json.append('"').append(LiveAudioHub.escape(channels.get(i))).append('"');
+        }
+        return json.append(']').toString();
     }
 
     private static String unescape(String input) {

@@ -31,10 +31,11 @@
 
     <section>
       <h2>Historical Playback</h2>
+      <div id="filter-chips" class="filter-chips"></div>
       <div class="history-controls">
         <label>From <input id="from" type="datetime-local"></label>
         <label>To <input id="to" type="datetime-local"></label>
-        <button id="index" type="button">List</button>
+        <label class="checkbox"><input id="realtime-gaps" type="checkbox"> Real-time gaps</label>
         <button id="play-history" type="button">Play selected</button>
       </div>
       <div id="history"></div>
