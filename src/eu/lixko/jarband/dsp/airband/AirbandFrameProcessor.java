@@ -121,6 +121,8 @@ public final class AirbandFrameProcessor implements AutoCloseable {
         if (aboveClose) {
             channels.lastSignalSequence[channelId] = sequence;
         }
+        channels.snrSumDb[channelId] += powerToDb(channels.power[channelId]) - powerToDb(thresholdBase);
+        channels.snrFrames[channelId]++;
 
         if (!aboveClose && sequence - channels.lastSignalSequence[channelId] >= closeLookaheadFrames) {
             // The carrier has been gone for the whole lookahead window. Emit up
@@ -147,6 +149,8 @@ public final class AirbandFrameProcessor implements AutoCloseable {
                 channels.emittedThroughSequence[channelId] + 1);
         channels.lastSignalSequence[channelId] = sequence;
         channels.openRunFrames[channelId] = 0;
+        channels.snrSumDb[channelId] = 0.0f;
+        channels.snrFrames[channelId] = 0;
     }
 
     private void closeGate(int channelId, long unixMillis, AudioSink sink) {
@@ -161,7 +165,12 @@ public final class AirbandFrameProcessor implements AutoCloseable {
         channels.candidateStartSequence[channelId] = -1L;
         channels.lastSignalSequence[channelId] = -1L;
         channels.nextEmitSequence[channelId] = -1L;
-        sink.closeUtterance(channelId, unixMillis);
+        float averageSnrDb = channels.snrFrames[channelId] > 0
+                ? channels.snrSumDb[channelId] / channels.snrFrames[channelId]
+                : Float.NaN;
+        channels.snrSumDb[channelId] = 0.0f;
+        channels.snrFrames[channelId] = 0;
+        sink.closeUtterance(channelId, unixMillis, averageSnrDb);
     }
 
     private void emitRange(LogicalChannel channel, long firstSequence, long lastSequenceExclusive,
@@ -213,7 +222,7 @@ public final class AirbandFrameProcessor implements AutoCloseable {
     public interface AudioSink {
         void audio(int channelId, long unixMillis, float[] audio, int length);
 
-        void closeUtterance(int channelId, long unixMillis);
+        void closeUtterance(int channelId, long unixMillis, float averageSnrDb);
     }
 
     public static final class ChannelStatus {
@@ -248,6 +257,8 @@ public final class AirbandFrameProcessor implements AutoCloseable {
         final float[] i;
         final float[] q;
         final float[] power;
+        final float[] snrSumDb;
+        final int[] snrFrames;
         final float[] noiseScratch;
         float bandNoiseFloor = Float.NaN;
 
@@ -261,6 +272,8 @@ public final class AirbandFrameProcessor implements AutoCloseable {
             i = new float[channelCount];
             q = new float[channelCount];
             power = new float[channelCount];
+            snrSumDb = new float[channelCount];
+            snrFrames = new int[channelCount];
             noiseScratch = new float[channelCount];
             Arrays.fill(candidateStartSequence, -1L);
             Arrays.fill(lastSignalSequence, -1L);

@@ -29,6 +29,9 @@ public final class ChannelRecorder implements AutoCloseable {
     private UtteranceDbWriter dbFile;
     private String rotationKey = "";
     private boolean utteranceOpen;
+    private long utteranceStartMillis;
+    private int utteranceStartOffset;
+    private long utteranceDbOffset;
 
     public ChannelRecorder(Path outputDir, LogicalChannel channel, boolean weeklyRotation,
                            int opusSampleRate, int bitrate, int frameMillis, int complexity,
@@ -43,19 +46,13 @@ public final class ChannelRecorder implements AutoCloseable {
         this.frameBuffer = new float[encoder.frameSamples()];
     }
 
-    public synchronized void accept(long unixMillis, float[] audio, int length, boolean open) throws IOException {
+    public synchronized void accept(long unixMillis, float[] audio, int length) throws IOException {
         rotateIfNeeded(unixMillis);
-        if (open && !utteranceOpen) {
-            dbFile.append(unixMillis, opusFile.offsetForNextPacket());
+        if (!utteranceOpen) {
+            utteranceStartMillis = unixMillis;
+            utteranceStartOffset = opusFile.offsetForNextPacket();
+            utteranceDbOffset = dbFile.appendOpen(utteranceStartMillis, utteranceStartOffset);
             utteranceOpen = true;
-        } else if (!open) {
-            utteranceOpen = false;
-            // Keep utterances independent and avoid carrying a partial Opus
-            // frame, often containing squelch-edge noise, into the next one.
-            frameFill = 0;
-        }
-        if (!open) {
-            return;
         }
         for (int i = 0; i < length; i++) {
             if (frameFill == 0) {
@@ -71,8 +68,14 @@ public final class ChannelRecorder implements AutoCloseable {
         }
     }
 
-    public synchronized void closeUtterance(long unixMillis) throws IOException {
-        rotateIfNeeded(unixMillis);
+    public synchronized void closeUtterance(long unixMillis, float averageSnrDb) throws IOException {
+        if (opusFile == null || dbFile == null) {
+            rotateIfNeeded(unixMillis);
+        }
+        if (utteranceOpen) {
+            dbFile.update(utteranceDbOffset, utteranceStartMillis, utteranceStartOffset,
+                    Math.max(0, unixMillis - utteranceStartMillis), averageSnrDb);
+        }
         utteranceOpen = false;
         // Keep utterances independent and avoid carrying a partial Opus frame,
         // often containing squelch-edge noise, into the next one.
@@ -101,6 +104,9 @@ public final class ChannelRecorder implements AutoCloseable {
         opusFile = new OggOpusFile(channelDir.resolve(rotationKey + ".opus"), opusSampleRate, opusFrameMillis);
         dbFile = new UtteranceDbWriter(channelDir.resolve(rotationKey + ".udb"));
         utteranceOpen = false;
+        utteranceStartMillis = 0;
+        utteranceStartOffset = 0;
+        utteranceDbOffset = 0;
         frameFill = 0;
     }
 

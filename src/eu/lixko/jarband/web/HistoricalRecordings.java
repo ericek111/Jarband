@@ -18,6 +18,7 @@ import java.util.stream.Stream;
 
 import eu.lixko.jarband.dsp.channelizer.LogicalChannel;
 import eu.lixko.jarband.recording.EncodedOpusFrame;
+import eu.lixko.jarband.recording.UtteranceDbWriter;
 
 final class HistoricalRecordings {
     private static final DateTimeFormatter WEEKLY_ROTATION_FORMAT =
@@ -50,7 +51,9 @@ final class HistoricalRecordings {
                         .append("\"channel\":\"").append(LiveAudioHub.escape(channel.name())).append("\",")
                         .append("\"frequencyHz\":").append(Math.round(channel.frequencyHz())).append(',')
                         .append("\"startMillis\":").append(utterance.startMillis).append(',')
-                        .append("\"endMillis\":").append(utterance.endMillis)
+                        .append("\"endMillis\":").append(utterance.endMillis).append(',')
+                        .append("\"durationMillis\":").append(durationMillis(utterance)).append(',')
+                        .append("\"averageSnrDb\":").append(snrDb(utterance.averageSnrQ8_8))
                         .append('}');
             }
         }
@@ -91,7 +94,9 @@ final class HistoricalRecordings {
                     .append("\"channel\":\"").append(LiveAudioHub.escape(utterance.channel.name())).append("\",")
                     .append("\"frequencyHz\":").append(Math.round(utterance.channel.frequencyHz())).append(',')
                     .append("\"startMillis\":").append(utterance.startMillis).append(',')
-                    .append("\"endMillis\":").append(utterance.endMillis)
+                    .append("\"endMillis\":").append(utterance.endMillis).append(',')
+                    .append("\"durationMillis\":").append(durationMillis(utterance)).append(',')
+                    .append("\"averageSnrDb\":").append(snrDb(utterance.averageSnrQ8_8))
                     .append('}');
         }
         json.append("]}");
@@ -155,8 +160,7 @@ final class HistoricalRecordings {
                 if (!Files.isRegularFile(opus)) {
                     continue;
                 }
-                int endOffset = (int) Math.min(Integer.MAX_VALUE, Files.size(opus));
-                latest = Math.max(latest, estimateEndMillis(record.startMillis, record.opusOffset, endOffset));
+                latest = Math.max(latest, endMillis(record));
             }
         }
         return latest;
@@ -182,12 +186,10 @@ final class HistoricalRecordings {
                     int endOffset = i + 1 < records.size()
                             ? records.get(i + 1).opusOffset
                             : (int) Math.min(Integer.MAX_VALUE, opusSize);
-                    long endMillis = i + 1 < records.size()
-                            ? records.get(i + 1).startMillis
-                            : estimateEndMillis(current.startMillis, current.opusOffset, endOffset);
+                    long endMillis = endMillis(current);
                     if (endMillis >= fromMillis && current.startMillis <= toMillis) {
                         result.add(new Utterance(channel, opus, current.startMillis, endMillis,
-                                current.opusOffset, endOffset));
+                                current.opusOffset, endOffset, current.durationUnits, current.averageSnrQ8_8));
                     }
                 }
             }
@@ -223,48 +225,67 @@ final class HistoricalRecordings {
     }
 
     private static List<UdbRecord> readDb(Path path) throws IOException {
-        var records = new ArrayList<UdbRecord>();
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
-            ByteBuffer record = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
-            while (true) {
-                record.clear();
-                int read = 0;
-                while (record.hasRemaining()) {
-                    int n = channel.read(record);
-                    if (n < 0) break;
-                    read += n;
-                }
-                if (read == 0) break;
-                if (read < 12) break;
-                record.flip();
-                records.add(new UdbRecord(record.getLong(), record.getInt()));
+            return readDb(channel);
+        }
+    }
+
+    private static List<UdbRecord> readDb(FileChannel channel) throws IOException {
+        var records = new ArrayList<UdbRecord>();
+        ByteBuffer record = ByteBuffer.allocate(UtteranceDbWriter.RECORD_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        channel.position(UtteranceDbWriter.HEADER_BYTES);
+        while (true) {
+            record.clear();
+            int read = 0;
+            while (record.hasRemaining()) {
+                int n = channel.read(record);
+                if (n < 0) break;
+                read += n;
             }
+            if (read == 0) break;
+            if (read < UtteranceDbWriter.RECORD_BYTES) break;
+            record.flip();
+            records.add(new UdbRecord(record.getLong(), record.getInt(),
+                    record.getShort() & 0xffff, record.getShort()));
         }
         return records;
     }
 
     private static UdbRecord readLastDbRecord(Path path) throws IOException {
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
-            long recordCount = channel.size() / 12;
+            long recordCount = (channel.size() - UtteranceDbWriter.HEADER_BYTES) / UtteranceDbWriter.RECORD_BYTES;
             if (recordCount <= 0) {
                 return null;
             }
-            ByteBuffer record = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
-            channel.position((recordCount - 1) * 12);
+            ByteBuffer record = ByteBuffer.allocate(UtteranceDbWriter.RECORD_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+            channel.position(UtteranceDbWriter.HEADER_BYTES + (recordCount - 1) * UtteranceDbWriter.RECORD_BYTES);
             while (record.hasRemaining()) {
                 if (channel.read(record) < 0) {
                     return null;
                 }
             }
             record.flip();
-            return new UdbRecord(record.getLong(), record.getInt());
+            long startMillis = record.getLong();
+            int opusOffset = record.getInt();
+            return new UdbRecord(startMillis, opusOffset, record.getShort() & 0xffff, record.getShort());
         }
     }
 
-    private long estimateEndMillis(long startMillis, int startOffset, int endOffset) {
-        int bytes = Math.max(0, endOffset - startOffset);
-        int estimatedPackets = Math.max(1, bytes / 80);
-        return startMillis + (long) estimatedPackets * opusFrameMillis;
+    private long endMillis(UdbRecord record) {
+        if (record.durationUnits == UtteranceDbWriter.DURATION_INDEFINITE) {
+            return Long.MAX_VALUE;
+        }
+        return record.startMillis + record.durationUnits * (long) UtteranceDbWriter.DURATION_UNIT_MILLIS;
+    }
+
+    private static long durationMillis(Utterance utterance) {
+        return utterance.durationUnits == UtteranceDbWriter.DURATION_INDEFINITE
+                ? -1
+                : utterance.durationUnits * (long) UtteranceDbWriter.DURATION_UNIT_MILLIS;
+    }
+
+    private static float snrDb(short q8_8) {
+        return q8_8 / 256.0f;
     }
 
     @SuppressWarnings("unused")
@@ -272,8 +293,8 @@ final class HistoricalRecordings {
         return WEEKLY_ROTATION_FORMAT.format(Instant.ofEpochMilli(unixMillis));
     }
 
-    private record UdbRecord(long startMillis, int opusOffset) {}
+    private record UdbRecord(long startMillis, int opusOffset, int durationUnits, short averageSnrQ8_8) {}
 
     private record Utterance(LogicalChannel channel, Path opusPath, long startMillis, long endMillis,
-                             int startOffset, int endOffset) {}
+                             int startOffset, int endOffset, int durationUnits, short averageSnrQ8_8) {}
 }

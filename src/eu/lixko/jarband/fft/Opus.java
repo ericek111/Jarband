@@ -82,6 +82,18 @@ public class Opus {
         return (MemorySegment) NativeUtils.call(opus_encoder_create, Fs, channels, application, error);
     }
 
+    private static final ApiMethod opus_decoder_create = new ApiMethod("opus_decoder_create",
+        FunctionDescriptor.of(
+            ValueLayout.ADDRESS,
+            ValueLayout.JAVA_INT,
+            ValueLayout.JAVA_INT,
+            ValueLayout.ADDRESS
+        ));
+
+    public static MemorySegment opus_decoder_create(int Fs, int channels, MemorySegment error) {
+        return (MemorySegment) NativeUtils.call(opus_decoder_create, Fs, channels, error);
+    }
+
     // ========== opus_encoder_destroy ==========
     // void opus_encoder_destroy(OpusEncoder *st)
     private static final ApiMethod opus_encoder_destroy = new ApiMethod("opus_encoder_destroy",
@@ -94,6 +106,15 @@ public class Opus {
      */
     public static void opus_encoder_destroy(MemorySegment st) {
         NativeUtils.call(opus_encoder_destroy, st);
+    }
+
+    private static final ApiMethod opus_decoder_destroy = new ApiMethod("opus_decoder_destroy",
+        FunctionDescriptor.ofVoid(
+            ValueLayout.ADDRESS
+        ));
+
+    public static void opus_decoder_destroy(MemorySegment st) {
+        NativeUtils.call(opus_decoder_destroy, st);
     }
 
     // ========== opus_encode_float ==========
@@ -123,6 +144,27 @@ public class Opus {
                                         MemorySegment data, int max_data_bytes) {
         try {
             return (int) opus_encode_float.HANDLE.invokeExact(st, pcm, frame_size, data, max_data_bytes);
+        } catch (Throwable e) {
+            e.printStackTrace();
+            return OPUS_INTERNAL_ERROR;
+        }
+    }
+
+    private static final ApiMethod opus_decode_float = new ApiMethod("opus_decode_float",
+        FunctionDescriptor.of(
+            ValueLayout.JAVA_INT,
+            ValueLayout.ADDRESS,
+            ValueLayout.ADDRESS,
+            ValueLayout.JAVA_INT,
+            ValueLayout.ADDRESS,
+            ValueLayout.JAVA_INT,
+            ValueLayout.JAVA_INT
+        ));
+
+    public static int opus_decode_float(MemorySegment st, MemorySegment data, int len,
+                                        MemorySegment pcm, int frameSize, int decodeFec) {
+        try {
+            return (int) opus_decode_float.HANDLE.invokeExact(st, data, len, pcm, frameSize, decodeFec);
         } catch (Throwable e) {
             e.printStackTrace();
             return OPUS_INTERNAL_ERROR;

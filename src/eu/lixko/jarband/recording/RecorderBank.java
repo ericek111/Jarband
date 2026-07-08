@@ -48,8 +48,8 @@ public final class RecorderBank implements AirbandFrameProcessor.AudioSink, Auto
     }
 
     @Override
-    public void closeUtterance(int channelId, long unixMillis) {
-        enqueue(EncoderEvent.closeUtterance(channelId, unixMillis));
+    public void closeUtterance(int channelId, long unixMillis, float averageSnrDb) {
+        enqueue(EncoderEvent.closeUtterance(channelId, unixMillis, averageSnrDb));
     }
 
     private void enqueue(EncoderEvent event) {
@@ -76,9 +76,9 @@ public final class RecorderBank implements AirbandFrameProcessor.AudioSink, Auto
                     break;
                 }
                 if (event.kind == EncoderEvent.AUDIO) {
-                    recorders.get(event.channelId).accept(event.unixMillis, event.audio, event.length, true);
+                    recorders.get(event.channelId).accept(event.unixMillis, event.audio, event.length);
                 } else {
-                    recorders.get(event.channelId).closeUtterance(event.unixMillis);
+                    recorders.get(event.channelId).closeUtterance(event.unixMillis, event.averageSnrDb);
                     if (frameSink != null) {
                         frameSink.closeUtterance(event.channelId, event.unixMillis);
                     }
@@ -140,27 +140,29 @@ public final class RecorderBank implements AirbandFrameProcessor.AudioSink, Auto
         final byte kind;
         final int channelId;
         final long unixMillis;
+        final float averageSnrDb;
         final float[] audio;
         final int length;
 
-        private EncoderEvent(byte kind, int channelId, long unixMillis, float[] audio, int length) {
+        private EncoderEvent(byte kind, int channelId, long unixMillis, float averageSnrDb, float[] audio, int length) {
             this.kind = kind;
             this.channelId = channelId;
             this.unixMillis = unixMillis;
+            this.averageSnrDb = averageSnrDb;
             this.audio = audio;
             this.length = length;
         }
 
         static EncoderEvent audio(int channelId, long unixMillis, float[] audio, int length) {
-            return new EncoderEvent(AUDIO, channelId, unixMillis, audio, length);
+            return new EncoderEvent(AUDIO, channelId, unixMillis, 0.0f, audio, length);
         }
 
-        static EncoderEvent closeUtterance(int channelId, long unixMillis) {
-            return new EncoderEvent(CLOSE_UTTERANCE, channelId, unixMillis, null, 0);
+        static EncoderEvent closeUtterance(int channelId, long unixMillis, float averageSnrDb) {
+            return new EncoderEvent(CLOSE_UTTERANCE, channelId, unixMillis, averageSnrDb, null, 0);
         }
 
         static EncoderEvent stop() {
-            return new EncoderEvent(STOP, -1, 0L, null, 0);
+            return new EncoderEvent(STOP, -1, 0L, 0.0f, null, 0);
         }
     }
 }
