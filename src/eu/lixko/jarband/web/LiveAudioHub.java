@@ -57,6 +57,14 @@ public final class LiveAudioHub implements OpusFrameSink {
         return null;
     }
 
+    void seedLastActivity(int channelId, long unixMillis) {
+        if (unixMillis <= 0) {
+            return;
+        }
+        ChannelActivity item = activity[channelId];
+        item.lastActivityMillis = Math.max(item.lastActivityMillis, unixMillis);
+    }
+
     public String channelListJson(int recentLimit) {
         StringBuilder json = new StringBuilder(8192);
         json.append("{\"type\":\"channels\",\"channels\":[");

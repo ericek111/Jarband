@@ -25,6 +25,7 @@ declare class AudioDecoder {
   constructor(init: AudioDecoderInit);
   configure(config: AudioDecoderConfig): void;
   decode(chunk: EncodedAudioChunk): void;
+  flush(): Promise<void>;
   close(): void;
 }
 

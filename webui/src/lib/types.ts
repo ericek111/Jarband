@@ -21,6 +21,8 @@ export type ServerMessage =
   | { type: 'history_started'; frames: number; fromMillis: number; toMillis: number; playbackId: number; realtime: boolean; channels: string[] }
   | { type: 'history_finished'; playbackId: number }
   | { type: 'history_stopped' }
+  | { type: 'download_started'; downloadId: number; frames: number; filename: string }
+  | { type: 'download_finished'; downloadId: number }
   | { type: 'subscribed' | 'unsubscribed' }
   | { type: 'error'; message: string };
 

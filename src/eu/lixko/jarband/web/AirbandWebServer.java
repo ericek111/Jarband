@@ -53,6 +53,14 @@ public final class AirbandWebServer implements AutoCloseable {
                             LiveAudioHub hub, int opusSampleRateHz, int opusFrameMillis) {
         this.hub = hub;
         this.history = new HistoricalRecordings(outputDir, hub, opusSampleRateHz, opusFrameMillis);
+        try {
+            int seeded = history.seedLastActivityFromDbEnds();
+            if (seeded > 0) {
+                System.out.printf("Airband web: seeded last activity for %,d channels from recording DBs%n", seeded);
+            }
+        } catch (IOException e) {
+            System.err.println("Airband web: failed to seed last activity from recording DBs: " + e.getMessage());
+        }
         this.recentChannelLimit = recentChannelLimit;
         HttpHandler routes = Handlers.path()
                 .addExactPath("/airband/ws", Handlers.websocket(new Callback()))
@@ -174,6 +182,8 @@ public final class AirbandWebServer implements AutoCloseable {
                     case "play_utterance" -> playHistory(client, channels(json),
                             millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE), false, realtime(json));
                     case "play_last_utterance" -> playLastUtterance(client, channels(json));
+                    case "download_utterance" -> downloadUtterance(client, channels(json),
+                            millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE));
                     case "stop_history" -> {
                         stopPlayback(client);
                         sendText(channel, "{\"type\":\"history_stopped\"}");
@@ -197,6 +207,16 @@ public final class AirbandWebServer implements AutoCloseable {
             return;
         }
         playHistory(client, List.of(name), range[0], range[1], false, false);
+    }
+
+    private void downloadUtterance(LiveAudioHub.Client client, List<String> channels,
+                                   long fromMillis, long toMillis) {
+        if (channels.isEmpty()) {
+            return;
+        }
+        DownloadTask task = new DownloadTask(client, channels.getFirst(), fromMillis, toMillis,
+                playbackIds.incrementAndGet());
+        historyExecutor.execute(task);
     }
 
     private void playHistory(LiveAudioHub.Client client, List<String> channels, long fromMillis, long toMillis,
@@ -266,6 +286,48 @@ public final class AirbandWebServer implements AutoCloseable {
         @Override
         public void stop() {
             stopped = true;
+        }
+    }
+
+    private final class DownloadTask implements Runnable {
+        private final LiveAudioHub.Client client;
+        private final String channel;
+        private final long fromMillis;
+        private final long toMillis;
+        private final long downloadId;
+
+        DownloadTask(LiveAudioHub.Client client, String channel, long fromMillis, long toMillis, long downloadId) {
+            this.client = client;
+            this.channel = channel;
+            this.fromMillis = fromMillis;
+            this.toMillis = toMillis;
+            this.downloadId = downloadId;
+        }
+
+        @Override
+        public void run() {
+            try {
+                List<EncodedOpusFrame> frames = history.packets(List.of(channel), fromMillis, toMillis);
+                String filename = channel + "-" + fromMillis + ".wav";
+                sendText(client.channel(), "{\"type\":\"download_started\",\"downloadId\":" + downloadId
+                        + ",\"frames\":" + frames.size()
+                        + ",\"filename\":\"" + LiveAudioHub.escape(filename) + "\"}");
+                for (EncodedOpusFrame frame : frames) {
+                    if (!client.channel().isOpen()) {
+                        break;
+                    }
+                    WebSockets.sendBinary(LiveAudioHub.packetMessage(
+                            frame.withStreamKey("download:" + downloadId + ":" + frame.channelName())),
+                            client.channel(), null);
+                }
+                if (client.channel().isOpen()) {
+                    sendText(client.channel(), "{\"type\":\"download_finished\",\"downloadId\":" + downloadId + "}");
+                }
+            } catch (Exception e) {
+                if (client.channel().isOpen()) {
+                    error(client.channel(), e.getMessage());
+                }
+            }
         }
     }
 

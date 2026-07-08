@@ -152,6 +152,9 @@ button.live {
 }
 
 .replay-last {
+  width: 100%;
+  height: auto;
+  min-height: 38px;
   color: #8ab4f8;
 }
 

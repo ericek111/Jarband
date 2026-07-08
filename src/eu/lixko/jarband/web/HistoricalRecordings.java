@@ -126,6 +126,42 @@ final class HistoricalRecordings {
                 .orElse(null);
     }
 
+    int seedLastActivityFromDbEnds() throws IOException {
+        int seeded = 0;
+        for (LogicalChannel channel : hub.channels()) {
+            long lastActivityMillis = latestDbEndMillis(channel);
+            if (lastActivityMillis > 0) {
+                hub.seedLastActivity(channel.id(), lastActivityMillis);
+                seeded++;
+            }
+        }
+        return seeded;
+    }
+
+    private long latestDbEndMillis(LogicalChannel channel) throws IOException {
+        Path channelDir = outputDir.resolve(channel.name());
+        if (!Files.isDirectory(channelDir)) {
+            return 0;
+        }
+        long latest = 0;
+        try (Stream<Path> files = Files.list(channelDir)) {
+            for (Path db : files.filter(path -> path.getFileName().toString().endsWith(".udb")).toList()) {
+                UdbRecord record = readLastDbRecord(db);
+                if (record == null) {
+                    continue;
+                }
+                String base = db.getFileName().toString().replaceFirst("\\.udb$", "");
+                Path opus = channelDir.resolve(base + ".opus");
+                if (!Files.isRegularFile(opus)) {
+                    continue;
+                }
+                int endOffset = (int) Math.min(Integer.MAX_VALUE, Files.size(opus));
+                latest = Math.max(latest, estimateEndMillis(record.startMillis, record.opusOffset, endOffset));
+            }
+        }
+        return latest;
+    }
+
     private List<Utterance> utterances(LogicalChannel channel, long fromMillis, long toMillis) throws IOException {
         var result = new ArrayList<Utterance>();
         Path channelDir = outputDir.resolve(channel.name());
@@ -205,6 +241,24 @@ final class HistoricalRecordings {
             }
         }
         return records;
+    }
+
+    private static UdbRecord readLastDbRecord(Path path) throws IOException {
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
+            long recordCount = channel.size() / 12;
+            if (recordCount <= 0) {
+                return null;
+            }
+            ByteBuffer record = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
+            channel.position((recordCount - 1) * 12);
+            while (record.hasRemaining()) {
+                if (channel.read(record) < 0) {
+                    return null;
+                }
+            }
+            record.flip();
+            return new UdbRecord(record.getLong(), record.getInt());
+        }
     }
 
     private long estimateEndMillis(long startMillis, int startOffset, int endOffset) {

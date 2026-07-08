@@ -3,16 +3,11 @@
   import { SvelteMap } from 'svelte/reactivity';
   import ChannelTile from './components/ChannelTile.svelte';
   import { AudioEngine } from './lib/audio';
-  import type { Channel, OpusPacket, PlaybackMode, ServerMessage, Utterance } from './lib/types';
+  import { DownloadManager } from './lib/downloads';
+  import { HistoryPlaybackTracker } from './lib/historyPlayback';
+  import { RowPlaybackHighlighter, utteranceKey } from './lib/rowPlayback';
+  import type { Channel, OpusPacket, ServerMessage, Utterance } from './lib/types';
   import { connectSocket, send } from './lib/ws';
-
-  type RowPlayback = {
-    active: boolean;
-    startAt: number;
-    endAt: number;
-    startTimer: ReturnType<typeof setTimeout> | null;
-    endTimer: ReturnType<typeof setTimeout> | null;
-  };
 
   const historyPageSize = 20;
   const recentWindowMillis = 180_000;
@@ -34,12 +29,10 @@
   let channelsOpen = false;
 
   const audio = new AudioEngine();
-  const playbackModes = new Map<string, PlaybackMode>();
-  const playbackChannels = new Map<number, string[]>();
-  const playbackStreams = new Map<number, Set<string>>();
-  const serverFinishedPlaybacks = new Set<number>();
+  const downloads = new DownloadManager();
+  const historyPlayback = new HistoryPlaybackTracker();
+  const rowHighlighter = new RowPlaybackHighlighter(rows => playingRows = rows);
   let playingRows = new Set<string>();
-  const playingRowTimers = new Map<string, RowPlayback>();
   let replayingLast = new Set<string>();
   let tickTimer: ReturnType<typeof setInterval>;
 
@@ -59,7 +52,7 @@
     return () => {
       socket?.close();
       clearInterval(tickTimer);
-      clearPlayingRows();
+      rowHighlighter.clear();
     };
   });
 
@@ -88,13 +81,11 @@
         updateRangeInputs(message.utterances);
         break;
       case 'history_started': {
-        const modeKey = `history:${message.playbackId}`;
-        playbackModes.set(modeKey, {
+        historyPlayback.start(message.playbackId, message.channels, {
           realtime: message.realtime,
           originMillis: message.fromMillis,
           originAudioTime: audio.audioTime(0.15)
         });
-        playbackChannels.set(message.playbackId, message.channels);
         status = `Streaming ${message.frames} historical packets...`;
         break;
       }
@@ -105,6 +96,13 @@
         clearHistoryPlaybackState(true);
         status = 'Historical playback stopped';
         break;
+      case 'download_started':
+        downloads.start(message.downloadId, message.filename);
+        status = `Preparing ${message.filename}...`;
+        break;
+      case 'download_finished':
+        finishDownload(message.downloadId);
+        break;
       case 'error':
         replayingLast = new Set();
         status = message.message;
@@ -114,7 +112,10 @@
 
   function handlePacket(packet: OpusPacket) {
     try {
-      trackHistoryPacket(packet);
+      if (downloads.collect(packet)) {
+        return;
+      }
+      historyPlayback.trackPacket(packet);
       audio.enqueue(packet, playbackModeFor(packet.streamKey));
     } catch (error) {
       status = error instanceof Error ? error.message : String(error);
@@ -122,9 +123,7 @@
   }
 
   function playbackModeFor(streamKey: string) {
-    if (!streamKey.startsWith('history:')) return null;
-    const [kind, id] = streamKey.split(':');
-    return playbackModes.get(`${kind}:${id}`) ?? null;
+    return historyPlayback.modeFor(streamKey);
   }
 
   function updateChannel(update: Channel) {
@@ -204,7 +203,7 @@
       return;
     }
     clearHistoryPlaybackState(true);
-    markPlaying(utterance);
+    rowHighlighter.mark(utterance);
     send(socket, {
       type: 'play_utterance',
       channels: [utterance.channel],
@@ -239,20 +238,12 @@
     });
   }
 
-  function playRange() {
-    try {
-      audio.ensure();
-    } catch (error) {
-      status = error instanceof Error ? error.message : String(error);
-      return;
-    }
-    clearHistoryPlaybackState(true);
+  function downloadUtterance(utterance: Utterance) {
     send(socket, {
-      type: 'play_history',
-      channels: selected.size ? [...selected] : channelList.map(channel => channel.name),
-      fromMillis: localMillis(fromValue),
-      toMillis: localMillis(toValue) || Date.now(),
-      realtime: realtimeGaps
+      type: 'download_utterance',
+      channels: [utterance.channel],
+      fromMillis: utterance.startMillis,
+      toMillis: utterance.endMillis
     });
   }
 
@@ -265,126 +256,52 @@
     if (flushAudio) {
       audio.flushPrefix('history:');
     }
-    playbackModes.clear();
-    playbackChannels.clear();
-    playbackStreams.clear();
-    serverFinishedPlaybacks.clear();
+    historyPlayback.clear();
     replayingLast = new Set();
-    clearPlayingRows();
+    rowHighlighter.clear();
   }
 
   function finishPlayback(playbackId: number) {
-    serverFinishedPlaybacks.add(playbackId);
-    completePlaybackIfDrained(playbackId);
+    completePlayback(historyPlayback.serverDone(playbackId));
   }
 
-  function trackHistoryPacket(packet: OpusPacket) {
-    const id = historyPlaybackId(packet.streamKey);
-    if (id === null) return;
-    let streams = playbackStreams.get(id);
-    if (!streams) {
-      streams = new Set();
-      playbackStreams.set(id, streams);
+  async function finishDownload(downloadId: number) {
+    try {
+      const filename = await downloads.finish(downloadId);
+      if (filename) status = `Downloaded ${filename}`;
+    } catch (error) {
+      status = error instanceof Error ? error.message : String(error);
     }
-    streams.add(packet.streamKey);
   }
 
   function handleStreamIdle(streamKey: string) {
-    const id = historyPlaybackId(streamKey);
-    if (id === null) return;
-    const streams = playbackStreams.get(id);
-    if (streams) {
-      streams.delete(streamKey);
-      if (streams.size === 0) {
-        playbackStreams.delete(id);
-      }
-    }
-    completePlaybackIfDrained(id);
+    completePlayback(historyPlayback.streamIdle(streamKey));
   }
 
-  function completePlaybackIfDrained(playbackId: number) {
-    if (!serverFinishedPlaybacks.has(playbackId)) return;
-    const streams = playbackStreams.get(playbackId);
-    if (streams?.size) return;
-
-    const channels = playbackChannels.get(playbackId) ?? [];
+  function completePlayback(completed: { playbackId: number; channels: string[] } | null) {
+    if (!completed) return;
     const next = new Set(replayingLast);
-    for (const channel of channels) next.delete(channel);
+    for (const channel of completed.channels) next.delete(channel);
     replayingLast = next;
-    playbackModes.delete(`history:${playbackId}`);
-    playbackChannels.delete(playbackId);
-    serverFinishedPlaybacks.delete(playbackId);
-    clearPlayingRows();
+    rowHighlighter.clear();
     status = 'Historical playback finished';
   }
 
   function handleFrameScheduled(streamKey: string, targetMillis: number, startTime: number, durationSeconds: number) {
     if (!streamKey.startsWith('history:')) return;
     const utterance = recentHistory.find(item =>
-      item.channel === historyChannelName(streamKey)
+      item.channel === historyPlayback.channelFromStreamKey(streamKey)
         && targetMillis >= item.startMillis
         && targetMillis <= item.endMillis);
     if (!utterance) return;
     const delayMillis = Math.max(0, (startTime - audio.currentTime()) * 1000);
-    markPlaying(utterance, delayMillis, durationSeconds * 1000 + 150);
-  }
-
-  function historyPlaybackId(streamKey: string) {
-    const match = /^history:(\d+):/.exec(streamKey);
-    return match ? Number(match[1]) : null;
-  }
-
-  function historyChannelName(streamKey: string) {
-    return streamKey.replace(/^history:\d+:/, '');
+    rowHighlighter.mark(utterance, delayMillis, durationSeconds * 1000 + 150);
   }
 
   function updateRangeInputs(utterances: Utterance[]) {
     if (!utterances.length) return;
     fromValue = localDateTime(Math.min(...utterances.map(utterance => utterance.startMillis)));
     toValue = localDateTime(Math.max(...utterances.map(utterance => utterance.endMillis)));
-  }
-
-  function markPlaying(utterance: Utterance, delayMillis = 0, durationMillis = utterance.endMillis - utterance.startMillis + 750) {
-    const key = utteranceKey(utterance);
-    const nowMillis = performance.now();
-    const startAt = nowMillis + Math.max(0, delayMillis);
-    const endAt = startAt + Math.max(250, durationMillis);
-    let row = playingRowTimers.get(key);
-
-    if (!row) {
-      row = { active: false, startAt, endAt, startTimer: null, endTimer: null };
-      playingRowTimers.set(key, row);
-    } else {
-      row.endAt = Math.max(row.endAt, endAt);
-      if (!row.active && startAt < row.startAt) {
-        row.startAt = startAt;
-        if (row.startTimer) clearTimeout(row.startTimer);
-        row.startTimer = null;
-      }
-    }
-
-    if (row.active) {
-      scheduleRowEnd(key, row);
-      return;
-    }
-
-    if (!row.startTimer) {
-      row.startTimer = setTimeout(() => {
-        row!.startTimer = null;
-        row!.active = true;
-        playingRows = new Set(playingRows).add(key);
-        scheduleRowEnd(key, row!);
-      }, Math.max(0, row.startAt - performance.now()));
-    }
-  }
-
-  function scheduleRowEnd(key: string, row: RowPlayback) {
-    if (row.endTimer) clearTimeout(row.endTimer);
-    row.endTimer = setTimeout(() => {
-      playingRowTimers.delete(key);
-      playingRows.delete(key);
-      playingRows = new Set(playingRows);
-    }, Math.max(50, row.endAt - performance.now()));
   }
 
   function appendLiveUtterance(utterance: Utterance) {
@@ -400,19 +317,6 @@
       .sort((a, b) => b.startMillis - a.startMillis)
       .slice(0, historyPageSize);
     updateRangeInputs(recentHistory);
-  }
-
-  function clearPlayingRows() {
-    for (const row of playingRowTimers.values()) {
-      if (row.startTimer) clearTimeout(row.startTimer);
-      if (row.endTimer) clearTimeout(row.endTimer);
-    }
-    playingRowTimers.clear();
-    playingRows = new Set();
-  }
-
-  function utteranceKey(utterance: Utterance) {
-    return `${utterance.channel}:${utterance.startMillis}:${utterance.endMillis}`;
   }
 
   function lastActiveText(channel: Channel) {
@@ -499,7 +403,6 @@
       <label>From <input bind:value={fromValue} type="datetime-local" /></label>
       <label>To <input bind:value={toValue} type="datetime-local" /></label>
       <label class="checkbox"><input bind:checked={realtimeGaps} type="checkbox" /> Real-time gaps</label>
-    <button type="button" onclick={playRange}>Play selected</button>
     </div>
 
     <div class="history-list">
@@ -516,6 +419,10 @@
             <button type="button" class="icon-button" aria-label="Play recordings since this time"
               onclick={() => playSince(utterance)}>
               <span class="icon-symbol">⤒</span>
+            </button>
+            <button type="button" class="icon-button" aria-label="Download this recording as WAV"
+              onclick={() => downloadUtterance(utterance)}>
+              <span class="icon-symbol">↓</span>
             </button>
           </div>
         </div>
