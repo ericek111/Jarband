@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -33,10 +34,13 @@ public final class AirbandWebServer implements AutoCloseable {
     private static final Pattern STRING = Pattern.compile("\"((?:[^\"\\\\]|\\\\.)*)\"");
     private static final Pattern FROM = Pattern.compile("\"fromMillis\"\\s*:\\s*(\\d+)");
     private static final Pattern TO = Pattern.compile("\"toMillis\"\\s*:\\s*(\\d+)");
+    private static final Pattern PAGE = Pattern.compile("\"page\"\\s*:\\s*(\\d+)");
+    private static final Pattern PAGE_SIZE = Pattern.compile("\"pageSize\"\\s*:\\s*(\\d+)");
 
     private final Undertow undertow;
     private final LiveAudioHub hub;
     private final HistoricalRecordings history;
+    private final AtomicLong playbackIds = new AtomicLong();
     private final ExecutorService historyExecutor = Executors.newCachedThreadPool(r -> {
         Thread thread = new Thread(r, "jarband-web-history");
         thread.setDaemon(true);
@@ -109,10 +113,7 @@ public final class AirbandWebServer implements AutoCloseable {
             LiveAudioHub.Client client = hub.register(channel);
             channel.getReceiveSetter().set(new Receiver(client));
             channel.addCloseTask(ch -> {
-                LiveAudioHub.HistoryPlayback playback = client.playback();
-                if (playback != null) {
-                    playback.stop();
-                }
+                client.stopPlaybacks();
                 hub.unregister(client);
             });
             channel.resumeReceives();
@@ -160,8 +161,13 @@ public final class AirbandWebServer implements AutoCloseable {
                     }
                     case "history_index" -> sendText(channel,
                             history.indexJson(channels(json), millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE)));
+                    case "recent_history" -> sendText(channel,
+                            history.recentJson(channels(json),
+                                    (int) millis(json, PAGE, 0), (int) millis(json, PAGE_SIZE, 20)));
                     case "play_history" -> playHistory(client, channels(json),
-                            millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE));
+                            millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE), true);
+                    case "play_utterance" -> playHistory(client, channels(json),
+                            millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE), false);
                     case "stop_history" -> {
                         stopPlayback(client);
                         sendText(channel, "{\"type\":\"history_stopped\"}");
@@ -174,19 +180,18 @@ public final class AirbandWebServer implements AutoCloseable {
         }
     }
 
-    private void playHistory(LiveAudioHub.Client client, List<String> channels, long fromMillis, long toMillis) {
-        stopPlayback(client);
-        HistoryTask task = new HistoryTask(client, channels, fromMillis, toMillis);
-        client.playback(task);
+    private void playHistory(LiveAudioHub.Client client, List<String> channels, long fromMillis, long toMillis,
+                             boolean replaceExisting) {
+        if (replaceExisting) {
+            stopPlayback(client);
+        }
+        HistoryTask task = new HistoryTask(client, channels, fromMillis, toMillis, playbackIds.incrementAndGet());
+        client.addPlayback(task);
         historyExecutor.execute(task);
     }
 
     private void stopPlayback(LiveAudioHub.Client client) {
-        LiveAudioHub.HistoryPlayback playback = client.playback();
-        if (playback != null) {
-            playback.stop();
-            client.playback(null);
-        }
+        client.stopPlaybacks();
     }
 
     private final class HistoryTask implements Runnable, LiveAudioHub.HistoryPlayback {
@@ -194,13 +199,16 @@ public final class AirbandWebServer implements AutoCloseable {
         private final List<String> channels;
         private final long fromMillis;
         private final long toMillis;
+        private final long playbackId;
         private volatile boolean stopped;
 
-        HistoryTask(LiveAudioHub.Client client, List<String> channels, long fromMillis, long toMillis) {
+        HistoryTask(LiveAudioHub.Client client, List<String> channels, long fromMillis, long toMillis,
+                    long playbackId) {
             this.client = client;
             this.channels = List.copyOf(channels);
             this.fromMillis = fromMillis;
             this.toMillis = toMillis;
+            this.playbackId = playbackId;
         }
 
         @Override
@@ -208,24 +216,24 @@ public final class AirbandWebServer implements AutoCloseable {
             try {
                 List<EncodedOpusFrame> frames = history.packets(channels, fromMillis, toMillis);
                 sendText(client.channel(), "{\"type\":\"history_started\",\"frames\":" + frames.size()
-                        + ",\"fromMillis\":" + fromMillis + "}");
+                        + ",\"fromMillis\":" + fromMillis + ",\"playbackId\":" + playbackId + "}");
                 for (EncodedOpusFrame frame : frames) {
                     if (stopped || !client.channel().isOpen()) {
                         break;
                     }
-                    WebSockets.sendBinary(LiveAudioHub.packetMessage(frame), client.channel(), null);
+                    WebSockets.sendBinary(LiveAudioHub.packetMessage(
+                            frame.withStreamKey("history:" + playbackId + ":" + frame.channelName())),
+                            client.channel(), null);
                 }
                 if (!stopped && client.channel().isOpen()) {
-                    sendText(client.channel(), "{\"type\":\"history_finished\"}");
+                    sendText(client.channel(), "{\"type\":\"history_finished\",\"playbackId\":" + playbackId + "}");
                 }
             } catch (Exception e) {
                 if (client.channel().isOpen()) {
                     error(client.channel(), e.getMessage());
                 }
             } finally {
-                if (client.playback() == this) {
-                    client.playback(null);
-                }
+                client.removePlayback(this);
             }
         }
 

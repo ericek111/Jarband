@@ -145,23 +145,7 @@ public final class LiveAudioHub implements OpusFrameSink {
     }
 
     public static ByteBuffer packetMessage(EncodedOpusFrame frame) {
-        byte[] name = frame.channelName().getBytes(StandardCharsets.UTF_8);
-        byte[] packet = frame.packet();
-        ByteBuffer buffer = ByteBuffer.allocate(4 + 2 + 2 + 4 + 8 + 4 + 4 + 8 + 2 + name.length + packet.length)
-                .order(ByteOrder.LITTLE_ENDIAN);
-        buffer.putInt(PACKET_MAGIC);
-        buffer.putShort((short) 1);
-        buffer.putShort((short) frame.channelId());
-        buffer.putInt(frame.sampleRateHz());
-        buffer.putLong(frame.unixMillis());
-        buffer.putInt(frame.durationMillis());
-        buffer.putInt(packet.length);
-        buffer.putLong(frame.sequence());
-        buffer.putShort((short) name.length);
-        buffer.put(name);
-        buffer.put(packet);
-        buffer.flip();
-        return buffer;
+        return batchMessage(List.of(frame));
     }
 
     static String escape(String input) {
@@ -189,7 +173,7 @@ public final class LiveAudioHub implements OpusFrameSink {
         private final WebSocketChannel channel;
         private final Set<Integer> subscriptions = new HashSet<>();
         private final ConcurrentHashMap<Integer, Batch> batches = new ConcurrentHashMap<>();
-        private volatile HistoryPlayback playback;
+        private final CopyOnWriteArraySet<HistoryPlayback> playbacks = new CopyOnWriteArraySet<>();
 
         private Client(WebSocketChannel channel) {
             this.channel = channel;
@@ -258,12 +242,19 @@ public final class LiveAudioHub implements OpusFrameSink {
             return channel;
         }
 
-        public HistoryPlayback playback() {
-            return playback;
+        public void addPlayback(HistoryPlayback playback) {
+            playbacks.add(playback);
         }
 
-        public void playback(HistoryPlayback playback) {
-            this.playback = playback;
+        public void removePlayback(HistoryPlayback playback) {
+            playbacks.remove(playback);
+        }
+
+        public void stopPlaybacks() {
+            for (HistoryPlayback playback : playbacks) {
+                playback.stop();
+            }
+            playbacks.clear();
         }
     }
 
@@ -275,7 +266,9 @@ public final class LiveAudioHub implements OpusFrameSink {
         int bytes = 4 + 2 + 2;
         for (EncodedOpusFrame frame : frames) {
             byte[] name = frame.channelName().getBytes(StandardCharsets.UTF_8);
-            bytes += 2 + 2 + 4 + 8 + 4 + 4 + 8 + 2 + name.length + frame.packet().length;
+            byte[] streamKey = frame.streamKey().getBytes(StandardCharsets.UTF_8);
+            bytes += 2 + 2 + 4 + 8 + 4 + 4 + 8 + 2 + name.length + 2 + streamKey.length
+                    + frame.packet().length;
         }
         ByteBuffer buffer = ByteBuffer.allocate(bytes).order(ByteOrder.LITTLE_ENDIAN);
         buffer.putInt(PACKET_MAGIC);
@@ -283,8 +276,9 @@ public final class LiveAudioHub implements OpusFrameSink {
         buffer.putShort((short) frames.size());
         for (EncodedOpusFrame frame : frames) {
             byte[] name = frame.channelName().getBytes(StandardCharsets.UTF_8);
+            byte[] streamKey = frame.streamKey().getBytes(StandardCharsets.UTF_8);
             byte[] packet = frame.packet();
-            buffer.putShort((short) 1);
+            buffer.putShort((short) 2);
             buffer.putShort((short) frame.channelId());
             buffer.putInt(frame.sampleRateHz());
             buffer.putLong(frame.unixMillis());
@@ -293,6 +287,8 @@ public final class LiveAudioHub implements OpusFrameSink {
             buffer.putLong(frame.sequence());
             buffer.putShort((short) name.length);
             buffer.put(name);
+            buffer.putShort((short) streamKey.length);
+            buffer.put(streamKey);
             buffer.put(packet);
         }
         buffer.flip();

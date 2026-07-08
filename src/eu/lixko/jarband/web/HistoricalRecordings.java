@@ -14,7 +14,6 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
-import java.util.PriorityQueue;
 import java.util.stream.Stream;
 
 import eu.lixko.jarband.dsp.channelizer.LogicalChannel;
@@ -54,6 +53,46 @@ final class HistoricalRecordings {
                         .append("\"endMillis\":").append(utterance.endMillis)
                         .append('}');
             }
+        }
+        json.append("]}");
+        return json.toString();
+    }
+
+    String recentJson(List<String> channelNames, int page, int pageSize) throws IOException {
+        int safePage = Math.max(0, page);
+        int safePageSize = Math.clamp(pageSize, 1, 50);
+        var utterances = new ArrayList<Utterance>();
+        if (channelNames.isEmpty()) {
+            for (LogicalChannel channel : hub.channels()) {
+                utterances.addAll(utterances(channel, 0, Long.MAX_VALUE));
+            }
+        } else {
+            for (String name : channelNames) {
+                LogicalChannel channel = hub.channelByName(name);
+                if (channel != null) {
+                    utterances.addAll(utterances(channel, 0, Long.MAX_VALUE));
+                }
+            }
+        }
+        utterances.sort(Comparator.comparingLong(Utterance::startMillis).reversed());
+        int total = Math.min(100, utterances.size());
+        int from = Math.min(total, safePage * safePageSize);
+        int to = Math.min(total, from + safePageSize);
+
+        StringBuilder json = new StringBuilder(4096);
+        json.append("{\"type\":\"recent_history\",\"page\":").append(safePage)
+                .append(",\"pageSize\":").append(safePageSize)
+                .append(",\"total\":").append(total)
+                .append(",\"utterances\":[");
+        for (int i = from; i < to; i++) {
+            if (i > from) json.append(',');
+            Utterance utterance = utterances.get(i);
+            json.append('{')
+                    .append("\"channel\":\"").append(LiveAudioHub.escape(utterance.channel.name())).append("\",")
+                    .append("\"frequencyHz\":").append(Math.round(utterance.channel.frequencyHz())).append(',')
+                    .append("\"startMillis\":").append(utterance.startMillis).append(',')
+                    .append("\"endMillis\":").append(utterance.endMillis)
+                    .append('}');
         }
         json.append("]}");
         return json.toString();

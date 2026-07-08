@@ -42,6 +42,13 @@ h2 {
   font-size: 16px;
 }
 
+summary {
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: 650;
+  margin: 12px 0;
+}
+
 button,
 input {
   border: 1px solid #3a4652;
@@ -81,6 +88,15 @@ button.live {
   background: #171d24;
 }
 
+.channel.active-channel {
+  border-color: #2ea862;
+  background: #173322;
+}
+
+.channel.active-channel strong {
+  color: #79e39f;
+}
+
 .channel strong {
   font-size: 15px;
 }
@@ -94,4 +110,32 @@ button.live {
 #history {
   color: #aab6c2;
   font-size: 13px;
+}
+
+.history-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.utterance {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border-color: #2b3440;
+}
+
+.utterance:hover {
+  border-color: #6fa8dc;
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.pager span {
+  color: #aab6c2;
 }
