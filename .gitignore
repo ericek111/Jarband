@@ -3,3 +3,5 @@
 /bin/
 /target/
 /recordings/
+/src/main/resources/airband/
+/webui/node_modules/
