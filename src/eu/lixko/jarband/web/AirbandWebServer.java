@@ -74,15 +74,11 @@ public final class AirbandWebServer implements AutoCloseable {
             writeResource(exchange, "airband/index.html", "text/html; charset=utf-8");
             return;
         }
-        if (path.equals("/app.js")) {
-            writeResource(exchange, "airband/app.js", "text/javascript; charset=utf-8");
+        if (path.contains("..")) {
+            exchange.setStatusCode(StatusCodes.NOT_FOUND);
             return;
         }
-        if (path.equals("/style.css")) {
-            writeResource(exchange, "airband/style.css", "text/css; charset=utf-8");
-            return;
-        }
-        exchange.setStatusCode(StatusCodes.NOT_FOUND);
+        writeResource(exchange, "airband" + path, contentType(path));
     }
 
     private static void redirect(HttpServerExchange exchange, String location) {
@@ -100,6 +96,15 @@ public final class AirbandWebServer implements AutoCloseable {
             exchange.getResponseHeaders().put(Headers.CONTENT_TYPE, contentType);
             exchange.getResponseSender().send(ByteBuffer.wrap(bytes));
         }
+    }
+
+    private static String contentType(String path) {
+        if (path.endsWith(".js")) return "text/javascript; charset=utf-8";
+        if (path.endsWith(".css")) return "text/css; charset=utf-8";
+        if (path.endsWith(".html")) return "text/html; charset=utf-8";
+        if (path.endsWith(".svg")) return "image/svg+xml";
+        if (path.endsWith(".wasm")) return "application/wasm";
+        return "application/octet-stream";
     }
 
     @Override
@@ -153,7 +158,6 @@ public final class AirbandWebServer implements AutoCloseable {
                     case "subscribe_live" -> {
                         List<String> names = channels(json);
                         client.subscribe(names);
-                        hub.replayRecent(client, names);
                         sendText(channel, "{\"type\":\"subscribed\"}");
                     }
                     case "unsubscribe_live" -> {
@@ -169,6 +173,7 @@ public final class AirbandWebServer implements AutoCloseable {
                             millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE), true, realtime(json));
                     case "play_utterance" -> playHistory(client, channels(json),
                             millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE), false, realtime(json));
+                    case "play_last_utterance" -> playLastUtterance(client, channels(json));
                     case "stop_history" -> {
                         stopPlayback(client);
                         sendText(channel, "{\"type\":\"history_stopped\"}");
@@ -179,6 +184,19 @@ public final class AirbandWebServer implements AutoCloseable {
                 error(channel, e.getMessage());
             }
         }
+    }
+
+    private void playLastUtterance(LiveAudioHub.Client client, List<String> channels) throws IOException {
+        if (channels.isEmpty()) {
+            return;
+        }
+        String name = channels.getFirst();
+        long[] range = history.latestUtteranceMillis(name);
+        if (range == null) {
+            error(client.channel(), "No recording for " + name);
+            return;
+        }
+        playHistory(client, List.of(name), range[0], range[1], false, false);
     }
 
     private void playHistory(LiveAudioHub.Client client, List<String> channels, long fromMillis, long toMillis,

@@ -115,6 +115,17 @@ final class HistoricalRecordings {
         return all;
     }
 
+    long[] latestUtteranceMillis(String channelName) throws IOException {
+        LogicalChannel channel = hub.channelByName(channelName);
+        if (channel == null) {
+            return null;
+        }
+        return utterances(channel, 0, Long.MAX_VALUE).stream()
+                .max(Comparator.comparingLong(Utterance::startMillis))
+                .map(utterance -> new long[] { utterance.startMillis, utterance.endMillis })
+                .orElse(null);
+    }
+
     private List<Utterance> utterances(LogicalChannel channel, long fromMillis, long toMillis) throws IOException {
         var result = new ArrayList<Utterance>();
         Path channelDir = outputDir.resolve(channel.name());
