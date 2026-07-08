@@ -21,19 +21,24 @@ public final class ChannelRecorder implements AutoCloseable {
     private final byte[] packet = new byte[4096];
     private final int opusSampleRate;
     private final int opusFrameMillis;
+    private final OpusFrameSink frameSink;
     private int frameFill;
+    private long frameStartMillis;
+    private long packetSequence;
     private OggOpusFile opusFile;
     private UtteranceDbWriter dbFile;
     private String rotationKey = "";
     private boolean utteranceOpen;
 
     public ChannelRecorder(Path outputDir, LogicalChannel channel, boolean weeklyRotation,
-                           int opusSampleRate, int bitrate, int frameMillis, int complexity) {
+                           int opusSampleRate, int bitrate, int frameMillis, int complexity,
+                           OpusFrameSink frameSink) {
         this.outputDir = outputDir;
         this.channel = channel;
         this.weeklyRotation = weeklyRotation;
         this.opusSampleRate = opusSampleRate;
         this.opusFrameMillis = frameMillis;
+        this.frameSink = frameSink;
         this.encoder = new OpusFloatEncoder(opusSampleRate, bitrate, frameMillis, complexity);
         this.frameBuffer = new float[encoder.frameSamples()];
     }
@@ -53,10 +58,14 @@ public final class ChannelRecorder implements AutoCloseable {
             return;
         }
         for (int i = 0; i < length; i++) {
+            if (frameFill == 0) {
+                frameStartMillis = unixMillis + Math.round(i * 1000.0 / opusSampleRate);
+            }
             frameBuffer[frameFill++] = audio[i];
             if (frameFill == frameBuffer.length) {
                 int bytes = encoder.encode(frameBuffer, packet);
                 opusFile.writeAudioPacket(packet, bytes);
+                publishFrame(bytes);
                 frameFill = 0;
             }
         }
@@ -68,6 +77,17 @@ public final class ChannelRecorder implements AutoCloseable {
         // Keep utterances independent and avoid carrying a partial Opus frame,
         // often containing squelch-edge noise, into the next one.
         frameFill = 0;
+        if (opusFile != null) {
+            opusFile.flushPendingAudio();
+        }
+    }
+
+    private void publishFrame(int bytes) {
+        if (frameSink != null) {
+            frameSink.accept(new EncodedOpusFrame(channel.id(), channel.name(), frameStartMillis,
+                    opusFrameMillis, opusSampleRate, packetSequence++,
+                    java.util.Arrays.copyOf(packet, bytes)));
+        }
     }
 
     private void rotateIfNeeded(long unixMillis) throws IOException {

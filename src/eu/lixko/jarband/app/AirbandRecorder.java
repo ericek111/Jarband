@@ -28,6 +28,8 @@ import eu.lixko.jarband.dsp.vdl2.Vdl2Processor;
 import eu.lixko.jarband.gui.ChannelActivityPanel;
 import eu.lixko.jarband.gui.WaterfallPanel;
 import eu.lixko.jarband.recording.RecorderBank;
+import eu.lixko.jarband.web.AirbandWebServer;
+import eu.lixko.jarband.web.LiveAudioHub;
 import eu.lixko.jsoapy.util.NativeUtils;
 
 public final class AirbandRecorder {
@@ -96,6 +98,15 @@ public final class AirbandRecorder {
         ChannelStatus status = processor.status();
         DebugWindow debug = DebugWindow.open(plan, pfb, status, config.waterfall(),
                 config.channelWaterfall(), config.vdl2Waterfall(), config.vdl2FrequenciesHz());
+        LiveAudioHub liveAudio = new LiveAudioHub(plan);
+        AirbandWebServer web = config.webEnabled()
+                ? new AirbandWebServer(config.webHost(), config.webPort(), config.webRecentChannelLimit(),
+                        config.outputDirectory(), liveAudio, config.opusSampleRateHz(), config.opusFrameMillis())
+                : null;
+        if (web != null) {
+            System.out.printf("Airband web dashboard: http://%s:%d/airband/%n",
+                    config.webHost(), config.webPort());
+        }
         var channelizedQueue = new ArrayBlockingQueue<ChannelizedFrame>(CHANNELIZED_QUEUE_CAPACITY);
         CaptureStats captureStats = new CaptureStats();
         Vdl2Processor vdl2 = config.vdl2Enabled()
@@ -125,11 +136,15 @@ public final class AirbandRecorder {
 
         try (AirbandFrameProcessor frameProcessor = processor;
              DebugWindow debugWindow = debug;
+             AirbandWebServer webServer = web;
              RecorderBank recorders = new RecorderBank(config.outputDirectory(), plan, true,
                      config.opusSampleRateHz(), config.opusBitrateBps(),
-                     config.opusFrameMillis(), config.opusComplexity())) {
+                     config.opusFrameMillis(), config.opusComplexity(), liveAudio)) {
             long lastStatusNanos = System.nanoTime();
             long lastRepaintNanos = 0L;
+            if (webServer != null) {
+                webServer.start();
+            }
             captureThread = Thread.ofPlatform().name("jarband-capture").start(capture);
             if (vdl2Worker != null) {
                 vdl2Thread = Thread.ofPlatform().name("jarband-vdl2").start(vdl2Worker);

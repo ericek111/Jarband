@@ -16,16 +16,24 @@ public final class RecorderBank implements AirbandFrameProcessor.AudioSink, Auto
 
     private final ArrayBlockingQueue<EncoderEvent> queue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
     private final List<ChannelRecorder> recorders;
+    private final OpusFrameSink frameSink;
     private final Thread worker;
     private volatile Throwable failure;
     private volatile boolean closing;
 
     public RecorderBank(Path outputDir, ChannelPlan plan, boolean weeklyRotation,
                         int opusSampleRate, int opusBitrate, int opusFrameMillis, int opusComplexity) {
+        this(outputDir, plan, weeklyRotation, opusSampleRate, opusBitrate, opusFrameMillis, opusComplexity, null);
+    }
+
+    public RecorderBank(Path outputDir, ChannelPlan plan, boolean weeklyRotation,
+                        int opusSampleRate, int opusBitrate, int opusFrameMillis, int opusComplexity,
+                        OpusFrameSink frameSink) {
+        this.frameSink = frameSink;
         var list = new ArrayList<ChannelRecorder>(plan.size());
         for (var channel : plan.channels()) {
             list.add(new ChannelRecorder(outputDir, channel, weeklyRotation,
-                    opusSampleRate, opusBitrate, opusFrameMillis, opusComplexity));
+                    opusSampleRate, opusBitrate, opusFrameMillis, opusComplexity, frameSink));
         }
         this.recorders = List.copyOf(list);
         this.worker = Thread.ofPlatform().name("jarband-opus-writer").start(this::runWorker);
@@ -71,6 +79,9 @@ public final class RecorderBank implements AirbandFrameProcessor.AudioSink, Auto
                     recorders.get(event.channelId).accept(event.unixMillis, event.audio, event.length, true);
                 } else {
                     recorders.get(event.channelId).closeUtterance(event.unixMillis);
+                    if (frameSink != null) {
+                        frameSink.closeUtterance(event.channelId, event.unixMillis);
+                    }
                 }
             }
         } catch (InterruptedException e) {

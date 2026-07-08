@@ -1,0 +1,97 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #111418;
+  color: #e8edf2;
+}
+
+main {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 18px;
+}
+
+header,
+.toolbar,
+.history-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+header {
+  justify-content: space-between;
+}
+
+h1,
+h2 {
+  margin: 12px 0;
+  font-weight: 650;
+}
+
+h1 {
+  font-size: 24px;
+}
+
+h2 {
+  font-size: 16px;
+}
+
+button,
+input {
+  border: 1px solid #3a4652;
+  border-radius: 6px;
+  background: #171d24;
+  color: #e8edf2;
+  padding: 8px 10px;
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button.active {
+  background: #1e6f43;
+  border-color: #2ea862;
+}
+
+button.live {
+  background: #73302f;
+  border-color: #b84a46;
+}
+
+.channel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.channel {
+  display: grid;
+  gap: 6px;
+  padding: 9px;
+  border: 1px solid #2b3440;
+  border-radius: 8px;
+  background: #171d24;
+}
+
+.channel strong {
+  font-size: 15px;
+}
+
+.channel span {
+  color: #9aa7b4;
+  font-size: 12px;
+}
+
+#status,
+#history {
+  color: #aab6c2;
+  font-size: 13px;
+}

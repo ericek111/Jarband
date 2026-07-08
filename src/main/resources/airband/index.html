@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jarband Airband</title>
+  <link rel="stylesheet" href="/airband/style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Jarband Airband</h1>
+      <div id="status">Connecting...</div>
+    </header>
+
+    <section class="toolbar">
+      <input id="filter" type="search" placeholder="Filter channels">
+      <button id="refresh" type="button">Refresh</button>
+      <button id="stop-history" type="button">Stop history</button>
+    </section>
+
+    <section>
+      <h2>Recent Activity</h2>
+      <div id="recent" class="channel-grid"></div>
+    </section>
+
+    <section>
+      <h2>Channels</h2>
+      <div id="channels" class="channel-grid"></div>
+    </section>
+
+    <section>
+      <h2>Historical Playback</h2>
+      <div class="history-controls">
+        <label>From <input id="from" type="datetime-local"></label>
+        <label>To <input id="to" type="datetime-local"></label>
+        <button id="index" type="button">List</button>
+        <button id="play-history" type="button">Play selected</button>
+      </div>
+      <div id="history"></div>
+    </section>
+  </main>
+  <script src="/airband/app.js"></script>
+</body>
+</html>

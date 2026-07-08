@@ -84,6 +84,10 @@ public final class OggOpusFile implements AutoCloseable {
         }
     }
 
+    public synchronized void flushPendingAudio() throws IOException {
+        flushAudio(false);
+    }
+
     private void writeHeaders() throws IOException {
         packetIn(opusHead(), 19, true, false, 0);
         flushOneRequired();
