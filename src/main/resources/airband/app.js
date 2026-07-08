@@ -3,20 +3,23 @@ const channelsEl = document.querySelector("#channels");
 const recentEl = document.querySelector("#recent");
 const filterEl = document.querySelector("#filter");
 const historyEl = document.querySelector("#history");
+const channelsDetails = document.querySelector("details");
 const selected = new Set();
 const live = new Set();
 const decoders = new Map();
 const packetQueues = new Map();
 const playClocks = new Map();
+const channelNodes = new WeakMap();
 let channels = [];
 let recentUtterances = [];
 let historyPage = 0;
 let socket;
 let audioContext;
 let webCodecsSupported = false;
-let channelRefreshTimer;
+let displayRefreshTimer;
 
 const HISTORY_PAGE_SIZE = 20;
+const RECENT_ACTIVITY_WINDOW_MILLIS = 180_000;
 const MAX_DECODE_QUEUE = 48;
 const MAX_PACKET_QUEUE = 500;
 
@@ -28,11 +31,11 @@ function connect() {
     statusEl.textContent = "Connected";
     send({ type: "list_channels" });
     loadRecentHistory(0);
-    channelRefreshTimer = setInterval(() => send({ type: "list_channels" }), 1000);
+    displayRefreshTimer = setInterval(refreshDisplay, 1000);
   });
   socket.addEventListener("close", () => {
     statusEl.textContent = "Disconnected; reconnecting...";
-    clearInterval(channelRefreshTimer);
+    clearInterval(displayRefreshTimer);
     setTimeout(connect, 1500);
   });
   socket.addEventListener("message", event => {
@@ -50,8 +53,12 @@ function send(message) {
 function handleJson(message) {
   if (message.type === "channels") {
     channels = message.channels;
-    render(channelsEl, channels);
+    renderChannelsIfOpen();
     render(recentEl, visibleRecent(message.recent));
+  } else if (message.type === "activity") {
+    updateChannel(message.channel);
+    updateChannelTile(message.channel.id);
+    render(recentEl, visibleRecent(channels));
   } else if (message.type === "history_index") {
     historyEl.textContent = message.utterances.map(u =>
       `${u.channel}: ${zulu(u.startMillis)} -> ${zulu(u.endMillis)}`
@@ -77,29 +84,40 @@ function render(root, list) {
   root.replaceChildren();
   for (const channel of list) {
     if (term && !channel.name.toLowerCase().includes(term)) continue;
-    const card = document.createElement("div");
-    card.className = `channel${channel.active ? " active-channel" : ""}`;
-    const title = document.createElement("strong");
-    title.textContent = channel.name;
-    const meta = document.createElement("span");
-    meta.textContent = lastActiveText(channel);
-    const select = document.createElement("button");
-    select.textContent = selected.has(channel.name) ? "Filtering" : "Filter history";
-    select.className = selected.has(channel.name) ? "active" : "";
-    select.onclick = () => {
-      if (selected.has(channel.name)) selected.delete(channel.name);
-      else selected.add(channel.name);
-      render(channelsEl, channels);
-      render(recentEl, visibleRecent(channels));
-      loadRecentHistory(0);
-    };
-    const listen = document.createElement("button");
-    listen.textContent = live.has(channel.name) ? "Listening" : "Listen";
-    listen.className = live.has(channel.name) ? "live" : "";
-    listen.onclick = () => toggleLive(channel.name);
-    card.append(title, meta, select, listen);
-    root.append(card);
+    root.append(channelTile(channel));
   }
+}
+
+function channelTile(channel) {
+  const card = document.createElement("div");
+  card.className = "channel";
+  const title = document.createElement("strong");
+  const meta = document.createElement("span");
+  const select = document.createElement("button");
+  const listen = document.createElement("button");
+  select.onclick = () => {
+    if (selected.has(channel.name)) selected.delete(channel.name);
+    else selected.add(channel.name);
+    updateAllTileButtons();
+    loadRecentHistory(0);
+  };
+  listen.onclick = () => toggleLive(channel.name);
+  card.append(title, meta, select, listen);
+  channelNodes.set(card, { title, meta, select, listen });
+  updateTile(card, channel);
+  return card;
+}
+
+function updateTile(card, channel) {
+  const nodes = channelNodes.get(card);
+  card.dataset.channelId = String(channel.id);
+  card.className = `channel${channel.active ? " active-channel" : ""}`;
+  nodes.title.textContent = channel.name;
+  nodes.meta.textContent = lastActiveText(channel);
+  nodes.select.textContent = selected.has(channel.name) ? "Filtering" : "Filter history";
+  nodes.select.className = selected.has(channel.name) ? "active" : "";
+  nodes.listen.textContent = live.has(channel.name) ? "Listening" : "Listen";
+  nodes.listen.className = live.has(channel.name) ? "live" : "";
 }
 
 function toggleLive(name) {
@@ -111,7 +129,7 @@ function toggleLive(name) {
     live.add(name);
     send({ type: "subscribe_live", channels: [name] });
   }
-  render(channelsEl, channels);
+  updateChannelTileByName(name);
 }
 
 function handlePacket(buffer) {
@@ -270,8 +288,50 @@ function loadRecentHistory(page) {
 function visibleRecent(list) {
   return list
     .filter(channel => channel.lastActivityMillis > 0)
-    .filter(channel => selected.size === 0 || selected.has(channel.name))
-    .sort((a, b) => b.lastActivityMillis - a.lastActivityMillis);
+    .filter(channel => channel.active || Date.now() - channel.lastActivityMillis <= RECENT_ACTIVITY_WINDOW_MILLIS)
+    .sort((a, b) => a.frequencyHz - b.frequencyHz);
+}
+
+function updateChannel(update) {
+  const index = channels.findIndex(channel => channel.id === update.id);
+  if (index >= 0) {
+    channels[index] = { ...channels[index], ...update };
+  } else {
+    channels.push(update);
+    channels.sort((a, b) => a.frequencyHz - b.frequencyHz);
+  }
+}
+
+function renderChannelsIfOpen() {
+  if (channelsDetails.open) {
+    render(channelsEl, channels);
+  } else {
+    channelsEl.replaceChildren();
+  }
+}
+
+function updateChannelTile(channelId) {
+  const channel = channels.find(channel => channel.id === channelId);
+  if (!channel) return;
+  for (const root of [channelsEl, recentEl]) {
+    for (const card of root.querySelectorAll(`[data-channel-id="${channelId}"]`)) {
+      updateTile(card, channel);
+    }
+  }
+}
+
+function updateChannelTileByName(name) {
+  const channel = channels.find(channel => channel.name === name);
+  if (channel) updateChannelTile(channel.id);
+}
+
+function updateAllTileButtons() {
+  for (const root of [channelsEl, recentEl]) {
+    for (const card of root.querySelectorAll(".channel")) {
+      const channel = channels.find(item => String(item.id) === card.dataset.channelId);
+      if (channel) updateTile(card, channel);
+    }
+  }
 }
 
 function lastActiveText(channel) {
@@ -336,7 +396,21 @@ function playUtterance(utterance) {
   });
 }
 
-filterEl.addEventListener("input", () => render(channelsEl, channels));
+function refreshDisplay() {
+  for (const card of recentEl.querySelectorAll(".channel")) {
+    const channel = channels.find(item => String(item.id) === card.dataset.channelId);
+    if (channel) updateTile(card, channel);
+  }
+  const visibleIds = new Set(visibleRecent(channels).map(channel => String(channel.id)));
+  for (const card of recentEl.querySelectorAll(".channel")) {
+    if (!visibleIds.has(card.dataset.channelId)) {
+      card.remove();
+    }
+  }
+}
+
+filterEl.addEventListener("input", renderChannelsIfOpen);
+channelsDetails.addEventListener("toggle", renderChannelsIfOpen);
 document.querySelector("#refresh").onclick = () => {
   send({ type: "list_channels" });
   loadRecentHistory(historyPage);

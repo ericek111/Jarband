@@ -96,9 +96,18 @@ public final class LiveAudioHub implements OpusFrameSink {
                 .append('}');
     }
 
+    private String activityJson(LogicalChannel channel) {
+        StringBuilder json = new StringBuilder(160);
+        json.append("{\"type\":\"activity\",\"channel\":");
+        appendChannel(json, channel);
+        json.append('}');
+        return json.toString();
+    }
+
     @Override
     public void accept(EncodedOpusFrame frame) {
         ChannelActivity item = activity[frame.channelId()];
+        boolean wasActive = item.active;
         item.lastActivityMillis = frame.unixMillis();
         item.active = true;
         synchronized (item.recentPackets) {
@@ -113,6 +122,9 @@ public final class LiveAudioHub implements OpusFrameSink {
                 client.enqueueLive(frame);
             }
         }
+        if (!wasActive) {
+            broadcastActivity(channels.get(frame.channelId()));
+        }
     }
 
     public void closeUtterance(int channelId, long unixMillis) {
@@ -120,6 +132,16 @@ public final class LiveAudioHub implements OpusFrameSink {
         activity[channelId].lastActivityMillis = Math.max(activity[channelId].lastActivityMillis, unixMillis);
         for (Client client : clients) {
             client.flushLiveBatch(channelId);
+        }
+        broadcastActivity(channels.get(channelId));
+    }
+
+    private void broadcastActivity(LogicalChannel channel) {
+        String message = activityJson(channel);
+        for (Client client : clients) {
+            if (client.channel.isOpen()) {
+                WebSockets.sendText(message, client.channel, null);
+            }
         }
     }
 
