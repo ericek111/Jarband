@@ -171,10 +171,9 @@ public final class AirbandRecorder {
                 if (now - lastStatusNanos > 1_000_000_000L) {
                     lastStatusNanos = now;
                     channelizer.throwIfFailed();
-                    System.out.println(captureStats.statusAndReset());
-                    System.out.printf("Squelch open: %,d / %,d channels, above threshold: %,d, max margin: %.1f dB%n",
-                            countOpen(status), plan.size(), countAboveMargin(status, config.squelchOpenDb()),
-                            maxMargin(status));
+                    System.out.printf("%s; squelch open %,d / %,d channels, above threshold %,d, max margin %.1f dB%n",
+                            captureStats.statusAndReset(), countOpen(status), plan.size(),
+                            countAboveMargin(status, config.squelchOpenDb()), maxMargin(status));
                     if (vdl2Worker != null) {
                         vdl2Worker.throwIfFailed();
                         System.out.println(vdl2Worker.statusAndReset());
@@ -758,7 +757,7 @@ public final class AirbandRecorder {
             double rms = samples == 0 ? 0.0 : Math.sqrt(sumSquares / samples);
             double clippedPercent = samples == 0 ? 0.0 : nearFullScale * 100.0 / samples;
             String status = String.format(java.util.Locale.ROOT,
-                    "RF input sampled-rms %.4f peak %.4f sampled-near-full-scale %.3f%%",
+                    "RF input sampled-rms %.4f peak %.4f full-scale %.3f%%",
                     rms, peak, clippedPercent);
             samples = 0;
             nearFullScale = 0;

@@ -11,6 +11,7 @@ import eu.lixko.jarband.capture.NativeSampleBlock;
 
 public final class Vdl2Processor implements AutoCloseable {
     private static final double VDL2_CHANNEL_GUARD_HZ = 15_000.0;
+    private static final boolean LOG_PER_CHANNEL_STATS = false;
 
     public interface IqSink {
         void accept(MemorySegment samples, int sampleCount);
@@ -58,22 +59,24 @@ public final class Vdl2Processor implements AutoCloseable {
                 counters.connected() ? "connected" : "offline"));
         for (Vdl2ChannelProcessor channel : channels) {
             Vdl2Demodulator.Stats stats = channel.statusAndReset();
-            if (stats.syncs() == 0 && stats.symbols() == 0
-                    && !Float.isFinite(stats.bestSyncError())) {
-                continue;
+            if (LOG_PER_CHANNEL_STATS) {
+                if (stats.syncs() == 0 && stats.symbols() == 0
+                        && !Float.isFinite(stats.bestSyncError())) {
+                    continue;
+                }
+                status.append(String.format(Locale.ROOT,
+                        "%n  %.3f: sync %,d, sym %,d, SNR %.1f dB, searchSNR %.1f dB, ppm %.1f, "
+                                + "syncErr last %.2f best %.2f, hdr %s",
+                        channel.frequencyHz() / 1_000_000.0,
+                        stats.syncs(),
+                        stats.symbols(),
+                        stats.snrDb(),
+                        stats.searchSnrDb(),
+                        stats.ppmError(),
+                        stats.lastSyncError(),
+                        stats.bestSyncError(),
+                        stats.headerSymbols().isEmpty() ? "-" : stats.headerSymbols()));
             }
-            status.append(String.format(Locale.ROOT,
-                    "%n  %.3f: sync %,d, sym %,d, SNR %.1f dB, searchSNR %.1f dB, ppm %.1f, "
-                            + "syncErr last %.2f best %.2f, hdr %s",
-                    channel.frequencyHz() / 1_000_000.0,
-                    stats.syncs(),
-                    stats.symbols(),
-                    stats.snrDb(),
-                    stats.searchSnrDb(),
-                    stats.ppmError(),
-                    stats.lastSyncError(),
-                    stats.bestSyncError(),
-                    stats.headerSymbols().isEmpty() ? "-" : stats.headerSymbols()));
         }
         return status.toString();
     }
