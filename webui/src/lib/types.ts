@@ -19,7 +19,15 @@ export type ServerMessage =
   | { type: 'channels'; channels: Channel[]; recent: Channel[] }
   | { type: 'activity'; channel: Channel }
   | { type: 'utterance_closed'; utterance: Utterance }
-  | { type: 'recent_history'; page: number; pageSize: number; total: number; utterances: Utterance[] }
+  | {
+      type: 'recent_history';
+      beforeMillis: number;
+      limit: number;
+      newestMillis: number;
+      oldestMillis: number;
+      hasOlder: boolean;
+      utterances: Utterance[];
+    }
   | { type: 'history_started'; frames: number; fromMillis: number; toMillis: number; playbackId: number; realtime: boolean; channels: string[] }
   | { type: 'history_finished'; playbackId: number }
   | { type: 'history_stopped' }

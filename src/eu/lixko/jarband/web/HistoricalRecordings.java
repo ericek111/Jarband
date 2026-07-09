@@ -61,34 +61,39 @@ final class HistoricalRecordings {
         return json.toString();
     }
 
-    String recentJson(List<String> channelNames, int page, int pageSize) throws IOException {
-        int safePage = Math.max(0, page);
-        int safePageSize = Math.clamp(pageSize, 1, 50);
+    String recentJson(List<String> channelNames, long beforeMillis, int limit) throws IOException {
+        int safeLimit = Math.clamp(limit, 1, 100);
+        long safeBeforeMillis = beforeMillis <= 0 ? Long.MAX_VALUE : beforeMillis;
         var utterances = new ArrayList<Utterance>();
         if (channelNames.isEmpty()) {
             for (LogicalChannel channel : hub.channels()) {
-                utterances.addAll(utterances(channel, 0, Long.MAX_VALUE));
+                utterances.addAll(utterances(channel, 0, safeBeforeMillis - 1));
             }
         } else {
             for (String name : channelNames) {
                 LogicalChannel channel = hub.channelByName(name);
                 if (channel != null) {
-                    utterances.addAll(utterances(channel, 0, Long.MAX_VALUE));
+                    utterances.addAll(utterances(channel, 0, safeBeforeMillis - 1));
                 }
             }
         }
+        utterances.removeIf(utterance -> utterance.startMillis >= safeBeforeMillis);
         utterances.sort(Comparator.comparingLong(Utterance::startMillis).reversed());
-        int total = Math.min(100, utterances.size());
-        int from = Math.min(total, safePage * safePageSize);
-        int to = Math.min(total, from + safePageSize);
+        boolean hasOlder = utterances.size() > safeLimit;
+        int to = Math.min(utterances.size(), safeLimit);
+        long newestMillis = to > 0 ? utterances.getFirst().startMillis : 0;
+        long oldestMillis = to > 0 ? utterances.get(to - 1).startMillis : 0;
 
         StringBuilder json = new StringBuilder(4096);
-        json.append("{\"type\":\"recent_history\",\"page\":").append(safePage)
-                .append(",\"pageSize\":").append(safePageSize)
-                .append(",\"total\":").append(total)
+        json.append("{\"type\":\"recent_history\",\"beforeMillis\":")
+                .append(beforeMillis == Long.MAX_VALUE ? 0 : beforeMillis)
+                .append(",\"limit\":").append(safeLimit)
+                .append(",\"newestMillis\":").append(newestMillis)
+                .append(",\"oldestMillis\":").append(oldestMillis)
+                .append(",\"hasOlder\":").append(hasOlder)
                 .append(",\"utterances\":[");
-        for (int i = from; i < to; i++) {
-            if (i > from) json.append(',');
+        for (int i = 0; i < to; i++) {
+            if (i > 0) json.append(',');
             Utterance utterance = utterances.get(i);
             json.append('{')
                     .append("\"channel\":\"").append(LiveAudioHub.escape(utterance.channel.name())).append("\",")
@@ -160,7 +165,8 @@ final class HistoricalRecordings {
                 if (!Files.isRegularFile(opus)) {
                     continue;
                 }
-                latest = Math.max(latest, endMillis(record));
+                latest = Math.max(latest, endMillis(record, null,
+                        (int) Math.min(Integer.MAX_VALUE, Files.size(opus))));
             }
         }
         return latest;
@@ -183,10 +189,11 @@ final class HistoricalRecordings {
                 long opusSize = Files.size(opus);
                 for (int i = 0; i < records.size(); i++) {
                     UdbRecord current = records.get(i);
+                    UdbRecord next = i + 1 < records.size() ? records.get(i + 1) : null;
                     int endOffset = i + 1 < records.size()
-                            ? records.get(i + 1).opusOffset
+                            ? next.opusOffset
                             : (int) Math.min(Integer.MAX_VALUE, opusSize);
-                    long endMillis = endMillis(current);
+                    long endMillis = endMillis(current, next, endOffset);
                     if (endMillis >= fromMillis && current.startMillis <= toMillis) {
                         result.add(new Utterance(channel, opus, current.startMillis, endMillis,
                                 current.opusOffset, endOffset, current.durationUnits, current.averageSnrQ8_8));
@@ -245,8 +252,11 @@ final class HistoricalRecordings {
             if (read == 0) break;
             if (read < UtteranceDbWriter.RECORD_BYTES) break;
             record.flip();
-            records.add(new UdbRecord(record.getLong(), record.getInt(),
-                    record.getShort() & 0xffff, record.getShort()));
+            long startMillis = record.getLong();
+            int opusOffset = record.getInt();
+            int durationUnits = record.getShort() & 0xffff;
+            short averageSnrQ8_8 = record.getShort();
+            records.add(new UdbRecord(startMillis, opusOffset, durationUnits, averageSnrQ8_8));
         }
         return records;
     }
@@ -271,17 +281,26 @@ final class HistoricalRecordings {
         }
     }
 
-    private long endMillis(UdbRecord record) {
-        if (record.durationUnits == UtteranceDbWriter.DURATION_INDEFINITE) {
-            return Long.MAX_VALUE;
+    private long endMillis(UdbRecord record, UdbRecord next, int endOffset) {
+        if (record.durationUnits != UtteranceDbWriter.DURATION_INDEFINITE) {
+            return record.startMillis + record.durationUnits * (long) UtteranceDbWriter.DURATION_UNIT_MILLIS;
         }
-        return record.startMillis + record.durationUnits * (long) UtteranceDbWriter.DURATION_UNIT_MILLIS;
+        if (next != null) {
+            return next.startMillis;
+        }
+        return estimateEndMillis(record.startMillis, record.opusOffset, endOffset);
     }
 
     private static long durationMillis(Utterance utterance) {
         return utterance.durationUnits == UtteranceDbWriter.DURATION_INDEFINITE
                 ? -1
                 : utterance.durationUnits * (long) UtteranceDbWriter.DURATION_UNIT_MILLIS;
+    }
+
+    private long estimateEndMillis(long startMillis, int startOffset, int endOffset) {
+        int bytes = Math.max(0, endOffset - startOffset);
+        int estimatedPackets = Math.max(1, bytes / 80);
+        return startMillis + (long) estimatedPackets * opusFrameMillis;
     }
 
     private static float snrDb(short q8_8) {

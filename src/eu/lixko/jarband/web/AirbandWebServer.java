@@ -34,8 +34,10 @@ public final class AirbandWebServer implements AutoCloseable {
     private static final Pattern STRING = Pattern.compile("\"((?:[^\"\\\\]|\\\\.)*)\"");
     private static final Pattern FROM = Pattern.compile("\"fromMillis\"\\s*:\\s*(\\d+)");
     private static final Pattern TO = Pattern.compile("\"toMillis\"\\s*:\\s*(\\d+)");
+    private static final Pattern BEFORE = Pattern.compile("\"beforeMillis\"\\s*:\\s*(\\d+)");
     private static final Pattern PAGE = Pattern.compile("\"page\"\\s*:\\s*(\\d+)");
     private static final Pattern PAGE_SIZE = Pattern.compile("\"pageSize\"\\s*:\\s*(\\d+)");
+    private static final Pattern LIMIT = Pattern.compile("\"limit\"\\s*:\\s*(\\d+)");
     private static final Pattern REALTIME = Pattern.compile("\"realtime\"\\s*:\\s*true");
 
     private final Undertow undertow;
@@ -176,7 +178,8 @@ public final class AirbandWebServer implements AutoCloseable {
                             history.indexJson(channels(json), millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE)));
                     case "recent_history" -> sendText(channel,
                             history.recentJson(channels(json),
-                                    (int) millis(json, PAGE, 0), (int) millis(json, PAGE_SIZE, 20)));
+                                    millis(json, BEFORE, Long.MAX_VALUE),
+                                    (int) millis(json, LIMIT, millis(json, PAGE_SIZE, 20))));
                     case "play_history" -> playHistory(client, channels(json),
                             millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE), true, realtime(json));
                     case "play_utterance" -> playHistory(client, channels(json),

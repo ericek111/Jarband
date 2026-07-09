@@ -20,8 +20,9 @@
   let live = new Set<string>();
   let filter = '';
   let recentHistory: Utterance[] = [];
-  let historyPage = 0;
-  let historyTotal = 0;
+  let historyBeforeMillis = Number.POSITIVE_INFINITY;
+  let historyBackStack: number[] = [];
+  let historyHasOlder = false;
   let realtimeGaps = false;
   let fromValue = '';
   let toValue = '';
@@ -42,7 +43,6 @@
     .filter(channel => channel.lastActivityMillis > 0)
     .filter(channel => channel.active || now - channel.lastActivityMillis <= recentWindowMillis)
     .sort((a, b) => a.frequencyHz - b.frequencyHz);
-  $: historyPages = Math.max(1, Math.ceil(historyTotal / historyPageSize));
 
   onMount(() => {
     audio.onScheduled(handleFrameScheduled);
@@ -66,7 +66,7 @@
           channelsById.set(channel.id, channel);
         }
         channelVersion += 1;
-        loadRecentHistory(0);
+        resetHistoryWindow();
         break;
       case 'activity':
         updateChannel(message.channel);
@@ -75,8 +75,8 @@
         appendLiveUtterance(message.utterance);
         break;
       case 'recent_history':
-        historyPage = message.page;
-        historyTotal = message.total;
+        historyBeforeMillis = message.beforeMillis > 0 ? message.beforeMillis : Number.POSITIVE_INFINITY;
+        historyHasOlder = message.hasOlder;
         recentHistory = message.utterances;
         updateRangeInputs(message.utterances);
         break;
@@ -137,21 +137,21 @@
 
   function showChannelHistory(name: string) {
     selected = new Set([name]);
-    loadRecentHistory(0);
+    resetHistoryWindow();
   }
 
   function addChannelHistoryFilter(name: string) {
     const next = new Set(selected);
     next.add(name);
     selected = next;
-    loadRecentHistory(0);
+    resetHistoryWindow();
   }
 
   function removeSelected(name: string) {
     const next = new Set(selected);
     next.delete(name);
     selected = next;
-    loadRecentHistory(0);
+    resetHistoryWindow();
   }
 
   function toggleLive(name: string) {
@@ -191,8 +191,36 @@
     send(socket, { type: 'play_last_utterance', channels: [name] });
   }
 
-  function loadRecentHistory(page: number) {
-    send(socket, { type: 'recent_history', page, pageSize: historyPageSize, channels: [...selected] });
+  function resetHistoryWindow() {
+    historyBackStack = [];
+    loadRecentHistory(Number.POSITIVE_INFINITY);
+  }
+
+  function loadRecentHistory(beforeMillis = historyBeforeMillis) {
+    const message: Record<string, unknown> = {
+      type: 'recent_history',
+      limit: historyPageSize,
+      channels: [...selected]
+    };
+    if (Number.isFinite(beforeMillis)) {
+      message.beforeMillis = beforeMillis;
+    }
+    send(socket, message);
+  }
+
+  function loadOlderHistory() {
+    if (!recentHistory.length) return;
+    const oldest = Math.min(...recentHistory.map(utterance => utterance.startMillis).filter(Number.isFinite));
+    if (!Number.isFinite(oldest)) return;
+    historyBackStack = [...historyBackStack, historyBeforeMillis];
+    loadRecentHistory(oldest);
+  }
+
+  function loadNewerHistory() {
+    const previous = historyBackStack.at(-1);
+    if (previous === undefined) return;
+    historyBackStack = historyBackStack.slice(0, -1);
+    loadRecentHistory(previous);
   }
 
   function playUtterance(utterance: Utterance) {
@@ -310,14 +338,14 @@
     if (selected.size > 0 && !selected.has(utterance.channel)) {
       return;
     }
-    historyTotal = Math.min(100, historyTotal + 1);
-    if (historyPage !== 0) {
+    if (Number.isFinite(historyBeforeMillis)) {
       return;
     }
     const key = utteranceKey(utterance);
     recentHistory = [utterance, ...recentHistory.filter(item => utteranceKey(item) !== key)]
       .sort((a, b) => b.startMillis - a.startMillis)
       .slice(0, historyPageSize);
+    historyHasOlder = historyHasOlder || recentHistory.length === historyPageSize;
     updateRangeInputs(recentHistory);
   }
 
@@ -366,6 +394,20 @@
 
   function snr(utterance: Utterance) {
     return Number.isFinite(utterance.averageSnrDb) ? `${utterance.averageSnrDb!.toFixed(1)} dB` : '-';
+  }
+
+  function historyRangeLabel() {
+    if (!recentHistory.length) return 'No recordings';
+    const starts = recentHistory.map(utterance => utterance.startMillis).filter(Number.isFinite);
+    if (!starts.length) return 'No valid timestamps';
+    const newest = Math.max(...starts);
+    const oldest = Math.min(...starts);
+    const newestDate = utcDate(newest);
+    const oldestDate = utcDate(oldest);
+    if (newestDate === oldestDate) {
+      return `${oldestDate} ${utcTime(oldest)} - ${utcTime(newest)}`;
+    }
+    return `${oldestDate} ${utcTime(oldest)} - ${newestDate} ${utcTime(newest)}`;
   }
 </script>
 
@@ -456,10 +498,9 @@
     </div>
 
     <div class="pager">
-      <button type="button" disabled={historyPage <= 0} onclick={() => loadRecentHistory(historyPage - 1)}>Prev</button>
-      <span>Page {historyPage + 1} of {historyPages}</span>
-      <button type="button" disabled={(historyPage + 1) * historyPageSize >= historyTotal}
-        onclick={() => loadRecentHistory(historyPage + 1)}>Next</button>
+      <button type="button" disabled={historyBackStack.length === 0} onclick={loadNewerHistory}>Newer</button>
+      <span>{historyRangeLabel()}</span>
+      <button type="button" disabled={!historyHasOlder} onclick={loadOlderHistory}>Older</button>
     </div>
   </section>
 </main>
