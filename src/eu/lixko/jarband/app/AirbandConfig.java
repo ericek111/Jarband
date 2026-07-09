@@ -20,7 +20,7 @@ public record AirbandConfig(
         double centerFrequencyHz,
         Map<String, Double> gains,
         List<Double> merge25kHzFrequencies,
-        List<Double> skipFrequencies,
+        List<String> skipChannels,
         Path outputDirectory,
         int opusSampleRateHz,
         int opusBitrateBps,
@@ -100,7 +100,7 @@ public record AirbandConfig(
                 number(toml, "sdr.center_frequency_hz", DEFAULTS.centerFrequencyHz),
                 gains(toml.getTable("gains"), DEFAULTS.gains),
                 frequencies(toml.getArray("channels.merge_25khz")),
-                frequencies(toml.getArray("channels.skip")),
+                strings(toml.getArray("channels.skip")),
                 Path.of(string(toml, "recording.output_directory", DEFAULTS.outputDirectory.toString())),
                 opusSampleRateHz,
                 (int) number(toml, "opus.bitrate_bps", DEFAULTS.opusBitrateBps),
@@ -181,6 +181,21 @@ public record AirbandConfig(
             frequencies.add(Math.toIntExact(Math.round(value)));
         }
         return List.copyOf(frequencies);
+    }
+
+    private static List<String> strings(TomlArray array) {
+        if (array == null) {
+            return List.of();
+        }
+        var values = new ArrayList<String>(array.size());
+        for (int i = 0; i < array.size(); i++) {
+            Object value = array.get(i);
+            if (!(value instanceof String string)) {
+                throw new IllegalArgumentException("String array entries must be strings");
+            }
+            values.add(string);
+        }
+        return List.copyOf(values);
     }
 
     private static Double tableNumber(TomlTable table, String key) {

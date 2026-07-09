@@ -3,6 +3,7 @@ package eu.lixko.jarband.dsp.channelizer;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 public record ChannelPlan(PfbConfig pfb, List<LogicalChannel> channels) {
     private static final double AIRBAND_LOW_HZ = 118_000_000.0;
@@ -14,7 +15,7 @@ public record ChannelPlan(PfbConfig pfb, List<LogicalChannel> channels) {
     }
 
     public static ChannelPlan visibleAirband(PfbConfig pfb, List<Double> merge25kHzFrequencies,
-                                             List<Double> skipFrequencies) {
+                                             List<String> skipChannels) {
         double receiverLowHz = pfb.centerFrequency() - pfb.sampleRate() / 2.0;
         double receiverHighHz = pfb.centerFrequency() + pfb.sampleRate() / 2.0;
         double firstChannelHz = alignUp(Math.max(AIRBAND_LOW_HZ, receiverLowHz), AIRBAND_RASTER_HZ);
@@ -24,19 +25,16 @@ public record ChannelPlan(PfbConfig pfb, List<LogicalChannel> channels) {
             throw new IllegalStateException("SDR passband does not overlap the configured airband range");
         }
 
-        return airband(pfb, firstChannelHz, lastChannelHz, merge25kHzFrequencies, skipFrequencies);
+        return airband(pfb, firstChannelHz, lastChannelHz, merge25kHzFrequencies, skipChannels);
     }
 
     private static ChannelPlan airband(PfbConfig pfb, double firstChannelHz, double lastChannelHz,
-                                       List<Double> merge25kHzFrequencies, List<Double> skipFrequencies) {
+                                       List<Double> merge25kHzFrequencies, List<String> skipChannels) {
         var mergeBins = new HashSet<Integer>();
         for (double f : merge25kHzFrequencies) {
             mergeBins.add(binForFrequency(pfb, f));
         }
-        var skipBins = new HashSet<Integer>();
-        for (double f : skipFrequencies) {
-            skipBins.add(binForFrequency(pfb, f));
-        }
+        Set<String> skipNames = Set.copyOf(skipChannels);
 
         var channels = new ArrayList<LogicalChannel>();
         int id = 0;
@@ -45,13 +43,14 @@ public record ChannelPlan(PfbConfig pfb, List<LogicalChannel> channels) {
             if (bin < 0 || bin >= pfb.branches()) {
                 continue;
             }
-            if (skipBins.contains(bin)) {
-                continue;
-            }
             int[] bins = mergeBins.contains(bin)
                     ? new int[] { wrapBin(bin - 1, pfb.branches()), bin, wrapBin(bin + 1, pfb.branches()) }
                     : new int[] { bin };
-            channels.add(new LogicalChannel(id++, f, bins, channelName(f, bins.length == 3)));
+            String name = channelName(f, bins.length == 3);
+            if (skipNames.contains(name)) {
+                continue;
+            }
+            channels.add(new LogicalChannel(id++, f, bins, name));
         }
         return new ChannelPlan(pfb, List.copyOf(channels));
     }

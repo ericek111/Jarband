@@ -55,7 +55,7 @@ public final class AirbandRecorder {
         ChannelPlan plan = ChannelPlan.visibleAirband(
                 pfb,
                 config.merge25kHzFrequencies(),
-                config.skipFrequencies());
+                config.skipChannels());
 
         System.out.printf("Jarband airband recorder: %,d logical channels, %.3f Hz PFB spacing%n",
                 plan.size(), pfb.branchSpacingHz());
