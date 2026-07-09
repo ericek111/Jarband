@@ -11,6 +11,8 @@ export type Utterance = {
   frequencyHz: number;
   startMillis: number;
   endMillis: number;
+  durationMillis?: number;
+  averageSnrDb?: number;
 };
 
 export type ServerMessage =

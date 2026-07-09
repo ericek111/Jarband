@@ -300,8 +300,10 @@
 
   function updateRangeInputs(utterances: Utterance[]) {
     if (!utterances.length) return;
-    fromValue = localDateTime(Math.min(...utterances.map(utterance => utterance.startMillis)));
-    toValue = localDateTime(Math.max(...utterances.map(utterance => utterance.endMillis)));
+    const starts = utterances.map(utterance => utterance.startMillis).filter(Number.isFinite);
+    const ends = utterances.map(utterance => utterance.endMillis).filter(Number.isFinite);
+    if (starts.length) fromValue = localDateTime(Math.min(...starts));
+    if (ends.length) toValue = localDateTime(Math.max(...ends));
   }
 
   function appendLiveUtterance(utterance: Utterance) {
@@ -329,11 +331,24 @@
     return `active ${Math.round(minutes / 60)}h ago`;
   }
 
-  function zulu(millis: number) {
-    return new Date(millis).toISOString().replace('.000Z', 'Z');
+  function utcTime(millis: number) {
+    if (!Number.isFinite(millis)) return '';
+    const iso = new Date(millis).toISOString();
+    return `${iso.slice(11, 19)}.${iso.charAt(20)}Z`;
+  }
+
+  function utcDate(millis: number) {
+    if (!Number.isFinite(millis)) return '';
+    return new Date(millis).toISOString().slice(0, 10);
+  }
+
+  function showDateSeparator(index: number) {
+    if (index <= 0) return true;
+    return utcDate(recentHistory[index].startMillis) !== utcDate(recentHistory[index - 1].startMillis);
   }
 
   function localDateTime(millis: number) {
+    if (!Number.isFinite(millis)) return '';
     const date = new Date(millis);
     return new Date(millis - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
   }
@@ -343,7 +358,14 @@
   }
 
   function duration(utterance: Utterance) {
-    return Math.max(0, (utterance.endMillis - utterance.startMillis) / 1000).toFixed(1);
+    const millis = utterance.durationMillis && utterance.durationMillis > 0
+      ? utterance.durationMillis
+      : utterance.endMillis - utterance.startMillis;
+    return Number.isFinite(millis) ? Math.max(0, millis / 1000).toFixed(1) : '?';
+  }
+
+  function snr(utterance: Utterance) {
+    return Number.isFinite(utterance.averageSnrDb) ? `${utterance.averageSnrDb!.toFixed(1)} dB` : '-';
   }
 </script>
 
@@ -406,11 +428,15 @@
     </div>
 
     <div class="history-list">
-      {#each recentHistory as utterance (utteranceKey(utterance))}
+      {#each recentHistory as utterance, index (utteranceKey(utterance))}
+        {#if showDateSeparator(index)}
+          <div class="history-date">{utcDate(utterance.startMillis)}</div>
+        {/if}
         <div class:playing-row={playingRows.has(utteranceKey(utterance))} class="utterance">
           <strong>{utterance.channel}</strong>
-          <span>{zulu(utterance.startMillis)}</span>
+          <span>{utcTime(utterance.startMillis)}</span>
           <span>{duration(utterance)}s</span>
+          <span>{snr(utterance)}</span>
           <div class="utterance-actions">
             <button type="button" class="icon-button" aria-label="Play or stop this recording"
               onclick={() => toggleUtterancePlayback(utterance)}>

@@ -214,9 +214,27 @@ button.live {
   margin-top: 12px;
 }
 
+.history-date {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0 2px;
+  color: #8fa1b3;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.history-date::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: #27313d;
+}
+
 .utterance {
   display: grid;
-  grid-template-columns: 92px minmax(190px, 1fr) 72px auto;
+  grid-template-columns: 92px 96px 62px 76px auto;
   gap: 12px;
   align-items: center;
   width: 100%;
