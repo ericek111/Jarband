@@ -151,6 +151,18 @@ button.live {
   min-width: 0;
 }
 
+.listen-row button:first-child:hover:not(:disabled) {
+  background: #151a21;
+  border-color: #3a4652;
+  color: #e8edf2;
+}
+
+.listen-row button.live:hover:not(:disabled) {
+  background: #7b2d35;
+  border-color: #df6b73;
+  color: #e8edf2;
+}
+
 .replay-last {
   width: 100%;
   height: auto;
@@ -250,9 +262,28 @@ button.live {
   background: #18202a;
 }
 
-.utterance strong {
+.utterance-channel {
+  justify-self: start;
+  min-width: 0;
   color: #e8edf2;
   font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+  user-select: text;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.utterance-channel:hover,
+.utterance-channel:focus-visible {
+  color: #8ab4f8;
+  text-decoration: underline;
+}
+
+.utterance-channel:focus-visible {
+  outline: 1px solid #66819d;
+  outline-offset: 3px;
+  border-radius: 3px;
 }
 
 .utterance span {
@@ -289,7 +320,7 @@ button.live {
   background: #123120;
 }
 
-.utterance.playing-row strong,
+.utterance.playing-row .utterance-channel,
 .utterance.playing-row .utterance-actions .icon-button {
   color: #7cf0a8;
 }
@@ -310,7 +341,33 @@ button.live {
 }
 
 .filter-chip {
-  padding: 5px 8px;
-  background: #163a2a;
-  border-color: #2fbe75;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  padding: 3px 9px 3px 5px;
+  border-color: #315143;
+  border-radius: 999px;
+  background: #13251d;
+  color: #dff7e9;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 5%);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.filter-chip:hover:not(:disabled) {
+  background: #173323;
+  border-color: #3c8b5f;
+}
+
+.filter-chip-remove {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background: #244533;
+  color: #9ee6b5;
+  font-size: 16px;
+  line-height: 1;
 }

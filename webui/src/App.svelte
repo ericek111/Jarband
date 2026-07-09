@@ -223,6 +223,18 @@
     loadRecentHistory(previous);
   }
 
+  function filterHistoryAtUtterance(utterance: Utterance) {
+    selected = new Set([utterance.channel]);
+    historyBackStack = [Number.POSITIVE_INFINITY];
+    loadRecentHistory(utterance.startMillis + 1);
+  }
+
+  function filterHistoryFromKey(event: KeyboardEvent, utterance: Utterance) {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    filterHistoryAtUtterance(utterance);
+  }
+
   function playUtterance(utterance: Utterance) {
     try {
       audio.ensure();
@@ -458,7 +470,11 @@
         <span class="filter-empty">History filter: all channels</span>
       {:else}
         {#each [...selected].sort() as name}
-          <button type="button" class="filter-chip" onclick={() => removeSelected(name)}>{name} x</button>
+          <button type="button" class="filter-chip" aria-label={`Remove ${name} from history filter`}
+            onclick={() => removeSelected(name)}>
+            <span aria-hidden="true" class="filter-chip-remove">×</span>
+            <span>{name}</span>
+          </button>
         {/each}
       {/if}
     </div>
@@ -475,7 +491,12 @@
           <div class="history-date">{utcDate(utterance.startMillis)}</div>
         {/if}
         <div class:playing-row={playingRows.has(utteranceKey(utterance))} class="utterance">
-          <strong>{utterance.channel}</strong>
+          <span class="utterance-channel" role="link" tabindex="0"
+            aria-label={`Filter history to ${utterance.channel}`}
+            onclick={() => filterHistoryAtUtterance(utterance)}
+            onkeydown={(event) => filterHistoryFromKey(event, utterance)}>
+            {utterance.channel}
+          </span>
           <span>{utcTime(utterance.startMillis)}</span>
           <span>{duration(utterance)}s</span>
           <span>{snr(utterance)}</span>
