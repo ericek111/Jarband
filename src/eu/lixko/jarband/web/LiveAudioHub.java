@@ -19,6 +19,7 @@ import io.undertow.websockets.core.WebSocketChannel;
 import io.undertow.websockets.core.WebSockets;
 
 public final class LiveAudioHub implements OpusFrameSink {
+    private static final long MIN_BROADCAST_UTTERANCE_MILLIS = 100;
     public static final int PACKET_MAGIC = 0x4a424f50; // JBOP
     private static final int LIVE_BATCH_MILLIS = 200;
 
@@ -152,7 +153,7 @@ public final class LiveAudioHub implements OpusFrameSink {
     }
 
     private void broadcastUtteranceClosed(LogicalChannel channel, long startMillis, long endMillis) {
-        if (startMillis <= 0 || endMillis <= startMillis) {
+        if (startMillis <= 0 || endMillis - startMillis < MIN_BROADCAST_UTTERANCE_MILLIS) {
             return;
         }
         StringBuilder json = new StringBuilder(180);

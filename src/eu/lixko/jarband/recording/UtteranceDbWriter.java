@@ -43,6 +43,10 @@ public final class UtteranceDbWriter implements AutoCloseable {
         writeRecord(recordOffset, unixMillisStart, opusFileByteOffset, durationMillis, averageSnrDb);
     }
 
+    public synchronized void truncateFrom(long recordOffset) throws IOException {
+        channel.truncate(recordOffset);
+    }
+
     private void writeRecord(long recordOffset, long unixMillisStart, int opusFileByteOffset,
                              long durationMillis, float averageSnrDb) throws IOException {
         record.clear();

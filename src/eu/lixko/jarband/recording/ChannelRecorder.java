@@ -10,6 +10,7 @@ import java.util.Locale;
 import eu.lixko.jarband.dsp.channelizer.LogicalChannel;
 
 public final class ChannelRecorder implements AutoCloseable {
+    private static final long MIN_STORED_UTTERANCE_MILLIS = 100;
     private static final DateTimeFormatter WEEKLY_ROTATION_FORMAT =
             DateTimeFormatter.ofPattern("YYYY-'w'ww", Locale.ROOT).withZone(ZoneOffset.UTC);
 
@@ -73,8 +74,13 @@ public final class ChannelRecorder implements AutoCloseable {
             rotateIfNeeded(unixMillis);
         }
         if (utteranceOpen) {
-            dbFile.update(utteranceDbOffset, utteranceStartMillis, utteranceStartOffset,
-                    Math.max(0, unixMillis - utteranceStartMillis), averageSnrDb);
+            long durationMillis = Math.max(0, unixMillis - utteranceStartMillis);
+            if (durationMillis < MIN_STORED_UTTERANCE_MILLIS) {
+                dbFile.truncateFrom(utteranceDbOffset);
+            } else {
+                dbFile.update(utteranceDbOffset, utteranceStartMillis, utteranceStartOffset,
+                        durationMillis, averageSnrDb);
+            }
         }
         utteranceOpen = false;
         // Keep utterances independent and avoid carrying a partial Opus frame,
