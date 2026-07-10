@@ -69,26 +69,38 @@ public final class ChannelRecorder implements AutoCloseable {
         }
     }
 
-    public synchronized void closeUtterance(long unixMillis, float averageSnrDb) throws IOException {
+    public synchronized OpusFrameSink.UtteranceClosed closeUtterance(long unixMillis, float averageSnrDb) throws IOException {
         if (opusFile == null || dbFile == null) {
             rotateIfNeeded(unixMillis);
         }
+        OpusFrameSink.UtteranceClosed closed = null;
         if (utteranceOpen) {
             long durationMillis = Math.max(0, unixMillis - utteranceStartMillis);
-            if (durationMillis < MIN_STORED_UTTERANCE_MILLIS) {
+            // Drop the unfinished encoder frame at the squelch edge, then flush
+            // complete Opus packets so the live history event can carry a
+            // playable byte range immediately.
+            frameFill = 0;
+            opusFile.flushPendingAudio();
+            int utteranceEndOffset = opusFile.offsetForNextPacket();
+            if (durationMillis < MIN_STORED_UTTERANCE_MILLIS || utteranceEndOffset <= utteranceStartOffset) {
                 dbFile.truncateFrom(utteranceDbOffset);
             } else {
                 dbFile.update(utteranceDbOffset, utteranceStartMillis, utteranceStartOffset,
                         durationMillis, averageSnrDb);
+                closed = new OpusFrameSink.UtteranceClosed(channel.id(), channel.name(),
+                        utteranceStartMillis, unixMillis, durationMillis, averageSnrDb,
+                        rotationKey + ".opus", utteranceStartOffset, utteranceEndOffset,
+                        opusSampleRate, opusFrameMillis);
             }
         }
         utteranceOpen = false;
         // Keep utterances independent and avoid carrying a partial Opus frame,
         // often containing squelch-edge noise, into the next one.
         frameFill = 0;
-        if (opusFile != null) {
+        if (opusFile != null && closed == null) {
             opusFile.flushPendingAudio();
         }
+        return closed;
     }
 
     private void publishFrame(int bytes) {

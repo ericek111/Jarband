@@ -78,9 +78,10 @@ public final class RecorderBank implements AirbandFrameProcessor.AudioSink, Auto
                 if (event.kind == EncoderEvent.AUDIO) {
                     recorders.get(event.channelId).accept(event.unixMillis, event.audio, event.length);
                 } else {
-                    recorders.get(event.channelId).closeUtterance(event.unixMillis, event.averageSnrDb);
+                    OpusFrameSink.UtteranceClosed closed =
+                            recorders.get(event.channelId).closeUtterance(event.unixMillis, event.averageSnrDb);
                     if (frameSink != null) {
-                        frameSink.closeUtterance(event.channelId, event.unixMillis);
+                        frameSink.closeUtterance(event.channelId, event.unixMillis, closed);
                     }
                 }
             }

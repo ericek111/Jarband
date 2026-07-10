@@ -13,6 +13,7 @@ export type Utterance = {
   durationMillis?: number;
   averageSnrDb?: number;
   opusUrl?: string;
+  opusSize?: number;
   startOffset?: number;
   endOffset?: number;
   sampleRate?: number;

@@ -130,7 +130,7 @@ public final class LiveAudioHub implements OpusFrameSink {
         }
     }
 
-    public void closeUtterance(int channelId, long unixMillis) {
+    public void closeUtterance(int channelId, long unixMillis, OpusFrameSink.UtteranceClosed utterance) {
         ChannelActivity item = activity[channelId];
         long startMillis = item.utteranceStartMillis > 0 ? item.utteranceStartMillis : item.lastActivityMillis;
         item.active = false;
@@ -140,7 +140,7 @@ public final class LiveAudioHub implements OpusFrameSink {
         }
         LogicalChannel channel = channels.get(channelId);
         broadcastActivity(channel);
-        broadcastUtteranceClosed(channel, startMillis, unixMillis);
+        broadcastUtteranceClosed(channel, startMillis, unixMillis, utterance);
     }
 
     private void broadcastActivity(LogicalChannel channel) {
@@ -152,17 +152,31 @@ public final class LiveAudioHub implements OpusFrameSink {
         }
     }
 
-    private void broadcastUtteranceClosed(LogicalChannel channel, long startMillis, long endMillis) {
+    private void broadcastUtteranceClosed(LogicalChannel channel, long startMillis, long endMillis,
+                                          OpusFrameSink.UtteranceClosed utterance) {
+        if (utterance == null) {
+            return;
+        }
+        startMillis = utterance.startMillis();
+        endMillis = utterance.endMillis();
         if (startMillis <= 0 || endMillis - startMillis < MIN_BROADCAST_UTTERANCE_MILLIS) {
             return;
         }
-        StringBuilder json = new StringBuilder(180);
+        float averageSnrDb = Float.isFinite(utterance.averageSnrDb()) ? utterance.averageSnrDb() : 0.0f;
+        StringBuilder json = new StringBuilder(320);
         json.append("{\"type\":\"utterance_closed\",")
                 .append("\"utterance\":{")
                 .append("\"channel\":\"").append(escape(channel.name())).append("\",")
-                .append("\"frequencyHz\":").append(Math.round(channel.frequencyHz())).append(',')
                 .append("\"startMillis\":").append(startMillis).append(',')
-                .append("\"endMillis\":").append(endMillis)
+                .append("\"endMillis\":").append(endMillis).append(',')
+                .append("\"durationMillis\":").append(utterance.durationMillis()).append(',')
+                .append("\"averageSnrDb\":").append(String.format(java.util.Locale.ROOT, "%.3f", averageSnrDb)).append(',')
+                .append("\"opusUrl\":\"/airband/recordings/").append(escape(channel.name()))
+                .append('/').append(escape(utterance.opusFileName())).append("\",")
+                .append("\"startOffset\":").append(utterance.startOffset()).append(',')
+                .append("\"endOffset\":").append(utterance.endOffset()).append(',')
+                .append("\"sampleRate\":").append(utterance.sampleRateHz()).append(',')
+                .append("\"frameMillis\":").append(utterance.frameMillis())
                 .append("}}");
         String message = json.toString();
         for (Client client : clients) {

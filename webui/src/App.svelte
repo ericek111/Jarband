@@ -399,7 +399,7 @@
   }
 
   function appendLiveUtterance(utterance: Utterance) {
-    if (selected.size > 0 && !selected.has(utterance.channel)) {
+    if (selected.size === 0 || !selected.has(utterance.channel)) {
       return;
     }
     if (Number.isFinite(historyBeforeMillis)) {

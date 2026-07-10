@@ -31,12 +31,22 @@ type RecentFileResult = {
   hasOlder: boolean;
 };
 
+type RangeBlock = {
+  start: number;
+  end: number;
+  data: ArrayBuffer;
+};
+
 const decoder = new TextDecoder();
 const UDB_HEADER_BYTES = 4;
 const UDB_RECORD_BYTES = 16;
-const UDB_CHUNK_BYTES = 10 * 1024;
+const UDB_CHUNK_BYTES = 50 * 1024;
+const OPUS_CHUNK_BYTES = 500 * 1024;
+const MAX_CACHED_BLOCKS_PER_FILE = 8;
 const DURATION_UNIT_MILLIS = 100;
 const DURATION_INDEFINITE = 0xffff;
+const rangeCache = new Map<string, RangeBlock[]>();
+const recordingFilesCache = new Map<string, Promise<RecordingFile[]>>();
 
 export async function fetchRecentHistory(channels: string[], beforeMillis: number, limit: number) {
   const safeBefore = Number.isFinite(beforeMillis) ? beforeMillis : Number.POSITIVE_INFINITY;
@@ -74,16 +84,10 @@ export async function fetchUtterancePackets(utterance: Utterance, streamKey: str
   if (!utterance.opusUrl || utterance.startOffset === undefined || utterance.endOffset === undefined) {
     throw new Error('History row is missing Opus byte-range metadata.');
   }
-  const response = await fetch(utterance.opusUrl, {
-    signal,
-    headers: {
-      Range: `bytes=${utterance.startOffset}-${utterance.endOffset - 1}`
-    }
-  });
-  if (!response.ok && response.status !== 206) {
-    throw new Error(`Opus range request failed: ${response.status}`);
-  }
-  return parseOggOpusPackets(await response.arrayBuffer(), utterance, streamKey);
+  const fileSize = utterance.opusSize ?? Number.MAX_SAFE_INTEGER;
+  const bytes = await fetchRangeCached(utterance.opusUrl, fileSize,
+    utterance.startOffset, utterance.endOffset, OPUS_CHUNK_BYTES, signal);
+  return parseOggOpusPackets(bytes, utterance, streamKey);
 }
 
 function historyParams(channels: string[]) {
@@ -95,9 +99,26 @@ function historyParams(channels: string[]) {
 }
 
 async function fetchRecordingFiles(channels: string[]) {
-  const response = await fetch(`/airband/api/recording-files?${historyParams(channels)}`);
-  if (!response.ok) throw new Error(`Recording file list failed: ${response.status}`);
-  return (await response.json() as { files: RecordingFile[] }).files;
+  const key = channelsKey(channels);
+  const cached = recordingFilesCache.get(key);
+  if (cached) return cached;
+
+  const request = fetch(`/airband/api/recording-files?${historyParams(channels)}`)
+    .then(response => {
+      if (!response.ok) throw new Error(`Recording file list failed: ${response.status}`);
+      return response.json();
+    })
+    .then((body: { files: RecordingFile[] }) => body.files)
+    .catch(error => {
+      recordingFilesCache.delete(key);
+      throw error;
+    });
+  recordingFilesCache.set(key, request);
+  return request;
+}
+
+function channelsKey(channels: string[]) {
+  return channels.slice().sort().join('\u0000');
 }
 
 async function readRecentFileUtterances(file: RecordingFile, beforeMillis: number, limit: number) {
@@ -109,8 +130,8 @@ async function readRecentFileUtterances(file: RecordingFile, beforeMillis: numbe
   while (endRecordExclusive > 0 && utterances.length < limit) {
     const startRecord = Math.max(0, endRecordExclusive - recordsPerChunk);
     const expectedRecords = endRecordExclusive - startRecord;
-    const records = await readRecords(file, startRecord, endRecordExclusive);
-    utterances.push(...recordsToUtterances(file, records, startRecord)
+    const records = await readRecords(file, startRecord, endRecordExclusive, true);
+    utterances.push(...recordsToUtterances(file, records, expectedRecords)
       .filter(utterance => utterance.startMillis < beforeMillis));
     endRecordExclusive = startRecord;
     if (records.length < expectedRecords) break;
@@ -124,23 +145,20 @@ async function readRecentFileUtterances(file: RecordingFile, beforeMillis: numbe
 async function readAllFileUtterances(file: RecordingFile, fromMillis: number, toMillis: number) {
   const count = recordCount(file);
   if (count <= 0) return [];
-  const records = await readRecords(file, 0, count);
-  return recordsToUtterances(file, records, 0)
+  const records = await readRecords(file, 0, count, false);
+  return recordsToUtterances(file, records, records.length)
     .filter(utterance => utterance.endMillis >= fromMillis && utterance.startMillis <= toMillis);
 }
 
-async function readRecords(file: RecordingFile, startRecord: number, endRecordExclusive: number) {
+async function readRecords(file: RecordingFile, startRecord: number, endRecordExclusive: number, includeLookahead: boolean) {
+  const count = recordCount(file);
+  const fetchEndRecordExclusive = includeLookahead
+    ? Math.min(count, endRecordExclusive + 1)
+    : endRecordExclusive;
   const start = UDB_HEADER_BYTES + startRecord * UDB_RECORD_BYTES;
-  const end = UDB_HEADER_BYTES + endRecordExclusive * UDB_RECORD_BYTES - 1;
-  const bytes = endRecordExclusive * UDB_RECORD_BYTES - startRecord * UDB_RECORD_BYTES;
-  const range = endRecordExclusive === recordCount(file)
-    ? `bytes=-${bytes}`
-    : `bytes=${start}-${end}`;
-  const response = await fetch(file.dbUrl, { headers: { Range: range } });
-  if (!response.ok && response.status !== 206) {
-    throw new Error(`UDB range request failed: ${response.status}`);
-  }
-  return parseUdbRecords(await response.arrayBuffer());
+  const end = UDB_HEADER_BYTES + fetchEndRecordExclusive * UDB_RECORD_BYTES;
+  const bytes = await fetchRangeCached(file.dbUrl, file.dbSize, start, end, UDB_CHUNK_BYTES);
+  return parseUdbRecords(bytes);
 }
 
 function parseUdbRecords(buffer: ArrayBuffer) {
@@ -157,8 +175,8 @@ function parseUdbRecords(buffer: ArrayBuffer) {
   return records;
 }
 
-function recordsToUtterances(file: RecordingFile, records: UdbRecord[], startRecord: number) {
-  return records.map((record, index) => {
+function recordsToUtterances(file: RecordingFile, records: UdbRecord[], emitCount: number) {
+  return records.slice(0, emitCount).map((record, index) => {
     const durationMillis = record.durationUnits === DURATION_INDEFINITE
       ? -1
       : record.durationUnits * DURATION_UNIT_MILLIS;
@@ -169,6 +187,7 @@ function recordsToUtterances(file: RecordingFile, records: UdbRecord[], startRec
       durationMillis,
       averageSnrDb: record.averageSnrQ8_8 / 256,
       opusUrl: file.opusUrl,
+      opusSize: file.opusSize,
       startOffset: record.opusOffset,
       endOffset: records[index + 1]?.opusOffset ?? file.opusSize,
       sampleRate: file.sampleRate,
@@ -179,6 +198,51 @@ function recordsToUtterances(file: RecordingFile, records: UdbRecord[], startRec
 
 function recordCount(file: RecordingFile) {
   return Math.max(0, Math.floor((file.dbSize - UDB_HEADER_BYTES) / UDB_RECORD_BYTES));
+}
+
+async function fetchRangeCached(url: string, fileSize: number, start: number, end: number,
+                                blockBytes: number, signal?: AbortSignal) {
+  const cached = cachedSlice(url, start, end);
+  if (cached) return cached;
+
+  const alignedStart = Math.max(0, Math.floor(start / blockBytes) * blockBytes);
+  const alignedEnd = Math.min(fileSize, Math.ceil(end / blockBytes) * blockBytes);
+  const blockStart = alignedEnd === fileSize && alignedEnd - alignedStart <= blockBytes
+    ? Math.max(0, fileSize - blockBytes)
+    : alignedStart;
+  const blockEnd = alignedEnd;
+  const rangeLength = blockEnd - blockStart;
+  const range = blockEnd === fileSize
+    ? `bytes=-${rangeLength}`
+    : `bytes=${blockStart}-${blockEnd - 1}`;
+
+  const response = await fetch(url, { signal, headers: { Range: range } });
+  if (!response.ok && response.status !== 206) {
+    throw new Error(`Range request failed: ${response.status}`);
+  }
+  const data = await response.arrayBuffer();
+  addCachedBlock(url, { start: blockStart, end: blockStart + data.byteLength, data });
+  const fetched = cachedSlice(url, start, end);
+  if (!fetched) {
+    throw new Error('Fetched range did not cover requested bytes.');
+  }
+  return fetched;
+}
+
+function cachedSlice(url: string, start: number, end: number) {
+  const block = rangeCache.get(url)?.find(item => item.start <= start && item.end >= end);
+  if (!block) return null;
+  return block.data.slice(start - block.start, end - block.start);
+}
+
+function addCachedBlock(url: string, block: RangeBlock) {
+  const blocks = rangeCache.get(url) ?? [];
+  blocks.push(block);
+  blocks.sort((a, b) => b.end - b.start - (a.end - a.start));
+  while (blocks.length > MAX_CACHED_BLOCKS_PER_FILE) {
+    blocks.pop();
+  }
+  rangeCache.set(url, blocks);
 }
 
 function parseOggOpusPackets(buffer: ArrayBuffer, utterance: Utterance, streamKey: string) {
