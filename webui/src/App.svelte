@@ -12,6 +12,10 @@
 
   const historyPageSize = 20;
   const recentWindowMillis = 180_000;
+  const defaultTimelineWindowMillis = 60 * 60 * 1000;
+  const minTimelineWindowMillis = 60 * 1000;
+  const maxTimelineWindowMillis = 31 * 24 * 60 * 60 * 1000;
+  const waveformWindowMillis = 24 * 60 * 60 * 1000;
 
   type ScheduledHistoryFrame = {
     channel: string;
@@ -28,12 +32,17 @@
   let live = new Set<string>();
   let filter = '';
   let recentHistory: Utterance[] = [];
-  let historyBeforeMillis = Number.POSITIVE_INFINITY;
-  let historyBackStack: number[] = [];
   let historyHasOlder = false;
   let realtimeGaps = false;
   let fromValue = '';
   let toValue = '';
+  let timelineFromMillis = 0;
+  let timelineToMillis = 0;
+  let timelineLoading = false;
+  let playheadMillis = 0;
+  let seekingTimeline = false;
+  let timelineLoadTimer: ReturnType<typeof setTimeout> | null = null;
+  let historyWindowRequestId = 0;
   let now = Date.now();
   let channelsOpen = false;
 
@@ -53,6 +62,10 @@
     .filter(channel => channel.lastActivityMillis > 0)
     .filter(channel => channel.active || now - channel.lastActivityMillis <= recentWindowMillis)
     .sort((a, b) => a.frequencyHz - b.frequencyHz);
+  $: timelineSpanMillis = Math.max(minTimelineWindowMillis, timelineToMillis - timelineFromMillis);
+  $: timelineTicks = buildTimelineTicks(timelineFromMillis, timelineToMillis);
+  $: timelineBlocks = buildTimelineBlocks(recentHistory, timelineFromMillis, timelineToMillis);
+  $: playheadPercent = timelinePositionPercent(playheadMillis, timelineFromMillis, timelineToMillis);
 
   onMount(() => {
     audio.onScheduled(handleFrameScheduled);
@@ -62,6 +75,7 @@
     return () => {
       socket?.close();
       clearInterval(tickTimer);
+      if (timelineLoadTimer) clearTimeout(timelineLoadTimer);
       rowHighlighter.clear();
     };
   });
@@ -181,50 +195,24 @@
   }
 
   function resetHistoryWindow() {
-    historyBackStack = [];
-    loadRecentHistory(Number.POSITIVE_INFINITY);
-  }
-
-  async function loadRecentHistory(beforeMillis = historyBeforeMillis) {
-    if (selected.size === 0) {
-      recentHistory = [];
-      historyHasOlder = false;
-      historyBeforeMillis = Number.POSITIVE_INFINITY;
-      fromValue = '';
-      toValue = '';
-      return;
-    }
-    try {
-      const message = await fetchRecentHistory([...selected], beforeMillis, historyPageSize);
-      historyBeforeMillis = message.beforeMillis > 0 ? message.beforeMillis : Number.POSITIVE_INFINITY;
-      historyHasOlder = message.hasOlder;
-      recentHistory = message.utterances;
-      updateRangeInputs(message.utterances);
-      refreshVisiblePlaybackHighlights();
-    } catch (error) {
-      status = error instanceof Error ? error.message : String(error);
-    }
+    const endMillis = Date.now();
+    setHistoryWindow(endMillis - defaultTimelineWindowMillis, endMillis);
   }
 
   function loadOlderHistory() {
-    if (!recentHistory.length) return;
-    const oldest = Math.min(...recentHistory.map(utterance => utterance.startMillis).filter(Number.isFinite));
-    if (!Number.isFinite(oldest)) return;
-    historyBackStack = [...historyBackStack, historyBeforeMillis];
-    loadRecentHistory(oldest);
+    if (selected.size === 0) return;
+    shiftHistoryWindow(-timelineSpanMillis);
   }
 
   function loadNewerHistory() {
-    const previous = historyBackStack.at(-1);
-    if (previous === undefined) return;
-    historyBackStack = historyBackStack.slice(0, -1);
-    loadRecentHistory(previous);
+    if (selected.size === 0) return;
+    shiftHistoryWindow(timelineSpanMillis);
   }
 
   function filterHistoryAtUtterance(utterance: Utterance) {
     selected = new Set([utterance.channel]);
-    historyBackStack = [Number.POSITIVE_INFINITY];
-    loadRecentHistory(utterance.startMillis + 1);
+    const halfWindow = defaultTimelineWindowMillis / 2;
+    setHistoryWindow(utterance.startMillis - halfWindow, utterance.startMillis + halfWindow);
   }
 
   function filterHistoryFromKey(event: KeyboardEvent, utterance: Utterance) {
@@ -264,6 +252,136 @@
     const channels = [...selected];
     void fetchHistoryIndex(channels, utterance.startMillis, Date.now())
       .then(utterances => playHistoryUtterances(utterances, channels, utterance.startMillis, realtimeGaps))
+      .catch(error => status = error instanceof Error ? error.message : String(error));
+  }
+
+  function applyInputRange() {
+    const fromMillis = localMillis(fromValue);
+    const toMillis = localMillis(toValue);
+    if (!Number.isFinite(fromMillis) || !Number.isFinite(toMillis) || toMillis <= fromMillis) {
+      status = 'Choose a valid historical time range';
+      return;
+    }
+    setHistoryWindow(fromMillis, toMillis);
+  }
+
+  function setHistoryWindow(fromMillis: number, toMillis: number, loadDelayMillis = 0) {
+    const safeTo = Math.min(Date.now(), Math.max(fromMillis + minTimelineWindowMillis, toMillis));
+    const safeFrom = Math.max(0, Math.min(fromMillis, safeTo - minTimelineWindowMillis));
+    timelineFromMillis = safeFrom;
+    timelineToMillis = safeTo;
+    playheadMillis = clamp(playheadMillis || safeFrom, safeFrom, safeTo);
+    fromValue = localDateTime(safeFrom);
+    toValue = localDateTime(safeTo);
+    if (timelineLoadTimer) clearTimeout(timelineLoadTimer);
+    if (loadDelayMillis > 0) {
+      timelineLoadTimer = setTimeout(() => {
+        timelineLoadTimer = null;
+        void loadHistoryWindow();
+      }, loadDelayMillis);
+    } else {
+      void loadHistoryWindow();
+    }
+  }
+
+  async function loadHistoryWindow() {
+    if (selected.size === 0) {
+      historyWindowRequestId += 1;
+      recentHistory = [];
+      historyHasOlder = false;
+      return;
+    }
+    const requestId = ++historyWindowRequestId;
+    timelineLoading = true;
+    try {
+      const utterances = await fetchHistoryIndex([...selected], timelineFromMillis, timelineToMillis);
+      if (requestId !== historyWindowRequestId) return;
+      recentHistory = utterances.slice().sort((a, b) => b.startMillis - a.startMillis || a.channel.localeCompare(b.channel));
+      historyHasOlder = true;
+      refreshVisiblePlaybackHighlights();
+    } catch (error) {
+      status = error instanceof Error ? error.message : String(error);
+    } finally {
+      if (requestId === historyWindowRequestId) {
+        timelineLoading = false;
+      }
+    }
+  }
+
+  function shiftHistoryWindow(deltaMillis: number) {
+    const span = timelineSpanMillis;
+    const latestTo = Date.now();
+    let nextFrom = timelineFromMillis + deltaMillis;
+    let nextTo = timelineToMillis + deltaMillis;
+    if (nextTo > latestTo) {
+      nextTo = latestTo;
+      nextFrom = latestTo - span;
+    }
+    setHistoryWindow(nextFrom, nextTo);
+  }
+
+  function zoomTimeline(event: WheelEvent) {
+    if (selected.size === 0 || timelineToMillis <= timelineFromMillis) return;
+    event.preventDefault();
+    const element = event.currentTarget as HTMLElement;
+    const rect = element.getBoundingClientRect();
+    const ratio = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+    const anchor = timelineFromMillis + timelineSpanMillis * ratio;
+    const zoomFactor = event.deltaY > 0 ? 1.35 : 1 / 1.35;
+    const nextSpan = clamp(timelineSpanMillis * zoomFactor, minTimelineWindowMillis, maxTimelineWindowMillis);
+    let nextFrom = anchor - nextSpan * ratio;
+    let nextTo = nextFrom + nextSpan;
+    const latestTo = Date.now();
+    if (nextTo > latestTo) {
+      nextTo = latestTo;
+      nextFrom = latestTo - nextSpan;
+    }
+    setHistoryWindow(nextFrom, nextTo, 120);
+  }
+
+  function beginTimelineSeek(event: PointerEvent) {
+    if (selected.size === 0 || timelineToMillis <= timelineFromMillis) return;
+    const element = event.currentTarget as HTMLElement;
+    element.setPointerCapture(event.pointerId);
+    seekingTimeline = true;
+    playheadMillis = millisFromTimelineEvent(event, element);
+  }
+
+  function moveTimelineSeek(event: PointerEvent) {
+    if (!seekingTimeline) return;
+    playheadMillis = millisFromTimelineEvent(event, event.currentTarget as HTMLElement);
+  }
+
+  function endTimelineSeek(event: PointerEvent) {
+    if (!seekingTimeline) return;
+    const element = event.currentTarget as HTMLElement;
+    if (element.hasPointerCapture(event.pointerId)) {
+      element.releasePointerCapture(event.pointerId);
+    }
+    seekingTimeline = false;
+    const targetMillis = millisFromTimelineEvent(event, element);
+    playheadMillis = targetMillis;
+    seekHistoryTo(targetMillis);
+  }
+
+  function seekHistoryTo(targetMillis: number) {
+    try {
+      audio.ensure();
+    } catch (error) {
+      status = error instanceof Error ? error.message : String(error);
+      return;
+    }
+    clearHistoryPlaybackState(true);
+    playheadMillis = targetMillis;
+    const channels = [...selected];
+    void fetchHistoryIndex(channels, targetMillis, timelineToMillis)
+      .then(utterances => {
+        if (!utterances.length) {
+          status = 'No recordings after seek point in this window';
+          return;
+        }
+        return playHistoryUtterances(utterances, channels, targetMillis, realtimeGaps);
+      })
       .catch(error => status = error instanceof Error ? error.message : String(error));
   }
 
@@ -355,6 +473,7 @@
 
   function handleFrameScheduled(streamKey: string, targetMillis: number, startTime: number, durationSeconds: number) {
     if (!streamKey.startsWith('history:')) return;
+    playheadMillis = clamp(targetMillis, timelineFromMillis, timelineToMillis);
     const delayMillis = Math.max(0, (startTime - audio.currentTime()) * 1000);
     const startAtMillis = performance.now() + delayMillis;
     const endAtMillis = startAtMillis + durationSeconds * 1000 + 150;
@@ -390,27 +509,18 @@
     }
   }
 
-  function updateRangeInputs(utterances: Utterance[]) {
-    if (!utterances.length) return;
-    const starts = utterances.map(utterance => utterance.startMillis).filter(Number.isFinite);
-    const ends = utterances.map(utterance => utterance.endMillis).filter(Number.isFinite);
-    if (starts.length) fromValue = localDateTime(Math.min(...starts));
-    if (ends.length) toValue = localDateTime(Math.max(...ends));
-  }
-
   function appendLiveUtterance(utterance: Utterance) {
     if (selected.size === 0 || !selected.has(utterance.channel)) {
       return;
     }
-    if (Number.isFinite(historyBeforeMillis)) {
+    if (utterance.startMillis < timelineFromMillis || utterance.startMillis > timelineToMillis) {
       return;
     }
     const key = utteranceKey(utterance);
     recentHistory = [utterance, ...recentHistory.filter(item => utteranceKey(item) !== key)]
       .sort((a, b) => b.startMillis - a.startMillis)
-      .slice(0, historyPageSize);
-    historyHasOlder = historyHasOlder || recentHistory.length === historyPageSize;
-    updateRangeInputs(recentHistory);
+      .slice(0, historyPageSize * 50);
+    historyHasOlder = true;
   }
 
   function lastActiveText(channel: Channel) {
@@ -461,17 +571,75 @@
   }
 
   function historyRangeLabel() {
-    if (!recentHistory.length) return 'No recordings';
-    const starts = recentHistory.map(utterance => utterance.startMillis).filter(Number.isFinite);
-    if (!starts.length) return 'No valid timestamps';
-    const newest = Math.max(...starts);
-    const oldest = Math.min(...starts);
-    const newestDate = utcDate(newest);
-    const oldestDate = utcDate(oldest);
-    if (newestDate === oldestDate) {
-      return `${oldestDate} ${utcTime(oldest)} - ${utcTime(newest)}`;
+    if (!timelineFromMillis || !timelineToMillis) return 'No recordings';
+    const fromDate = utcDate(timelineFromMillis);
+    const toDate = utcDate(timelineToMillis);
+    const count = recentHistory.length === 1 ? '1 recording' : `${recentHistory.length} recordings`;
+    if (fromDate === toDate) {
+      return `${fromDate} ${utcTime(timelineFromMillis)} - ${utcTime(timelineToMillis)} · ${count}`;
     }
-    return `${oldestDate} ${utcTime(oldest)} - ${newestDate} ${utcTime(newest)}`;
+    return `${fromDate} ${utcTime(timelineFromMillis)} - ${toDate} ${utcTime(timelineToMillis)} · ${count}`;
+  }
+
+  function millisFromTimelineEvent(event: PointerEvent, element: HTMLElement) {
+    const rect = element.getBoundingClientRect();
+    const ratio = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+    return Math.round(timelineFromMillis + timelineSpanMillis * ratio);
+  }
+
+  function timelinePositionPercent(millis: number, fromMillis: number, toMillis: number) {
+    if (!millis || toMillis <= fromMillis) return 0;
+    return clamp(((millis - fromMillis) / (toMillis - fromMillis)) * 100, 0, 100);
+  }
+
+  function buildTimelineBlocks(utterances: Utterance[], fromMillis: number, toMillis: number) {
+    const span = toMillis - fromMillis;
+    if (span <= 0 || span > waveformWindowMillis) return [];
+    return utterances
+      .filter(utterance => utterance.endMillis >= fromMillis && utterance.startMillis <= toMillis)
+      .map(utterance => {
+        const start = clamp(utterance.startMillis, fromMillis, toMillis);
+        const end = clamp(Math.max(utterance.endMillis, utterance.startMillis + 100), fromMillis, toMillis);
+        const snrDb = Number.isFinite(utterance.averageSnrDb) ? utterance.averageSnrDb! : 10;
+        const height = clamp(18 + ((snrDb + 5) / 55) * 62, 18, 80);
+        return {
+          key: utteranceKey(utterance),
+          left: ((start - fromMillis) / span) * 100,
+          width: Math.max(0.18, ((end - start) / span) * 100),
+          top: 50 - height / 2,
+          height,
+          label: `${utterance.channel} ${utcTime(utterance.startMillis)} ${duration(utterance)}s ${snr(utterance)}`
+        };
+      });
+  }
+
+  function buildTimelineTicks(fromMillis: number, toMillis: number) {
+    const span = toMillis - fromMillis;
+    if (span <= 0) return [];
+    const hour = 60 * 60 * 1000;
+    const day = 24 * hour;
+    const interval = span <= 2 * hour ? 15 * 60 * 1000
+      : span <= 12 * hour ? hour
+      : span <= 2 * day ? 6 * hour
+      : span <= 14 * day ? day
+      : 7 * day;
+    const ticks: { millis: number; left: number; label: string; major: boolean }[] = [];
+    const first = Math.ceil(fromMillis / interval) * interval;
+    for (let millis = first; millis <= toMillis && ticks.length < 240; millis += interval) {
+      const date = new Date(millis);
+      const major = interval >= day || (date.getUTCHours() === 0 && date.getUTCMinutes() === 0);
+      ticks.push({
+        millis,
+        left: ((millis - fromMillis) / span) * 100,
+        label: major ? date.toISOString().slice(5, 10) : `${date.toISOString().slice(11, 16)}Z`,
+        major
+      });
+    }
+    return ticks;
+  }
+
+  function clamp(value: number, min: number, max: number) {
+    return Math.min(max, Math.max(min, value));
   }
 </script>
 
@@ -532,9 +700,38 @@
     </div>
 
     <div class="history-controls">
-      <label>From <input bind:value={fromValue} type="datetime-local" /></label>
-      <label>To <input bind:value={toValue} type="datetime-local" /></label>
+      <label>From <input bind:value={fromValue} type="datetime-local" onchange={applyInputRange} /></label>
+      <label>To <input bind:value={toValue} type="datetime-local" onchange={applyInputRange} /></label>
       <label class="checkbox"><input bind:checked={realtimeGaps} type="checkbox" /> Real-time gaps</label>
+    </div>
+
+    <div class="timeline-shell">
+      <div class="timeline-topline">
+        <span>{historyRangeLabel()}</span>
+        <span>{timelineLoading ? 'Loading...' : timelineSpanMillis <= waveformWindowMillis ? 'Waveform by utterance SNR' : 'Zoom in to show utterance blocks'}</span>
+      </div>
+      <div class="history-timeline" role="slider" aria-label="Historical playback seek bar"
+        aria-valuemin={timelineFromMillis} aria-valuemax={timelineToMillis} aria-valuenow={playheadMillis}
+        tabindex="0"
+        onwheel={zoomTimeline}
+        onpointerdown={beginTimelineSeek}
+        onpointermove={moveTimelineSeek}
+        onpointerup={endTimelineSeek}
+        onpointercancel={() => seekingTimeline = false}>
+        <div class="timeline-track">
+          {#each timelineTicks as tick (tick.millis)}
+            <div class:major={tick.major} class="timeline-tick" style={`left:${tick.left}%`}>
+              <span>{tick.label}</span>
+            </div>
+          {/each}
+          {#each timelineBlocks as block (block.key)}
+            <div class="timeline-block" title={block.label}
+              style={`left:${block.left}%;width:${block.width}%;top:${block.top}%;height:${block.height}%`}>
+            </div>
+          {/each}
+          <div class="timeline-playhead" style={`left:${playheadPercent}%`}></div>
+        </div>
+      </div>
     </div>
 
     <div class="history-list">
@@ -571,9 +768,9 @@
     </div>
 
     <div class="pager">
-      <button type="button" disabled={historyBackStack.length === 0} onclick={loadNewerHistory}>Newer</button>
+      <button type="button" disabled={selected.size === 0 || timelineToMillis >= now - 1000} onclick={loadNewerHistory}>Newer</button>
       <span>{historyRangeLabel()}</span>
-      <button type="button" disabled={!historyHasOlder} onclick={loadOlderHistory}>Older</button>
+      <button type="button" disabled={!historyHasOlder || selected.size === 0} onclick={loadOlderHistory}>Older</button>
     </div>
   </section>
 </main>
