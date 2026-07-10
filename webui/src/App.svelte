@@ -28,6 +28,8 @@
     endAtMillis: number;
   };
 
+  type TimelineDragMode = 'seek' | 'pan';
+
   let socket: WebSocket | null = null;
   let status = 'Connecting...';
   const channelsById = new SvelteMap<number, Channel>();
@@ -44,7 +46,12 @@
   let timelineToMillis = 0;
   let timelineLoading = false;
   let playheadMillis = 0;
-  let seekingTimeline = false;
+  let timelineCanvas: HTMLCanvasElement | null = null;
+  let timelineDragMode: TimelineDragMode | null = null;
+  let timelineDragStartX = 0;
+  let timelineDragStartFromMillis = 0;
+  let timelineDragStartToMillis = 0;
+  let timelineDrawFrame = 0;
   let historyPlaying = false;
   let historyPaused = false;
   let playbackSpeed = 1;
@@ -75,19 +82,25 @@
   $: timelineTicks = buildTimelineTicks(timelineFromMillis, timelineToMillis);
   $: timelineBlocks = buildTimelineBlocks(recentHistory, timelineFromMillis, timelineToMillis);
   $: playheadPercent = timelinePositionPercent(playheadMillis, timelineFromMillis, timelineToMillis);
+  $: scheduleTimelineDraw(timelineCanvas, timelineTicks, timelineBlocks, playheadMillis, timelineFromMillis, timelineToMillis);
 
   onMount(() => {
     audio.onScheduled(handleFrameScheduled);
     audio.onIdle(handleStreamIdle);
     socket = connectSocket(handleMessage, handlePacket, next => status = next);
+    const redrawTimeline = () => scheduleTimelineDraw(timelineCanvas, timelineTicks, timelineBlocks,
+      playheadMillis, timelineFromMillis, timelineToMillis);
+    window.addEventListener('resize', redrawTimeline);
     tickTimer = setInterval(() => {
       now = Date.now();
       updateTimelinePlaybackClock();
     }, 100);
     return () => {
       socket?.close();
+      window.removeEventListener('resize', redrawTimeline);
       clearInterval(tickTimer);
       if (timelineLoadTimer) clearTimeout(timelineLoadTimer);
+      if (timelineDrawFrame) cancelAnimationFrame(timelineDrawFrame);
       rowHighlighter.clear();
     };
   });
@@ -361,31 +374,59 @@
 
   function beginTimelineSeek(event: PointerEvent) {
     if (selected.size === 0 || timelineToMillis <= timelineFromMillis) return;
-    const element = event.currentTarget as HTMLElement;
+    if (event.button !== 0) return;
+    const element = event.currentTarget as HTMLCanvasElement;
+    const rect = element.getBoundingClientRect();
+    const cursorX = event.clientX - rect.left;
+    const playheadX = (playheadPercent / 100) * rect.width;
     element.setPointerCapture(event.pointerId);
-    seekingTimeline = true;
-    playheadMillis = millisFromTimelineEvent(event, element);
+    timelineDragMode = Math.abs(cursorX - playheadX) <= 10 ? 'seek' : 'pan';
+    timelineDragStartX = event.clientX;
+    timelineDragStartFromMillis = timelineFromMillis;
+    timelineDragStartToMillis = timelineToMillis;
+    if (timelineDragMode === 'seek') {
+      playheadMillis = millisFromTimelineEvent(event, element);
+    }
   }
 
   function moveTimelineSeek(event: PointerEvent) {
-    if (!seekingTimeline) return;
-    playheadMillis = millisFromTimelineEvent(event, event.currentTarget as HTMLElement);
+    if (!timelineDragMode) return;
+    const element = event.currentTarget as HTMLCanvasElement;
+    if (timelineDragMode === 'seek') {
+      playheadMillis = millisFromTimelineEvent(event, element);
+      return;
+    }
+    const rect = element.getBoundingClientRect();
+    const deltaRatio = (event.clientX - timelineDragStartX) / Math.max(1, rect.width);
+    const deltaMillis = -deltaRatio * (timelineDragStartToMillis - timelineDragStartFromMillis);
+    panTimelineWindow(timelineDragStartFromMillis + deltaMillis, timelineDragStartToMillis + deltaMillis, 80);
   }
 
   function endTimelineSeek(event: PointerEvent) {
-    if (!seekingTimeline) return;
-    const element = event.currentTarget as HTMLElement;
+    if (!timelineDragMode) return;
+    const element = event.currentTarget as HTMLCanvasElement;
     if (element.hasPointerCapture(event.pointerId)) {
       element.releasePointerCapture(event.pointerId);
     }
-    seekingTimeline = false;
-    const targetMillis = millisFromTimelineEvent(event, element);
-    playheadMillis = targetMillis;
-    if (historyPlaying) {
-      seekHistoryTo(targetMillis);
-    } else {
-      historyPaused = true;
+    const mode = timelineDragMode;
+    timelineDragMode = null;
+    if (mode === 'seek') {
+      const targetMillis = millisFromTimelineEvent(event, element);
+      playheadMillis = targetMillis;
+      if (historyPlaying) {
+        seekHistoryTo(targetMillis);
+      } else {
+        historyPaused = true;
+      }
     }
+  }
+
+  function cancelTimelineDrag(event: PointerEvent) {
+    const element = event.currentTarget as HTMLCanvasElement;
+    if (element.hasPointerCapture(event.pointerId)) {
+      element.releasePointerCapture(event.pointerId);
+    }
+    timelineDragMode = null;
   }
 
   function seekHistoryTo(targetMillis: number) {
@@ -584,7 +625,7 @@
   }
 
   function updateTimelinePlaybackClock() {
-    if (seekingTimeline || !historyPlaying) return;
+    if (timelineDragMode === 'seek' || !historyPlaying) return;
     playheadMillis = currentTimelinePlayhead();
   }
 
@@ -675,6 +716,22 @@
     return `${fromDate} ${utcTime(timelineFromMillis)} - ${toDate} ${utcTime(timelineToMillis)} · ${count}`;
   }
 
+  function panTimelineWindow(fromMillis: number, toMillis: number, loadDelayMillis = 0) {
+    const span = toMillis - fromMillis;
+    const latestTo = Date.now();
+    let nextFrom = fromMillis;
+    let nextTo = toMillis;
+    if (nextFrom < 0) {
+      nextFrom = 0;
+      nextTo = span;
+    }
+    if (nextTo > latestTo) {
+      nextTo = latestTo;
+      nextFrom = latestTo - span;
+    }
+    setHistoryWindow(nextFrom, nextTo, loadDelayMillis);
+  }
+
   function millisFromTimelineEvent(event: PointerEvent, element: HTMLElement) {
     const rect = element.getBoundingClientRect();
     const ratio = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
@@ -747,6 +804,119 @@
     }
     const hue = ((hash % 360) + 360) % 360;
     return `hsl(${hue} 76% 62%)`;
+  }
+
+  function scheduleTimelineDraw(_canvas: HTMLCanvasElement | null, _ticks: ReturnType<typeof buildTimelineTicks>,
+                                _blocks: ReturnType<typeof buildTimelineBlocks>, _playheadMillis: number,
+                                _fromMillis: number, _toMillis: number) {
+    if (!timelineCanvas) return;
+    if (timelineDrawFrame) cancelAnimationFrame(timelineDrawFrame);
+    timelineDrawFrame = requestAnimationFrame(() => {
+      timelineDrawFrame = 0;
+      drawTimelineCanvas();
+    });
+  }
+
+  function drawTimelineCanvas() {
+    if (!timelineCanvas) return;
+    const rect = timelineCanvas.getBoundingClientRect();
+    const width = Math.max(1, Math.round(rect.width));
+    const height = Math.max(1, Math.round(rect.height));
+    const scale = window.devicePixelRatio || 1;
+    const pixelWidth = Math.round(width * scale);
+    const pixelHeight = Math.round(height * scale);
+    if (timelineCanvas.width !== pixelWidth || timelineCanvas.height !== pixelHeight) {
+      timelineCanvas.width = pixelWidth;
+      timelineCanvas.height = pixelHeight;
+    }
+    const context = timelineCanvas.getContext('2d');
+    if (!context) return;
+    context.setTransform(scale, 0, 0, scale, 0, 0);
+    context.clearRect(0, 0, width, height);
+
+    const radius = 8;
+    context.fillStyle = '#10151c';
+    context.beginPath();
+    context.roundRect(0, 0, width, height, radius);
+    context.fill();
+
+    context.strokeStyle = 'rgb(255 255 255 / 0.03)';
+    context.lineWidth = 1;
+    for (let x = 0; x <= width; x += width / 10) {
+      context.beginPath();
+      context.moveTo(x, 0);
+      context.lineTo(x, height);
+      context.stroke();
+    }
+
+    const gradient = context.createLinearGradient(0, 0, 0, height * 0.42);
+    gradient.addColorStop(0, 'rgb(255 255 255 / 0.03)');
+    gradient.addColorStop(1, 'rgb(255 255 255 / 0)');
+    context.fillStyle = gradient;
+    context.fillRect(0, 0, width, height * 0.42);
+
+    context.strokeStyle = '#26313d';
+    context.beginPath();
+    context.moveTo(0, height / 2);
+    context.lineTo(width, height / 2);
+    context.stroke();
+
+    context.font = '11px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    context.textBaseline = 'top';
+    for (const tick of timelineTicks) {
+      const x = (tick.left / 100) * width;
+      context.strokeStyle = tick.major ? '#526579' : '#33404d';
+      context.lineWidth = tick.major ? 2 : 1;
+      context.beginPath();
+      context.moveTo(x, 0);
+      context.lineTo(x, height);
+      context.stroke();
+      context.fillStyle = tick.major ? '#c3cfda' : '#8493a2';
+      context.fillText(tick.label, Math.min(width - 80, x + 6), 8, 78);
+    }
+
+    for (const block of timelineBlocks) {
+      const x = (block.left / 100) * width;
+      const blockWidth = Math.max(2, (block.width / 100) * width);
+      const y = (block.top / 100) * height;
+      const blockHeight = (block.height / 100) * height;
+      const blockGradient = context.createLinearGradient(0, y, 0, y + blockHeight);
+      blockGradient.addColorStop(0, mixCanvasColor(block.color, '#ffffff', 0.18));
+      blockGradient.addColorStop(1, mixCanvasColor(block.color, '#000000', 0.28));
+      context.fillStyle = blockGradient;
+      context.strokeStyle = mixCanvasColor(block.color, '#ffffff', 0.22);
+      context.lineWidth = 1;
+      context.beginPath();
+      context.roundRect(x, y, blockWidth, blockHeight, 2);
+      context.fill();
+      context.stroke();
+    }
+
+    const playheadX = (playheadPercent / 100) * width;
+    context.strokeStyle = '#7cf0a8';
+    context.lineWidth = 2;
+    context.shadowColor = 'rgb(124 240 168 / 0.36)';
+    context.shadowBlur = 14;
+    context.beginPath();
+    context.moveTo(playheadX, 0);
+    context.lineTo(playheadX, height);
+    context.stroke();
+    context.shadowBlur = 0;
+    context.fillStyle = '#7cf0a8';
+    context.beginPath();
+    context.roundRect(playheadX - 6, 0, 12, 12, 3);
+    context.fill();
+  }
+
+  function mixCanvasColor(color: string, other: string, amount: number) {
+    if (!color.startsWith('hsl(')) return color;
+    const match = /^hsl\(([-\d.]+) ([\d.]+)% ([\d.]+)%\)$/.exec(color);
+    if (!match) return color;
+    const hue = Number(match[1]);
+    const saturation = Number(match[2]);
+    const lightness = Number(match[3]);
+    const targetLightness = other === '#ffffff' ? 100 : 0;
+    return `hsl(${hue} ${saturation}% ${lightness + (targetLightness - lightness) * amount}%)`;
   }
 </script>
 
@@ -845,28 +1015,16 @@
             onchange={changePlaybackSpeed} />
         </label>
       </div>
-      <div class="history-timeline" role="slider" aria-label="Historical playback seek bar"
+      <canvas class="history-timeline" role="slider" aria-label="Historical playback seek bar"
+        bind:this={timelineCanvas}
         aria-valuemin={timelineFromMillis} aria-valuemax={timelineToMillis} aria-valuenow={playheadMillis}
         tabindex="0"
         onwheel={zoomTimeline}
         onpointerdown={beginTimelineSeek}
         onpointermove={moveTimelineSeek}
         onpointerup={endTimelineSeek}
-        onpointercancel={() => seekingTimeline = false}>
-        <div class="timeline-track">
-          {#each timelineTicks as tick (tick.millis)}
-            <div class:major={tick.major} class="timeline-tick" style={`left:${tick.left}%`}>
-              <span>{tick.label}</span>
-            </div>
-          {/each}
-          {#each timelineBlocks as block (block.key)}
-            <div class="timeline-block" title={block.label}
-              style={`left:${block.left}%;width:${block.width}%;top:${block.top}%;height:${block.height}%;--block-color:${block.color}`}>
-            </div>
-          {/each}
-          <div class="timeline-playhead" style={`left:${playheadPercent}%`}></div>
-        </div>
-      </div>
+        onpointercancel={cancelTimelineDrag}>
+      </canvas>
     </div>
 
     <div class="history-list">
