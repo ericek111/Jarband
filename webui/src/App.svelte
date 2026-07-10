@@ -3,9 +3,10 @@
   import { SvelteMap } from 'svelte/reactivity';
   import ChannelTile from './components/ChannelTile.svelte';
   import { AudioEngine } from './lib/audio';
-  import { DownloadManager } from './lib/downloads';
+  import { fetchHistoryIndex, fetchRecentHistory, fetchUtterancePackets } from './lib/historyHttp';
   import { HistoryPlaybackTracker } from './lib/historyPlayback';
   import { RowPlaybackHighlighter, utteranceKey } from './lib/rowPlayback';
+  import { opusPacketsToWav } from './lib/wav';
   import type { Channel, OpusPacket, ServerMessage, Utterance } from './lib/types';
   import { connectSocket, send } from './lib/ws';
 
@@ -37,10 +38,11 @@
   let channelsOpen = false;
 
   const audio = new AudioEngine();
-  const downloads = new DownloadManager();
   const historyPlayback = new HistoryPlaybackTracker();
   const rowHighlighter = new RowPlaybackHighlighter(rows => playingRows = rows);
   let scheduledHistoryFrames: ScheduledHistoryFrame[] = [];
+  let historyAbort: AbortController | null = null;
+  let nextPlaybackId = 1;
   let playingRows = new Set<string>();
   let replayingLast = new Set<string>();
   let tickTimer: ReturnType<typeof setInterval>;
@@ -82,36 +84,6 @@
       case 'utterance_closed':
         appendLiveUtterance(message.utterance);
         break;
-      case 'recent_history':
-        historyBeforeMillis = message.beforeMillis > 0 ? message.beforeMillis : Number.POSITIVE_INFINITY;
-        historyHasOlder = message.hasOlder;
-        recentHistory = message.utterances;
-        updateRangeInputs(message.utterances);
-        refreshVisiblePlaybackHighlights();
-        break;
-      case 'history_started': {
-        historyPlayback.start(message.playbackId, message.channels, {
-          realtime: message.realtime,
-          originMillis: message.fromMillis,
-          originAudioTime: audio.audioTime(0.15)
-        });
-        status = `Streaming ${message.frames} historical packets...`;
-        break;
-      }
-      case 'history_finished':
-        finishPlayback(message.playbackId);
-        break;
-      case 'history_stopped':
-        clearHistoryPlaybackState(true);
-        status = 'Historical playback stopped';
-        break;
-      case 'download_started':
-        downloads.start(message.downloadId, message.filename);
-        status = `Preparing ${message.filename}...`;
-        break;
-      case 'download_finished':
-        finishDownload(message.downloadId);
-        break;
       case 'error':
         replayingLast = new Set();
         status = message.message;
@@ -121,10 +93,6 @@
 
   function handlePacket(packet: OpusPacket) {
     try {
-      if (downloads.collect(packet)) {
-        return;
-      }
-      historyPlayback.trackPacket(packet);
       audio.enqueue(packet, playbackModeFor(packet.streamKey));
     } catch (error) {
       status = error instanceof Error ? error.message : String(error);
@@ -197,7 +165,19 @@
     const next = new Set(replayingLast);
     next.add(name);
     replayingLast = next;
-    send(socket, { type: 'play_last_utterance', channels: [name] });
+    void fetchRecentHistory([name], Number.POSITIVE_INFINITY, 1)
+      .then(result => {
+        if (!result.utterances.length) {
+          replayingLast = new Set();
+          status = `No recording for ${name}`;
+          return;
+        }
+        return playHistoryUtterances(result.utterances, [name], result.utterances[0].startMillis, false);
+      })
+      .catch(error => {
+        replayingLast = new Set();
+        status = error instanceof Error ? error.message : String(error);
+      });
   }
 
   function resetHistoryWindow() {
@@ -205,16 +185,25 @@
     loadRecentHistory(Number.POSITIVE_INFINITY);
   }
 
-  function loadRecentHistory(beforeMillis = historyBeforeMillis) {
-    const message: Record<string, unknown> = {
-      type: 'recent_history',
-      limit: historyPageSize,
-      channels: [...selected]
-    };
-    if (Number.isFinite(beforeMillis)) {
-      message.beforeMillis = beforeMillis;
+  async function loadRecentHistory(beforeMillis = historyBeforeMillis) {
+    if (selected.size === 0) {
+      recentHistory = [];
+      historyHasOlder = false;
+      historyBeforeMillis = Number.POSITIVE_INFINITY;
+      fromValue = '';
+      toValue = '';
+      return;
     }
-    send(socket, message);
+    try {
+      const message = await fetchRecentHistory([...selected], beforeMillis, historyPageSize);
+      historyBeforeMillis = message.beforeMillis > 0 ? message.beforeMillis : Number.POSITIVE_INFINITY;
+      historyHasOlder = message.hasOlder;
+      recentHistory = message.utterances;
+      updateRangeInputs(message.utterances);
+      refreshVisiblePlaybackHighlights();
+    } catch (error) {
+      status = error instanceof Error ? error.message : String(error);
+    }
   }
 
   function loadOlderHistory() {
@@ -253,13 +242,7 @@
     }
     clearHistoryPlaybackState(true);
     rowHighlighter.mark(utterance);
-    send(socket, {
-      type: 'play_utterance',
-      channels: [utterance.channel],
-      fromMillis: utterance.startMillis,
-      toMillis: utterance.endMillis,
-      realtime: false
-    });
+    void playHistoryUtterances([utterance], [utterance.channel], utterance.startMillis, false);
   }
 
   function toggleUtterancePlayback(utterance: Utterance) {
@@ -278,30 +261,24 @@
       return;
     }
     clearHistoryPlaybackState(true);
-    send(socket, {
-      type: 'play_history',
-      channels: selected.size ? [...selected] : channelList.map(channel => channel.name),
-      fromMillis: utterance.startMillis,
-      toMillis: Date.now(),
-      realtime: realtimeGaps
-    });
+    const channels = [...selected];
+    void fetchHistoryIndex(channels, utterance.startMillis, Date.now())
+      .then(utterances => playHistoryUtterances(utterances, channels, utterance.startMillis, realtimeGaps))
+      .catch(error => status = error instanceof Error ? error.message : String(error));
   }
 
   function downloadUtterance(utterance: Utterance) {
-    send(socket, {
-      type: 'download_utterance',
-      channels: [utterance.channel],
-      fromMillis: utterance.startMillis,
-      toMillis: utterance.endMillis
-    });
+    void downloadHistoryUtterance(utterance);
   }
 
   function stopHistory() {
     clearHistoryPlaybackState(true);
-    send(socket, { type: 'stop_history' });
+    status = 'Historical playback stopped';
   }
 
   function clearHistoryPlaybackState(flushAudio: boolean) {
+    historyAbort?.abort();
+    historyAbort = null;
     if (flushAudio) {
       audio.flushPrefix('history:');
     }
@@ -309,19 +286,6 @@
     replayingLast = new Set();
     scheduledHistoryFrames = [];
     rowHighlighter.clear();
-  }
-
-  function finishPlayback(playbackId: number) {
-    completePlayback(historyPlayback.serverDone(playbackId));
-  }
-
-  async function finishDownload(downloadId: number) {
-    try {
-      const filename = await downloads.finish(downloadId);
-      if (filename) status = `Downloaded ${filename}`;
-    } catch (error) {
-      status = error instanceof Error ? error.message : String(error);
-    }
   }
 
   function handleStreamIdle(streamKey: string) {
@@ -336,6 +300,57 @@
     scheduledHistoryFrames = [];
     rowHighlighter.clear();
     status = 'Historical playback finished';
+  }
+
+  async function playHistoryUtterances(utterances: Utterance[], channels: string[], originMillis: number, realtime: boolean) {
+    const playbackId = nextPlaybackId++;
+    const abort = new AbortController();
+    historyAbort = abort;
+    historyPlayback.start(playbackId, channels, {
+      realtime,
+      originMillis,
+      originAudioTime: audio.audioTime(0.15)
+    });
+    status = `Fetching ${utterances.length} historical recordings...`;
+    try {
+      const packets = (await Promise.all(utterances.map(utterance =>
+        fetchUtterancePackets(utterance, `history:${playbackId}:${utterance.channel}`, abort.signal)
+      ))).flat().sort((a, b) => a.unixMillis - b.unixMillis || a.channelName.localeCompare(b.channelName));
+      for (const packet of packets) {
+        if (abort.signal.aborted) break;
+        historyPlayback.trackPacket(packet);
+        audio.enqueue(packet, playbackModeFor(packet.streamKey));
+      }
+      completePlayback(historyPlayback.serverDone(playbackId));
+      status = `Queued ${packets.length} historical packets`;
+    } catch (error) {
+      if (!abort.signal.aborted) {
+        status = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      if (historyAbort === abort) {
+        historyAbort = null;
+      }
+    }
+  }
+
+  async function downloadHistoryUtterance(utterance: Utterance) {
+    try {
+      status = `Preparing ${utterance.channel}-${utterance.startMillis}.wav...`;
+      const packets = await fetchUtterancePackets(utterance, `download:${utterance.channel}`);
+      const wav = await opusPacketsToWav(packets);
+      const url = URL.createObjectURL(wav);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${utterance.channel}-${utterance.startMillis}.wav`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30_000);
+      status = `Downloaded ${link.download}`;
+    } catch (error) {
+      status = error instanceof Error ? error.message : String(error);
+    }
   }
 
   function handleFrameScheduled(streamKey: string, targetMillis: number, startTime: number, durationSeconds: number) {
@@ -504,7 +519,7 @@
     <h2>Historical Playback</h2>
     <div class="filter-chips">
       {#if selected.size === 0}
-        <span class="filter-empty">History filter: all channels</span>
+        <span class="filter-empty">Select a channel to show history</span>
       {:else}
         {#each [...selected].sort() as name}
           <button type="button" class="filter-chip" aria-label={`Remove ${name} from history filter`}

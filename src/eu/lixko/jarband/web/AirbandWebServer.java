@@ -3,17 +3,18 @@ package eu.lixko.jarband.web;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.Map;
+import java.util.stream.Stream;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import eu.lixko.jarband.recording.EncodedOpusFrame;
 import io.undertow.Handlers;
 import io.undertow.Undertow;
 import io.undertow.server.HttpHandler;
@@ -32,28 +33,21 @@ public final class AirbandWebServer implements AutoCloseable {
     private static final Pattern TYPE = Pattern.compile("\"type\"\\s*:\\s*\"([^\"]+)\"");
     private static final Pattern CHANNELS = Pattern.compile("\"channels\"\\s*:\\s*\\[(.*?)]", Pattern.DOTALL);
     private static final Pattern STRING = Pattern.compile("\"((?:[^\"\\\\]|\\\\.)*)\"");
-    private static final Pattern FROM = Pattern.compile("\"fromMillis\"\\s*:\\s*(\\d+)");
-    private static final Pattern TO = Pattern.compile("\"toMillis\"\\s*:\\s*(\\d+)");
-    private static final Pattern BEFORE = Pattern.compile("\"beforeMillis\"\\s*:\\s*(\\d+)");
-    private static final Pattern PAGE = Pattern.compile("\"page\"\\s*:\\s*(\\d+)");
-    private static final Pattern PAGE_SIZE = Pattern.compile("\"pageSize\"\\s*:\\s*(\\d+)");
-    private static final Pattern LIMIT = Pattern.compile("\"limit\"\\s*:\\s*(\\d+)");
-    private static final Pattern REALTIME = Pattern.compile("\"realtime\"\\s*:\\s*true");
 
     private final Undertow undertow;
     private final LiveAudioHub hub;
     private final HistoricalRecordings history;
-    private final AtomicLong playbackIds = new AtomicLong();
-    private final ExecutorService historyExecutor = Executors.newCachedThreadPool(r -> {
-        Thread thread = new Thread(r, "jarband-web-history");
-        thread.setDaemon(true);
-        return thread;
-    });
+    private final Path outputDir;
     private final int recentChannelLimit;
+    private final int opusSampleRateHz;
+    private final int opusFrameMillis;
 
     public AirbandWebServer(String host, int port, int recentChannelLimit, Path outputDir,
                             LiveAudioHub hub, int opusSampleRateHz, int opusFrameMillis) {
         this.hub = hub;
+        this.outputDir = outputDir;
+        this.opusSampleRateHz = opusSampleRateHz;
+        this.opusFrameMillis = opusFrameMillis;
         this.history = new HistoricalRecordings(outputDir, hub, opusSampleRateHz, opusFrameMillis);
         try {
             int seeded = history.seedLastActivityFromDbEnds();
@@ -66,6 +60,8 @@ public final class AirbandWebServer implements AutoCloseable {
         this.recentChannelLimit = recentChannelLimit;
         HttpHandler routes = Handlers.path()
                 .addExactPath("/airband/ws", Handlers.websocket(new Callback()))
+                .addExactPath("/airband/api/recording-files", this::recordingFilesResource)
+                .addPrefixPath("/airband/recordings", this::recordingResource)
                 .addPrefixPath("/airband", this::staticResource)
                 .addExactPath("/", exchange -> redirect(exchange, "/airband/"));
         this.undertow = Undertow.builder()
@@ -91,6 +87,108 @@ public final class AirbandWebServer implements AutoCloseable {
         writeResource(exchange, "airband" + path, contentType(path));
     }
 
+    private void recordingFilesResource(HttpServerExchange exchange) throws IOException {
+        List<String> channelNames = queryChannels(exchange.getQueryParameters());
+        StringBuilder json = new StringBuilder(4096);
+        json.append("{\"files\":[");
+        int count = 0;
+        for (String channel : channelNames.isEmpty() ? allChannelNames() : channelNames) {
+            Path channelDir = outputDir.resolve(channel);
+            if (!Files.isDirectory(channelDir)) {
+                continue;
+            }
+            try (Stream<Path> files = Files.list(channelDir)) {
+                for (Path db : files
+                        .filter(path -> path.getFileName().toString().endsWith(".udb"))
+                        .sorted((a, b) -> b.getFileName().toString().compareTo(a.getFileName().toString()))
+                        .toList()) {
+                    String base = db.getFileName().toString().replaceFirst("\\.udb$", "");
+                    Path opus = channelDir.resolve(base + ".opus");
+                    if (!Files.isRegularFile(opus)) {
+                        continue;
+                    }
+                    if (count++ > 0) json.append(',');
+                    json.append('{')
+                            .append("\"channel\":\"").append(LiveAudioHub.escape(channel)).append("\",")
+                            .append("\"dbUrl\":\"/airband/recordings/").append(LiveAudioHub.escape(channel))
+                            .append('/').append(LiveAudioHub.escape(db.getFileName().toString())).append("\",")
+                            .append("\"opusUrl\":\"/airband/recordings/").append(LiveAudioHub.escape(channel))
+                            .append('/').append(LiveAudioHub.escape(opus.getFileName().toString())).append("\",")
+                            .append("\"dbSize\":").append(Files.size(db)).append(',')
+                            .append("\"opusSize\":").append(Files.size(opus)).append(',')
+                            .append("\"sampleRate\":").append(opusSampleRateHz).append(',')
+                            .append("\"frameMillis\":").append(opusFrameMillis)
+                            .append('}');
+                }
+            }
+        }
+        json.append("]}");
+        writeJson(exchange, json.toString());
+    }
+
+    private void recordingResource(HttpServerExchange exchange) throws IOException {
+        String relative = exchange.getRelativePath();
+        if (relative.startsWith("/")) {
+            relative = relative.substring(1);
+        }
+        if (relative.isBlank() || relative.contains("..")) {
+            exchange.setStatusCode(StatusCodes.NOT_FOUND);
+            return;
+        }
+        Path file = outputDir.resolve(relative).normalize();
+        if (!file.startsWith(outputDir.normalize()) || !Files.isRegularFile(file)) {
+            exchange.setStatusCode(StatusCodes.NOT_FOUND);
+            return;
+        }
+
+        long size = Files.size(file);
+        long start = 0;
+        long end = size - 1;
+        boolean partial = false;
+        String range = exchange.getRequestHeaders().getFirst(Headers.RANGE);
+        if (range != null && range.startsWith("bytes=")) {
+            String spec = range.substring("bytes=".length());
+            int dash = spec.indexOf('-');
+            if (dash >= 0) {
+                String startText = spec.substring(0, dash);
+                String endText = spec.substring(dash + 1);
+                if (startText.isBlank() && !endText.isBlank()) {
+                    long suffixLength = Long.parseLong(endText);
+                    start = Math.max(0, size - suffixLength);
+                    end = size - 1;
+                } else {
+                    if (!startText.isBlank()) start = Long.parseLong(startText);
+                    if (!endText.isBlank()) end = Long.parseLong(endText);
+                }
+                partial = true;
+            }
+        }
+        if (size == 0 || start < 0 || end < start || start >= size) {
+            exchange.setStatusCode(StatusCodes.REQUEST_RANGE_NOT_SATISFIABLE);
+            exchange.getResponseHeaders().put(Headers.CONTENT_RANGE, "bytes */" + size);
+            return;
+        }
+        end = Math.min(end, size - 1);
+        int length = Math.toIntExact(end - start + 1);
+        ByteBuffer bytes = ByteBuffer.allocate(length);
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ)) {
+            channel.position(start);
+            while (bytes.hasRemaining() && channel.read(bytes) >= 0) {
+                // Copy the requested byte range.
+            }
+        }
+        bytes.flip();
+        exchange.setStatusCode(partial ? StatusCodes.PARTIAL_CONTENT : StatusCodes.OK);
+        exchange.getResponseHeaders().put(Headers.ACCEPT_RANGES, "bytes");
+        exchange.getResponseHeaders().put(Headers.CONTENT_TYPE, contentType(file.getFileName().toString()));
+        exchange.getResponseHeaders().put(Headers.CONTENT_LENGTH, Long.toString(length));
+        if (partial) {
+            exchange.getResponseHeaders().put(Headers.CONTENT_RANGE,
+                    "bytes " + start + "-" + end + "/" + size);
+        }
+        exchange.getResponseSender().send(bytes);
+    }
+
     private static void redirect(HttpServerExchange exchange, String location) {
         exchange.setStatusCode(StatusCodes.FOUND);
         exchange.getResponseHeaders().put(Headers.LOCATION, location);
@@ -108,10 +206,17 @@ public final class AirbandWebServer implements AutoCloseable {
         }
     }
 
+    private static void writeJson(HttpServerExchange exchange, String json) {
+        exchange.getResponseHeaders().put(Headers.CONTENT_TYPE, "application/json; charset=utf-8");
+        exchange.getResponseSender().send(json);
+    }
+
     private static String contentType(String path) {
         if (path.endsWith(".js")) return "text/javascript; charset=utf-8";
         if (path.endsWith(".css")) return "text/css; charset=utf-8";
         if (path.endsWith(".html")) return "text/html; charset=utf-8";
+        if (path.endsWith(".opus")) return "audio/ogg; codecs=opus";
+        if (path.endsWith(".udb")) return "application/octet-stream";
         if (path.endsWith(".svg")) return "image/svg+xml";
         if (path.endsWith(".wasm")) return "application/wasm";
         return "application/octet-stream";
@@ -119,7 +224,6 @@ public final class AirbandWebServer implements AutoCloseable {
 
     @Override
     public void close() {
-        historyExecutor.shutdownNow();
         undertow.stop();
     }
 
@@ -128,10 +232,7 @@ public final class AirbandWebServer implements AutoCloseable {
         public void onConnect(WebSocketHttpExchange exchange, WebSocketChannel channel) {
             LiveAudioHub.Client client = hub.register(channel);
             channel.getReceiveSetter().set(new Receiver(client));
-            channel.addCloseTask(ch -> {
-                client.stopPlaybacks();
-                hub.unregister(client);
-            });
+            channel.addCloseTask(ch -> hub.unregister(client));
             channel.resumeReceives();
             sendText(channel, hub.channelListJson(recentChannelLimit));
         }
@@ -151,13 +252,11 @@ public final class AirbandWebServer implements AutoCloseable {
 
         @Override
         protected void onError(WebSocketChannel channel, Throwable error) {
-            stopPlayback(client);
             hub.unregister(client);
         }
 
         @Override
         protected void onClose(WebSocketChannel webSocketChannel, StreamSourceFrameChannel channel) {
-            stopPlayback(client);
             hub.unregister(client);
         }
 
@@ -174,162 +273,10 @@ public final class AirbandWebServer implements AutoCloseable {
                         client.unsubscribe(channels(json));
                         sendText(channel, "{\"type\":\"unsubscribed\"}");
                     }
-                    case "history_index" -> sendText(channel,
-                            history.indexJson(channels(json), millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE)));
-                    case "recent_history" -> sendText(channel,
-                            history.recentJson(channels(json),
-                                    millis(json, BEFORE, Long.MAX_VALUE),
-                                    (int) millis(json, LIMIT, millis(json, PAGE_SIZE, 20))));
-                    case "play_history" -> playHistory(client, channels(json),
-                            millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE), true, realtime(json));
-                    case "play_utterance" -> playHistory(client, channels(json),
-                            millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE), false, realtime(json));
-                    case "play_last_utterance" -> playLastUtterance(client, channels(json));
-                    case "download_utterance" -> downloadUtterance(client, channels(json),
-                            millis(json, FROM, 0), millis(json, TO, Long.MAX_VALUE));
-                    case "stop_history" -> {
-                        stopPlayback(client);
-                        sendText(channel, "{\"type\":\"history_stopped\"}");
-                    }
                     default -> error(channel, "Unknown command");
                 }
             } catch (Exception e) {
                 error(channel, e.getMessage());
-            }
-        }
-    }
-
-    private void playLastUtterance(LiveAudioHub.Client client, List<String> channels) throws IOException {
-        if (channels.isEmpty()) {
-            return;
-        }
-        String name = channels.getFirst();
-        long[] range = history.latestUtteranceMillis(name);
-        if (range == null) {
-            error(client.channel(), "No recording for " + name);
-            return;
-        }
-        playHistory(client, List.of(name), range[0], range[1], false, false);
-    }
-
-    private void downloadUtterance(LiveAudioHub.Client client, List<String> channels,
-                                   long fromMillis, long toMillis) {
-        if (channels.isEmpty()) {
-            return;
-        }
-        DownloadTask task = new DownloadTask(client, channels.getFirst(), fromMillis, toMillis,
-                playbackIds.incrementAndGet());
-        historyExecutor.execute(task);
-    }
-
-    private void playHistory(LiveAudioHub.Client client, List<String> channels, long fromMillis, long toMillis,
-                             boolean replaceExisting, boolean realtime) {
-        if (replaceExisting) {
-            stopPlayback(client);
-        }
-        HistoryTask task = new HistoryTask(client, channels, fromMillis, toMillis, playbackIds.incrementAndGet(),
-                realtime);
-        client.addPlayback(task);
-        historyExecutor.execute(task);
-    }
-
-    private void stopPlayback(LiveAudioHub.Client client) {
-        client.stopPlaybacks();
-    }
-
-    private final class HistoryTask implements Runnable, LiveAudioHub.HistoryPlayback {
-        private final LiveAudioHub.Client client;
-        private final List<String> channels;
-        private final long fromMillis;
-        private final long toMillis;
-        private final long playbackId;
-        private final boolean realtime;
-        private volatile boolean stopped;
-
-        HistoryTask(LiveAudioHub.Client client, List<String> channels, long fromMillis, long toMillis,
-                    long playbackId, boolean realtime) {
-            this.client = client;
-            this.channels = List.copyOf(channels);
-            this.fromMillis = fromMillis;
-            this.toMillis = toMillis;
-            this.playbackId = playbackId;
-            this.realtime = realtime;
-        }
-
-        @Override
-        public void run() {
-            try {
-                List<EncodedOpusFrame> frames = history.packets(channels, fromMillis, toMillis);
-                sendText(client.channel(), "{\"type\":\"history_started\",\"frames\":" + frames.size()
-                        + ",\"fromMillis\":" + fromMillis
-                        + ",\"toMillis\":" + toMillis
-                        + ",\"playbackId\":" + playbackId
-                        + ",\"realtime\":" + realtime
-                        + ",\"channels\":" + channelsJson(channels) + "}");
-                for (EncodedOpusFrame frame : frames) {
-                    if (stopped || !client.channel().isOpen()) {
-                        break;
-                    }
-                    WebSockets.sendBinary(LiveAudioHub.packetMessage(
-                            frame.withStreamKey("history:" + playbackId + ":" + frame.channelName())),
-                            client.channel(), null);
-                }
-                if (!stopped && client.channel().isOpen()) {
-                    sendText(client.channel(), "{\"type\":\"history_finished\",\"playbackId\":" + playbackId + "}");
-                }
-            } catch (Exception e) {
-                if (client.channel().isOpen()) {
-                    error(client.channel(), e.getMessage());
-                }
-            } finally {
-                client.removePlayback(this);
-            }
-        }
-
-        @Override
-        public void stop() {
-            stopped = true;
-        }
-    }
-
-    private final class DownloadTask implements Runnable {
-        private final LiveAudioHub.Client client;
-        private final String channel;
-        private final long fromMillis;
-        private final long toMillis;
-        private final long downloadId;
-
-        DownloadTask(LiveAudioHub.Client client, String channel, long fromMillis, long toMillis, long downloadId) {
-            this.client = client;
-            this.channel = channel;
-            this.fromMillis = fromMillis;
-            this.toMillis = toMillis;
-            this.downloadId = downloadId;
-        }
-
-        @Override
-        public void run() {
-            try {
-                List<EncodedOpusFrame> frames = history.packets(List.of(channel), fromMillis, toMillis);
-                String filename = channel + "-" + fromMillis + ".wav";
-                sendText(client.channel(), "{\"type\":\"download_started\",\"downloadId\":" + downloadId
-                        + ",\"frames\":" + frames.size()
-                        + ",\"filename\":\"" + LiveAudioHub.escape(filename) + "\"}");
-                for (EncodedOpusFrame frame : frames) {
-                    if (!client.channel().isOpen()) {
-                        break;
-                    }
-                    WebSockets.sendBinary(LiveAudioHub.packetMessage(
-                            frame.withStreamKey("download:" + downloadId + ":" + frame.channelName())),
-                            client.channel(), null);
-                }
-                if (client.channel().isOpen()) {
-                    sendText(client.channel(), "{\"type\":\"download_finished\",\"downloadId\":" + downloadId + "}");
-                }
-            } catch (Exception e) {
-                if (client.channel().isOpen()) {
-                    error(client.channel(), e.getMessage());
-                }
             }
         }
     }
@@ -352,22 +299,17 @@ public final class AirbandWebServer implements AutoCloseable {
         return channels;
     }
 
-    private static long millis(String json, Pattern pattern, long fallback) {
-        Matcher matcher = pattern.matcher(json);
-        return matcher.find() ? Long.parseLong(matcher.group(1)) : fallback;
+    private static List<String> queryChannels(Map<String, Deque<String>> query) {
+        Deque<String> values = query.get("channel");
+        return values == null ? List.of() : List.copyOf(values);
     }
 
-    private static boolean realtime(String json) {
-        return REALTIME.matcher(json).find();
-    }
-
-    private static String channelsJson(List<String> channels) {
-        StringBuilder json = new StringBuilder("[");
-        for (int i = 0; i < channels.size(); i++) {
-            if (i > 0) json.append(',');
-            json.append('"').append(LiveAudioHub.escape(channels.get(i))).append('"');
+    private List<String> allChannelNames() {
+        var names = new ArrayList<String>();
+        for (var channel : hub.channels()) {
+            names.add(channel.name());
         }
-        return json.append(']').toString();
+        return names;
     }
 
     private static String unescape(String input) {

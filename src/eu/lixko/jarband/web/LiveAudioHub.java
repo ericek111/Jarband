@@ -201,7 +201,6 @@ public final class LiveAudioHub implements OpusFrameSink {
         private final WebSocketChannel channel;
         private final Set<Integer> subscriptions = new HashSet<>();
         private final ConcurrentHashMap<Integer, Batch> batches = new ConcurrentHashMap<>();
-        private final CopyOnWriteArraySet<HistoryPlayback> playbacks = new CopyOnWriteArraySet<>();
 
         private Client(WebSocketChannel channel) {
             this.channel = channel;
@@ -270,24 +269,6 @@ public final class LiveAudioHub implements OpusFrameSink {
             return channel;
         }
 
-        public void addPlayback(HistoryPlayback playback) {
-            playbacks.add(playback);
-        }
-
-        public void removePlayback(HistoryPlayback playback) {
-            playbacks.remove(playback);
-        }
-
-        public void stopPlaybacks() {
-            for (HistoryPlayback playback : playbacks) {
-                playback.stop();
-            }
-            playbacks.clear();
-        }
-    }
-
-    public interface HistoryPlayback {
-        void stop();
     }
 
     private static ByteBuffer batchMessage(List<EncodedOpusFrame> frames) {

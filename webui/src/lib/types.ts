@@ -8,31 +8,21 @@ export type Channel = {
 
 export type Utterance = {
   channel: string;
-  frequencyHz: number;
   startMillis: number;
   endMillis: number;
   durationMillis?: number;
   averageSnrDb?: number;
+  opusUrl?: string;
+  startOffset?: number;
+  endOffset?: number;
+  sampleRate?: number;
+  frameMillis?: number;
 };
 
 export type ServerMessage =
   | { type: 'channels'; channels: Channel[]; recent: Channel[] }
   | { type: 'activity'; channel: Channel }
   | { type: 'utterance_closed'; utterance: Utterance }
-  | {
-      type: 'recent_history';
-      beforeMillis: number;
-      limit: number;
-      newestMillis: number;
-      oldestMillis: number;
-      hasOlder: boolean;
-      utterances: Utterance[];
-    }
-  | { type: 'history_started'; frames: number; fromMillis: number; toMillis: number; playbackId: number; realtime: boolean; channels: string[] }
-  | { type: 'history_finished'; playbackId: number }
-  | { type: 'history_stopped' }
-  | { type: 'download_started'; downloadId: number; frames: number; filename: string }
-  | { type: 'download_finished'; downloadId: number }
   | { type: 'subscribed' | 'unsubscribed' }
   | { type: 'error'; message: string };
 
