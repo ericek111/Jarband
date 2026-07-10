@@ -12,6 +12,13 @@
   const historyPageSize = 20;
   const recentWindowMillis = 180_000;
 
+  type ScheduledHistoryFrame = {
+    channel: string;
+    targetMillis: number;
+    startAtMillis: number;
+    endAtMillis: number;
+  };
+
   let socket: WebSocket | null = null;
   let status = 'Connecting...';
   const channelsById = new SvelteMap<number, Channel>();
@@ -33,6 +40,7 @@
   const downloads = new DownloadManager();
   const historyPlayback = new HistoryPlaybackTracker();
   const rowHighlighter = new RowPlaybackHighlighter(rows => playingRows = rows);
+  let scheduledHistoryFrames: ScheduledHistoryFrame[] = [];
   let playingRows = new Set<string>();
   let replayingLast = new Set<string>();
   let tickTimer: ReturnType<typeof setInterval>;
@@ -79,6 +87,7 @@
         historyHasOlder = message.hasOlder;
         recentHistory = message.utterances;
         updateRangeInputs(message.utterances);
+        refreshVisiblePlaybackHighlights();
         break;
       case 'history_started': {
         historyPlayback.start(message.playbackId, message.channels, {
@@ -298,6 +307,7 @@
     }
     historyPlayback.clear();
     replayingLast = new Set();
+    scheduledHistoryFrames = [];
     rowHighlighter.clear();
   }
 
@@ -323,19 +333,46 @@
     const next = new Set(replayingLast);
     for (const channel of completed.channels) next.delete(channel);
     replayingLast = next;
+    scheduledHistoryFrames = [];
     rowHighlighter.clear();
     status = 'Historical playback finished';
   }
 
   function handleFrameScheduled(streamKey: string, targetMillis: number, startTime: number, durationSeconds: number) {
     if (!streamKey.startsWith('history:')) return;
+    const delayMillis = Math.max(0, (startTime - audio.currentTime()) * 1000);
+    const startAtMillis = performance.now() + delayMillis;
+    const endAtMillis = startAtMillis + durationSeconds * 1000 + 150;
+    scheduledHistoryFrames = [
+      ...scheduledHistoryFrames.filter(frame => frame.endAtMillis > performance.now()),
+      {
+        channel: historyPlayback.channelFromStreamKey(streamKey),
+        targetMillis,
+        startAtMillis,
+        endAtMillis
+      }
+    ];
     const utterance = recentHistory.find(item =>
       item.channel === historyPlayback.channelFromStreamKey(streamKey)
         && targetMillis >= item.startMillis
         && targetMillis <= item.endMillis);
     if (!utterance) return;
-    const delayMillis = Math.max(0, (startTime - audio.currentTime()) * 1000);
     rowHighlighter.mark(utterance, delayMillis, durationSeconds * 1000 + 150);
+  }
+
+  function refreshVisiblePlaybackHighlights() {
+    const nowMillis = performance.now();
+    scheduledHistoryFrames = scheduledHistoryFrames.filter(frame => frame.endAtMillis > nowMillis);
+    for (const utterance of recentHistory) {
+      const frame = scheduledHistoryFrames.find(item =>
+        item.channel === utterance.channel
+          && item.targetMillis >= utterance.startMillis
+          && item.targetMillis <= utterance.endMillis);
+      if (!frame) continue;
+      rowHighlighter.mark(utterance,
+        Math.max(0, frame.startAtMillis - nowMillis),
+        Math.max(250, frame.endAtMillis - Math.max(nowMillis, frame.startAtMillis)));
+    }
   }
 
   function updateRangeInputs(utterances: Utterance[]) {
