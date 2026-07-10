@@ -41,4 +41,5 @@ export type PlaybackMode = {
   realtime: boolean;
   originMillis: number;
   originAudioTime: number;
+  speed: number;
 };

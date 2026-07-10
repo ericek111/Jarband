@@ -137,11 +137,14 @@ export class AudioEngine {
 
     const targetMillis = frame.timestamp / 1000;
     const durationSeconds = frame.duration ? frame.duration / 1_000_000 : audio.duration;
+    const speed = playbackMode?.speed ?? 1;
+    source.playbackRate.value = speed;
+    const playedDurationSeconds = durationSeconds / speed;
     const startTime = playbackMode?.realtime
-      ? playbackMode.originAudioTime + (targetMillis - playbackMode.originMillis) / 1000
-      : this.liveStartTime(streamKey, targetMillis, durationSeconds);
+      ? playbackMode.originAudioTime + (targetMillis - playbackMode.originMillis) / (1000 * speed)
+      : this.liveStartTime(streamKey, targetMillis, playedDurationSeconds);
     const scheduledTime = Math.max(this.context.currentTime, startTime);
-    this.onFrameScheduled?.(streamKey, targetMillis, scheduledTime, durationSeconds);
+    this.onFrameScheduled?.(streamKey, targetMillis, scheduledTime, playedDurationSeconds);
     source.start(scheduledTime);
     frame.close();
   }

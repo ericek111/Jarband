@@ -16,6 +16,10 @@
   const minTimelineWindowMillis = 60 * 1000;
   const maxTimelineWindowMillis = 31 * 24 * 60 * 60 * 1000;
   const waveformWindowMillis = 24 * 60 * 60 * 1000;
+  const timelineZoomStep = 1.6;
+  const historySkipMillis = 5_000;
+  const minTimelineSnrDb = 35;
+  const maxTimelineSnrDb = 50;
 
   type ScheduledHistoryFrame = {
     channel: string;
@@ -41,6 +45,11 @@
   let timelineLoading = false;
   let playheadMillis = 0;
   let seekingTimeline = false;
+  let historyPlaying = false;
+  let historyPaused = false;
+  let playbackSpeed = 1;
+  let playbackClockOriginMillis = 0;
+  let playbackClockStartedAt = 0;
   let timelineLoadTimer: ReturnType<typeof setTimeout> | null = null;
   let historyWindowRequestId = 0;
   let now = Date.now();
@@ -71,7 +80,10 @@
     audio.onScheduled(handleFrameScheduled);
     audio.onIdle(handleStreamIdle);
     socket = connectSocket(handleMessage, handlePacket, next => status = next);
-    tickTimer = setInterval(() => now = Date.now(), 1000);
+    tickTimer = setInterval(() => {
+      now = Date.now();
+      updateTimelinePlaybackClock();
+    }, 100);
     return () => {
       socket?.close();
       clearInterval(tickTimer);
@@ -326,8 +338,16 @@
     const element = event.currentTarget as HTMLElement;
     const rect = element.getBoundingClientRect();
     const ratio = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+    zoomTimelineAt(ratio, event.deltaY > 0 ? timelineZoomStep : 1 / timelineZoomStep, 120);
+  }
+
+  function zoomTimelineButton(direction: 'in' | 'out') {
+    if (selected.size === 0 || timelineToMillis <= timelineFromMillis) return;
+    zoomTimelineAt(0.5, direction === 'out' ? timelineZoomStep : 1 / timelineZoomStep);
+  }
+
+  function zoomTimelineAt(ratio: number, zoomFactor: number, loadDelayMillis = 0) {
     const anchor = timelineFromMillis + timelineSpanMillis * ratio;
-    const zoomFactor = event.deltaY > 0 ? 1.35 : 1 / 1.35;
     const nextSpan = clamp(timelineSpanMillis * zoomFactor, minTimelineWindowMillis, maxTimelineWindowMillis);
     let nextFrom = anchor - nextSpan * ratio;
     let nextTo = nextFrom + nextSpan;
@@ -336,7 +356,7 @@
       nextTo = latestTo;
       nextFrom = latestTo - nextSpan;
     }
-    setHistoryWindow(nextFrom, nextTo, 120);
+    setHistoryWindow(nextFrom, nextTo, loadDelayMillis);
   }
 
   function beginTimelineSeek(event: PointerEvent) {
@@ -361,7 +381,11 @@
     seekingTimeline = false;
     const targetMillis = millisFromTimelineEvent(event, element);
     playheadMillis = targetMillis;
-    seekHistoryTo(targetMillis);
+    if (historyPlaying) {
+      seekHistoryTo(targetMillis);
+    } else {
+      historyPaused = true;
+    }
   }
 
   function seekHistoryTo(targetMillis: number) {
@@ -372,17 +396,48 @@
       return;
     }
     clearHistoryPlaybackState(true);
-    playheadMillis = targetMillis;
+    const boundedTargetMillis = clamp(targetMillis, timelineFromMillis, timelineToMillis);
+    playheadMillis = boundedTargetMillis;
     const channels = [...selected];
-    void fetchHistoryIndex(channels, targetMillis, timelineToMillis)
+    void fetchHistoryIndex(channels, boundedTargetMillis, timelineToMillis)
       .then(utterances => {
         if (!utterances.length) {
           status = 'No recordings after seek point in this window';
+          historyPaused = true;
           return;
         }
-        return playHistoryUtterances(utterances, channels, targetMillis, realtimeGaps);
+        return playHistoryUtterances(utterances, channels, boundedTargetMillis, realtimeGaps);
       })
       .catch(error => status = error instanceof Error ? error.message : String(error));
+  }
+
+  function toggleTimelinePlayback() {
+    if (historyPlaying) {
+      pauseTimelinePlayback();
+      return;
+    }
+    seekHistoryTo(playheadMillis || timelineFromMillis);
+  }
+
+  function pauseTimelinePlayback() {
+    playheadMillis = currentTimelinePlayhead();
+    clearHistoryPlaybackState(true);
+    historyPaused = true;
+    status = 'Historical playback paused';
+  }
+
+  function skipTimeline(deltaMillis: number) {
+    const targetMillis = clamp(currentTimelinePlayhead() + deltaMillis, timelineFromMillis, timelineToMillis);
+    playheadMillis = targetMillis;
+    if (historyPlaying) {
+      seekHistoryTo(targetMillis);
+    }
+  }
+
+  function changePlaybackSpeed() {
+    if (historyPlaying) {
+      seekHistoryTo(currentTimelinePlayhead());
+    }
   }
 
   function downloadUtterance(utterance: Utterance) {
@@ -391,10 +446,12 @@
 
   function stopHistory() {
     clearHistoryPlaybackState(true);
+    historyPaused = false;
     status = 'Historical playback stopped';
   }
 
   function clearHistoryPlaybackState(flushAudio: boolean) {
+    const keepPlayheadMillis = currentTimelinePlayhead();
     historyAbort?.abort();
     historyAbort = null;
     if (flushAudio) {
@@ -404,6 +461,12 @@
     replayingLast = new Set();
     scheduledHistoryFrames = [];
     rowHighlighter.clear();
+    historyPlaying = false;
+    playbackClockOriginMillis = 0;
+    playbackClockStartedAt = 0;
+    if (flushAudio && keepPlayheadMillis > 0) {
+      playheadMillis = keepPlayheadMillis;
+    }
   }
 
   function handleStreamIdle(streamKey: string) {
@@ -417,6 +480,10 @@
     replayingLast = next;
     scheduledHistoryFrames = [];
     rowHighlighter.clear();
+    historyPlaying = false;
+    historyPaused = false;
+    playbackClockOriginMillis = 0;
+    playbackClockStartedAt = 0;
     status = 'Historical playback finished';
   }
 
@@ -427,13 +494,21 @@
     historyPlayback.start(playbackId, channels, {
       realtime,
       originMillis,
-      originAudioTime: audio.audioTime(0.15)
+      originAudioTime: audio.audioTime(0.15),
+      speed: playbackSpeed
     });
+    historyPlaying = true;
+    historyPaused = false;
+    playbackClockOriginMillis = originMillis;
+    playbackClockStartedAt = performance.now();
+    playheadMillis = originMillis;
     status = `Fetching ${utterances.length} historical recordings...`;
     try {
       const packets = (await Promise.all(utterances.map(utterance =>
         fetchUtterancePackets(utterance, `history:${playbackId}:${utterance.channel}`, abort.signal)
-      ))).flat().sort((a, b) => a.unixMillis - b.unixMillis || a.channelName.localeCompare(b.channelName));
+      ))).flat()
+        .filter(packet => packet.unixMillis + packet.durationMillis >= originMillis)
+        .sort((a, b) => a.unixMillis - b.unixMillis || a.channelName.localeCompare(b.channelName));
       for (const packet of packets) {
         if (abort.signal.aborted) break;
         historyPlayback.trackPacket(packet);
@@ -473,7 +548,6 @@
 
   function handleFrameScheduled(streamKey: string, targetMillis: number, startTime: number, durationSeconds: number) {
     if (!streamKey.startsWith('history:')) return;
-    playheadMillis = clamp(targetMillis, timelineFromMillis, timelineToMillis);
     const delayMillis = Math.max(0, (startTime - audio.currentTime()) * 1000);
     const startAtMillis = performance.now() + delayMillis;
     const endAtMillis = startAtMillis + durationSeconds * 1000 + 150;
@@ -507,6 +581,26 @@
         Math.max(0, frame.startAtMillis - nowMillis),
         Math.max(250, frame.endAtMillis - Math.max(nowMillis, frame.startAtMillis)));
     }
+  }
+
+  function updateTimelinePlaybackClock() {
+    if (seekingTimeline || !historyPlaying) return;
+    playheadMillis = currentTimelinePlayhead();
+  }
+
+  function currentTimelinePlayhead() {
+    const nowMillis = performance.now();
+    const activeFrame = scheduledHistoryFrames
+      .filter(frame => frame.startAtMillis <= nowMillis && frame.endAtMillis >= nowMillis)
+      .sort((a, b) => b.startAtMillis - a.startAtMillis)[0];
+    if (activeFrame) {
+      return clamp(activeFrame.targetMillis, timelineFromMillis, timelineToMillis);
+    }
+    if (historyPlaying && playbackClockOriginMillis > 0 && playbackClockStartedAt > 0) {
+      return clamp(playbackClockOriginMillis + (nowMillis - playbackClockStartedAt) * playbackSpeed,
+        timelineFromMillis, timelineToMillis);
+    }
+    return clamp(playheadMillis || timelineFromMillis, timelineFromMillis, timelineToMillis);
   }
 
   function appendLiveUtterance(utterance: Utterance) {
@@ -600,14 +694,18 @@
       .map(utterance => {
         const start = clamp(utterance.startMillis, fromMillis, toMillis);
         const end = clamp(Math.max(utterance.endMillis, utterance.startMillis + 100), fromMillis, toMillis);
-        const snrDb = Number.isFinite(utterance.averageSnrDb) ? utterance.averageSnrDb! : 10;
-        const height = clamp(18 + ((snrDb + 5) / 55) * 62, 18, 80);
+        const snrDb = Number.isFinite(utterance.averageSnrDb) ? utterance.averageSnrDb! : minTimelineSnrDb;
+        const snrRatio = (clamp(snrDb, minTimelineSnrDb, maxTimelineSnrDb) - minTimelineSnrDb)
+          / (maxTimelineSnrDb - minTimelineSnrDb);
+        const height = 18 + snrRatio * 70;
+        const color = channelTimelineColor(utterance.channel);
         return {
           key: utteranceKey(utterance),
           left: ((start - fromMillis) / span) * 100,
           width: Math.max(0.18, ((end - start) / span) * 100),
           top: 50 - height / 2,
           height,
+          color,
           label: `${utterance.channel} ${utcTime(utterance.startMillis)} ${duration(utterance)}s ${snr(utterance)}`
         };
       });
@@ -640,6 +738,15 @@
 
   function clamp(value: number, min: number, max: number) {
     return Math.min(max, Math.max(min, value));
+  }
+
+  function channelTimelineColor(channel: string) {
+    let hash = 0;
+    for (let i = 0; i < channel.length; i++) {
+      hash = ((hash << 5) - hash + channel.charCodeAt(i)) | 0;
+    }
+    const hue = ((hash % 360) + 360) % 360;
+    return `hsl(${hue} 76% 62%)`;
   }
 </script>
 
@@ -710,6 +817,34 @@
         <span>{historyRangeLabel()}</span>
         <span>{timelineLoading ? 'Loading...' : timelineSpanMillis <= waveformWindowMillis ? 'Waveform by utterance SNR' : 'Zoom in to show utterance blocks'}</span>
       </div>
+      <div class="timeline-controls">
+        <button type="button" class="icon-button" disabled={selected.size === 0}
+          aria-label={historyPlaying ? 'Pause historical playback' : 'Play historical playback'}
+          onclick={toggleTimelinePlayback}>
+          <span class="icon-symbol">{historyPlaying ? 'Ⅱ' : '▶'}</span>
+        </button>
+        <button type="button" class="icon-button" disabled={selected.size === 0}
+          aria-label="Skip back 5 seconds" onclick={() => skipTimeline(-historySkipMillis)}>
+          <span class="icon-symbol">↶</span>
+        </button>
+        <button type="button" class="icon-button" disabled={selected.size === 0}
+          aria-label="Skip forward 5 seconds" onclick={() => skipTimeline(historySkipMillis)}>
+          <span class="icon-symbol">↷</span>
+        </button>
+        <button type="button" class="icon-button" disabled={selected.size === 0}
+          aria-label="Zoom out" onclick={() => zoomTimelineButton('out')}>
+          <span class="icon-symbol">−</span>
+        </button>
+        <button type="button" class="icon-button" disabled={selected.size === 0}
+          aria-label="Zoom in" onclick={() => zoomTimelineButton('in')}>
+          <span class="icon-symbol">+</span>
+        </button>
+        <label class="speed-control">
+          <span>{playbackSpeed.toFixed(1)}×</span>
+          <input bind:value={playbackSpeed} type="range" min="0.5" max="4" step="0.1"
+            onchange={changePlaybackSpeed} />
+        </label>
+      </div>
       <div class="history-timeline" role="slider" aria-label="Historical playback seek bar"
         aria-valuemin={timelineFromMillis} aria-valuemax={timelineToMillis} aria-valuenow={playheadMillis}
         tabindex="0"
@@ -726,7 +861,7 @@
           {/each}
           {#each timelineBlocks as block (block.key)}
             <div class="timeline-block" title={block.label}
-              style={`left:${block.left}%;width:${block.width}%;top:${block.top}%;height:${block.height}%`}>
+              style={`left:${block.left}%;width:${block.width}%;top:${block.top}%;height:${block.height}%;--block-color:${block.color}`}>
             </div>
           {/each}
           <div class="timeline-playhead" style={`left:${playheadPercent}%`}></div>
