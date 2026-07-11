@@ -114,8 +114,6 @@ public final class AirbandWebServer implements AutoCloseable {
                             .append('/').append(LiveAudioHub.escape(db.getFileName().toString())).append("\",")
                             .append("\"opusUrl\":\"/airband/recordings/").append(LiveAudioHub.escape(channel))
                             .append('/').append(LiveAudioHub.escape(opus.getFileName().toString())).append("\",")
-                            .append("\"dbSize\":").append(Files.size(db)).append(',')
-                            .append("\"opusSize\":").append(Files.size(opus)).append(',')
                             .append("\"sampleRate\":").append(opusSampleRateHz).append(',')
                             .append("\"frameMillis\":").append(opusFrameMillis)
                             .append('}');

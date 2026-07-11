@@ -34,7 +34,9 @@ export class AudioEngine {
     this.ensure();
     const queue = this.queues.get(packet.streamKey) ?? [];
     queue.push(packet);
-    while (queue.length > this.maxPacketQueue) queue.shift();
+    if (!playbackMode) {
+      while (queue.length > this.maxPacketQueue) queue.shift();
+    }
     this.queues.set(packet.streamKey, queue);
     this.drain(packet.streamKey, playbackMode);
   }

@@ -2,8 +2,9 @@
   import { onDestroy, onMount } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import ChannelTile from './components/ChannelTile.svelte';
+  import HistoryTimeline from './components/HistoryTimeline.svelte';
   import { AudioEngine } from './lib/audio';
-  import { fetchHistoryIndex, fetchRecentHistory, fetchUtterancePackets } from './lib/historyHttp';
+  import { fetchHistoryIndex, fetchRecentHistory, fetchUtterancePackets, historyRangeCacheStats, invalidateRecordingFilesCache } from './lib/historyHttp';
   import { HistoryPlaybackTracker } from './lib/historyPlayback';
   import { RowPlaybackHighlighter, utteranceKey } from './lib/rowPlayback';
   import { opusPacketsToWav } from './lib/wav';
@@ -14,12 +15,7 @@
   const recentWindowMillis = 180_000;
   const defaultTimelineWindowMillis = 60 * 60 * 1000;
   const minTimelineWindowMillis = 60 * 1000;
-  const maxTimelineWindowMillis = 31 * 24 * 60 * 60 * 1000;
-  const waveformWindowMillis = 24 * 60 * 60 * 1000;
-  const timelineZoomStep = 1.6;
   const historySkipMillis = 5_000;
-  const minTimelineSnrDb = 35;
-  const maxTimelineSnrDb = 50;
 
   type ScheduledHistoryFrame = {
     channel: string;
@@ -27,8 +23,6 @@
     startAtMillis: number;
     endAtMillis: number;
   };
-
-  type TimelineDragMode = 'seek' | 'pan';
 
   let socket: WebSocket | null = null;
   let status = 'Connecting...';
@@ -39,27 +33,25 @@
   let filter = '';
   let recentHistory: Utterance[] = [];
   let historyHasOlder = false;
-  let realtimeGaps = false;
+  let skipSilence = true;
   let fromValue = '';
   let toValue = '';
   let timelineFromMillis = 0;
   let timelineToMillis = 0;
+  let timelineFollowRealtime = false;
   let timelineLoading = false;
   let playheadMillis = 0;
-  let timelineCanvas: HTMLCanvasElement | null = null;
-  let timelineDragMode: TimelineDragMode | null = null;
-  let timelineDragStartX = 0;
-  let timelineDragStartFromMillis = 0;
-  let timelineDragStartToMillis = 0;
-  let timelineDrawFrame = 0;
   let historyPlaying = false;
   let historyPaused = false;
+  let realtimePlayback = false;
   let playbackSpeed = 1;
   let playbackClockOriginMillis = 0;
   let playbackClockStartedAt = 0;
   let timelineLoadTimer: ReturnType<typeof setTimeout> | null = null;
   let historyWindowRequestId = 0;
   let now = Date.now();
+  let rangeCacheBytes = 0;
+  let lastRangeCacheStatsAt = 0;
   let channelsOpen = false;
 
   const audio = new AudioEngine();
@@ -68,6 +60,7 @@
   let scheduledHistoryFrames: ScheduledHistoryFrame[] = [];
   let historyAbort: AbortController | null = null;
   let nextPlaybackId = 1;
+  let jumpRealtimeOnPlaybackFinish = new Set<number>();
   let playingRows = new Set<string>();
   let replayingLast = new Set<string>();
   let tickTimer: ReturnType<typeof setInterval>;
@@ -79,28 +72,27 @@
     .filter(channel => channel.active || now - channel.lastActivityMillis <= recentWindowMillis)
     .sort((a, b) => a.frequencyHz - b.frequencyHz);
   $: timelineSpanMillis = Math.max(minTimelineWindowMillis, timelineToMillis - timelineFromMillis);
-  $: timelineTicks = buildTimelineTicks(timelineFromMillis, timelineToMillis);
-  $: timelineBlocks = buildTimelineBlocks(recentHistory, timelineFromMillis, timelineToMillis);
-  $: playheadPercent = timelinePositionPercent(playheadMillis, timelineFromMillis, timelineToMillis);
-  $: scheduleTimelineDraw(timelineCanvas, timelineTicks, timelineBlocks, playheadMillis, timelineFromMillis, timelineToMillis);
+  $: activeTimelineChannels = channelList
+    .filter(channel => selected.has(channel.name) && channel.active && channel.lastActivityMillis > 0)
+    .map(channel => ({ name: channel.name, startMillis: channel.lastActivityMillis }));
 
   onMount(() => {
     audio.onScheduled(handleFrameScheduled);
     audio.onIdle(handleStreamIdle);
     socket = connectSocket(handleMessage, handlePacket, next => status = next);
-    const redrawTimeline = () => scheduleTimelineDraw(timelineCanvas, timelineTicks, timelineBlocks,
-      playheadMillis, timelineFromMillis, timelineToMillis);
-    window.addEventListener('resize', redrawTimeline);
     tickTimer = setInterval(() => {
       now = Date.now();
+      if (now - lastRangeCacheStatsAt >= 500) {
+        rangeCacheBytes = historyRangeCacheStats().bytes;
+        lastRangeCacheStatsAt = now;
+      }
+      updateRealtimeTimelineWindow();
       updateTimelinePlaybackClock();
     }, 100);
     return () => {
       socket?.close();
-      window.removeEventListener('resize', redrawTimeline);
       clearInterval(tickTimer);
       if (timelineLoadTimer) clearTimeout(timelineLoadTimer);
-      if (timelineDrawFrame) cancelAnimationFrame(timelineDrawFrame);
       rowHighlighter.clear();
     };
   });
@@ -154,6 +146,7 @@
   function showChannelHistory(name: string) {
     selected = new Set([name]);
     resetHistoryWindow();
+    startRealtimeHistory();
   }
 
   function addChannelHistoryFilter(name: string) {
@@ -201,6 +194,7 @@
       return;
     }
     clearHistoryPlaybackState(true);
+    realtimePlayback = false;
     const next = new Set(replayingLast);
     next.add(name);
     replayingLast = next;
@@ -221,7 +215,15 @@
 
   function resetHistoryWindow() {
     const endMillis = Date.now();
+    playheadMillis = 0;
     setHistoryWindow(endMillis - defaultTimelineWindowMillis, endMillis);
+  }
+
+  function startRealtimeHistory() {
+    historyPlaying = true;
+    historyPaused = false;
+    realtimePlayback = true;
+    playheadMillis = timelineToMillis || Date.now();
   }
 
   function loadOlderHistory() {
@@ -254,6 +256,7 @@
       return;
     }
     clearHistoryPlaybackState(true);
+    realtimePlayback = false;
     rowHighlighter.mark(utterance);
     void playHistoryUtterances([utterance], [utterance.channel], utterance.startMillis, false);
   }
@@ -274,9 +277,12 @@
       return;
     }
     clearHistoryPlaybackState(true);
+    realtimePlayback = false;
     const channels = [...selected];
     void fetchHistoryIndex(channels, utterance.startMillis, Date.now())
-      .then(utterances => playHistoryUtterances(utterances, channels, utterance.startMillis, realtimeGaps))
+      .then(utterances => playHistoryUtterances(utterances, channels, utterance.startMillis, !skipSilence, {
+        jumpRealtimeOnFinish: skipSilence
+      }))
       .catch(error => status = error instanceof Error ? error.message : String(error));
   }
 
@@ -291,14 +297,22 @@
   }
 
   function setHistoryWindow(fromMillis: number, toMillis: number, loadDelayMillis = 0) {
-    const safeTo = Math.min(Date.now(), Math.max(fromMillis + minTimelineWindowMillis, toMillis));
+    const latestTo = Date.now();
+    const followsRealtime = toMillis >= latestTo - 1000;
+    const safeTo = Math.min(latestTo, Math.max(fromMillis + minTimelineWindowMillis, toMillis));
     const safeFrom = Math.max(0, Math.min(fromMillis, safeTo - minTimelineWindowMillis));
     timelineFromMillis = safeFrom;
     timelineToMillis = safeTo;
-    playheadMillis = clamp(playheadMillis || safeFrom, safeFrom, safeTo);
+    timelineFollowRealtime = followsRealtime;
+    if (!playheadMillis) {
+      playheadMillis = safeTo;
+    }
     fromValue = localDateTime(safeFrom);
     toValue = localDateTime(safeTo);
     if (timelineLoadTimer) clearTimeout(timelineLoadTimer);
+    if (loadDelayMillis < 0) {
+      return;
+    }
     if (loadDelayMillis > 0) {
       timelineLoadTimer = setTimeout(() => {
         timelineLoadTimer = null;
@@ -307,6 +321,19 @@
     } else {
       void loadHistoryWindow();
     }
+  }
+
+  function updateRealtimeTimelineWindow() {
+    if (!timelineFollowRealtime || timelineToMillis <= timelineFromMillis) return;
+    const latestTo = Date.now();
+    const span = timelineSpanMillis;
+    timelineToMillis = latestTo;
+    timelineFromMillis = Math.max(0, latestTo - span);
+    if (!historyPlaying || historyPaused || scheduledHistoryFrames.length === 0) {
+      playheadMillis = timelineToMillis;
+    }
+    fromValue = localDateTime(timelineFromMillis);
+    toValue = localDateTime(timelineToMillis);
   }
 
   async function loadHistoryWindow() {
@@ -345,90 +372,6 @@
     setHistoryWindow(nextFrom, nextTo);
   }
 
-  function zoomTimeline(event: WheelEvent) {
-    if (selected.size === 0 || timelineToMillis <= timelineFromMillis) return;
-    event.preventDefault();
-    const element = event.currentTarget as HTMLElement;
-    const rect = element.getBoundingClientRect();
-    const ratio = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
-    zoomTimelineAt(ratio, event.deltaY > 0 ? timelineZoomStep : 1 / timelineZoomStep, 120);
-  }
-
-  function zoomTimelineButton(direction: 'in' | 'out') {
-    if (selected.size === 0 || timelineToMillis <= timelineFromMillis) return;
-    zoomTimelineAt(0.5, direction === 'out' ? timelineZoomStep : 1 / timelineZoomStep);
-  }
-
-  function zoomTimelineAt(ratio: number, zoomFactor: number, loadDelayMillis = 0) {
-    const anchor = timelineFromMillis + timelineSpanMillis * ratio;
-    const nextSpan = clamp(timelineSpanMillis * zoomFactor, minTimelineWindowMillis, maxTimelineWindowMillis);
-    let nextFrom = anchor - nextSpan * ratio;
-    let nextTo = nextFrom + nextSpan;
-    const latestTo = Date.now();
-    if (nextTo > latestTo) {
-      nextTo = latestTo;
-      nextFrom = latestTo - nextSpan;
-    }
-    setHistoryWindow(nextFrom, nextTo, loadDelayMillis);
-  }
-
-  function beginTimelineSeek(event: PointerEvent) {
-    if (selected.size === 0 || timelineToMillis <= timelineFromMillis) return;
-    if (event.button !== 0) return;
-    const element = event.currentTarget as HTMLCanvasElement;
-    const rect = element.getBoundingClientRect();
-    const cursorX = event.clientX - rect.left;
-    const playheadX = (playheadPercent / 100) * rect.width;
-    element.setPointerCapture(event.pointerId);
-    timelineDragMode = Math.abs(cursorX - playheadX) <= 10 ? 'seek' : 'pan';
-    timelineDragStartX = event.clientX;
-    timelineDragStartFromMillis = timelineFromMillis;
-    timelineDragStartToMillis = timelineToMillis;
-    if (timelineDragMode === 'seek') {
-      playheadMillis = millisFromTimelineEvent(event, element);
-    }
-  }
-
-  function moveTimelineSeek(event: PointerEvent) {
-    if (!timelineDragMode) return;
-    const element = event.currentTarget as HTMLCanvasElement;
-    if (timelineDragMode === 'seek') {
-      playheadMillis = millisFromTimelineEvent(event, element);
-      return;
-    }
-    const rect = element.getBoundingClientRect();
-    const deltaRatio = (event.clientX - timelineDragStartX) / Math.max(1, rect.width);
-    const deltaMillis = -deltaRatio * (timelineDragStartToMillis - timelineDragStartFromMillis);
-    panTimelineWindow(timelineDragStartFromMillis + deltaMillis, timelineDragStartToMillis + deltaMillis, 80);
-  }
-
-  function endTimelineSeek(event: PointerEvent) {
-    if (!timelineDragMode) return;
-    const element = event.currentTarget as HTMLCanvasElement;
-    if (element.hasPointerCapture(event.pointerId)) {
-      element.releasePointerCapture(event.pointerId);
-    }
-    const mode = timelineDragMode;
-    timelineDragMode = null;
-    if (mode === 'seek') {
-      const targetMillis = millisFromTimelineEvent(event, element);
-      playheadMillis = targetMillis;
-      if (historyPlaying) {
-        seekHistoryTo(targetMillis);
-      } else {
-        historyPaused = true;
-      }
-    }
-  }
-
-  function cancelTimelineDrag(event: PointerEvent) {
-    const element = event.currentTarget as HTMLCanvasElement;
-    if (element.hasPointerCapture(event.pointerId)) {
-      element.releasePointerCapture(event.pointerId);
-    }
-    timelineDragMode = null;
-  }
-
   function seekHistoryTo(targetMillis: number) {
     try {
       audio.ensure();
@@ -437,17 +380,21 @@
       return;
     }
     clearHistoryPlaybackState(true);
+    realtimePlayback = false;
     const boundedTargetMillis = clamp(targetMillis, timelineFromMillis, timelineToMillis);
     playheadMillis = boundedTargetMillis;
     const channels = [...selected];
-    void fetchHistoryIndex(channels, boundedTargetMillis, timelineToMillis)
+    const playbackToMillis = Date.now();
+    void fetchHistoryIndex(channels, boundedTargetMillis, playbackToMillis)
       .then(utterances => {
         if (!utterances.length) {
-          status = 'No recordings after seek point in this window';
+          status = 'No recordings after seek point';
           historyPaused = true;
           return;
         }
-        return playHistoryUtterances(utterances, channels, boundedTargetMillis, realtimeGaps);
+        return playHistoryUtterances(utterances, channels, boundedTargetMillis, !skipSilence, {
+          jumpRealtimeOnFinish: skipSilence
+        });
       })
       .catch(error => status = error instanceof Error ? error.message : String(error));
   }
@@ -475,10 +422,35 @@
     }
   }
 
-  function changePlaybackSpeed() {
+  function previewTimelinePlayhead(millis: number) {
+    playheadMillis = clamp(millis, timelineFromMillis, timelineToMillis);
+  }
+
+  function handleTimelineSeek(targetMillis: number) {
+    playheadMillis = targetMillis;
+    if (historyPlaying) {
+      seekHistoryTo(targetMillis);
+    } else {
+      historyPaused = true;
+    }
+  }
+
+  function changePlaybackSpeed(speed: number) {
+    playbackSpeed = speed;
     if (historyPlaying) {
       seekHistoryTo(currentTimelinePlayhead());
     }
+  }
+
+  function changeSkipSilence(nextSkipSilence: boolean) {
+    skipSilence = nextSkipSilence;
+    if (historyPlaying) {
+      seekHistoryTo(currentTimelinePlayhead());
+    }
+  }
+
+  function leaveRealtimeNavigation() {
+    playheadMillis = currentTimelinePlayhead();
   }
 
   function downloadUtterance(utterance: Utterance) {
@@ -491,6 +463,13 @@
     status = 'Historical playback stopped';
   }
 
+  function jumpToRealtime() {
+    clearHistoryPlaybackState(true);
+    resetHistoryWindow();
+    startRealtimeHistory();
+    status = 'Historical playback at real time';
+  }
+
   function clearHistoryPlaybackState(flushAudio: boolean) {
     const keepPlayheadMillis = currentTimelinePlayhead();
     historyAbort?.abort();
@@ -499,10 +478,12 @@
       audio.flushPrefix('history:');
     }
     historyPlayback.clear();
+    jumpRealtimeOnPlaybackFinish = new Set();
     replayingLast = new Set();
     scheduledHistoryFrames = [];
     rowHighlighter.clear();
     historyPlaying = false;
+    realtimePlayback = false;
     playbackClockOriginMillis = 0;
     playbackClockStartedAt = 0;
     if (flushAudio && keepPlayheadMillis > 0) {
@@ -515,23 +496,34 @@
   }
 
   function completePlayback(completed: { playbackId: number; channels: string[] } | null) {
-    if (!completed) return;
+    if (!completed) return false;
+    const jumpRealtime = jumpRealtimeOnPlaybackFinish.has(completed.playbackId);
+    jumpRealtimeOnPlaybackFinish.delete(completed.playbackId);
     const next = new Set(replayingLast);
     for (const channel of completed.channels) next.delete(channel);
     replayingLast = next;
     scheduledHistoryFrames = [];
     rowHighlighter.clear();
-    historyPlaying = false;
+    historyPlaying = realtimePlayback && !historyPaused;
     historyPaused = false;
     playbackClockOriginMillis = 0;
     playbackClockStartedAt = 0;
+    if (jumpRealtime) {
+      jumpToRealtime();
+      return true;
+    }
     status = 'Historical playback finished';
+    return true;
   }
 
-  async function playHistoryUtterances(utterances: Utterance[], channels: string[], originMillis: number, realtime: boolean) {
+  async function playHistoryUtterances(utterances: Utterance[], channels: string[], originMillis: number, realtime: boolean,
+                                      options: { jumpRealtimeOnFinish?: boolean } = {}) {
     const playbackId = nextPlaybackId++;
     const abort = new AbortController();
     historyAbort = abort;
+    if (options.jumpRealtimeOnFinish) {
+      jumpRealtimeOnPlaybackFinish = new Set(jumpRealtimeOnPlaybackFinish).add(playbackId);
+    }
     historyPlayback.start(playbackId, channels, {
       realtime,
       originMillis,
@@ -545,7 +537,8 @@
     playheadMillis = originMillis;
     status = `Fetching ${utterances.length} historical recordings...`;
     try {
-      const packets = (await Promise.all(utterances.map(utterance =>
+      const uniqueUtterances = [...new Map(utterances.map(utterance => [utteranceKey(utterance), utterance])).values()];
+      const packets = (await Promise.all(uniqueUtterances.map(utterance =>
         fetchUtterancePackets(utterance, `history:${playbackId}:${utterance.channel}`, abort.signal)
       ))).flat()
         .filter(packet => packet.unixMillis + packet.durationMillis >= originMillis)
@@ -555,8 +548,10 @@
         historyPlayback.trackPacket(packet);
         audio.enqueue(packet, playbackModeFor(packet.streamKey));
       }
-      completePlayback(historyPlayback.serverDone(playbackId));
-      status = `Queued ${packets.length} historical packets`;
+      const completed = completePlayback(historyPlayback.serverDone(playbackId));
+      if (!completed) {
+        status = `Queued ${packets.length} historical packets`;
+      }
     } catch (error) {
       if (!abort.signal.aborted) {
         status = error instanceof Error ? error.message : String(error);
@@ -625,7 +620,7 @@
   }
 
   function updateTimelinePlaybackClock() {
-    if (timelineDragMode === 'seek' || !historyPlaying) return;
+    if (!historyPlaying) return;
     playheadMillis = currentTimelinePlayhead();
   }
 
@@ -635,20 +630,31 @@
       .filter(frame => frame.startAtMillis <= nowMillis && frame.endAtMillis >= nowMillis)
       .sort((a, b) => b.startAtMillis - a.startAtMillis)[0];
     if (activeFrame) {
-      return clamp(activeFrame.targetMillis, timelineFromMillis, timelineToMillis);
+      return activeFrame.targetMillis;
     }
     if (historyPlaying && playbackClockOriginMillis > 0 && playbackClockStartedAt > 0) {
-      return clamp(playbackClockOriginMillis + (nowMillis - playbackClockStartedAt) * playbackSpeed,
-        timelineFromMillis, timelineToMillis);
+      return playbackClockOriginMillis + (nowMillis - playbackClockStartedAt) * playbackSpeed;
     }
-    return clamp(playheadMillis || timelineFromMillis, timelineFromMillis, timelineToMillis);
+    if (realtimePlayback && historyPlaying && !historyPaused) {
+      return Date.now();
+    }
+    return playheadMillis || timelineToMillis || Date.now();
   }
 
   function appendLiveUtterance(utterance: Utterance) {
+    invalidateRecordingFilesCache([utterance.channel]);
     if (selected.size === 0 || !selected.has(utterance.channel)) {
       return;
     }
-    if (utterance.startMillis < timelineFromMillis || utterance.startMillis > timelineToMillis) {
+    if (timelineFollowRealtime && timelineToMillis > timelineFromMillis) {
+      const latestTo = Math.max(Date.now(), utterance.endMillis, utterance.startMillis);
+      const span = timelineSpanMillis;
+      timelineToMillis = latestTo;
+      timelineFromMillis = Math.max(0, latestTo - span);
+      fromValue = localDateTime(timelineFromMillis);
+      toValue = localDateTime(timelineToMillis);
+    }
+    if (utterance.endMillis < timelineFromMillis || utterance.startMillis > timelineToMillis) {
       return;
     }
     const key = utteranceKey(utterance);
@@ -716,207 +722,8 @@
     return `${fromDate} ${utcTime(timelineFromMillis)} - ${toDate} ${utcTime(timelineToMillis)} · ${count}`;
   }
 
-  function panTimelineWindow(fromMillis: number, toMillis: number, loadDelayMillis = 0) {
-    const span = toMillis - fromMillis;
-    const latestTo = Date.now();
-    let nextFrom = fromMillis;
-    let nextTo = toMillis;
-    if (nextFrom < 0) {
-      nextFrom = 0;
-      nextTo = span;
-    }
-    if (nextTo > latestTo) {
-      nextTo = latestTo;
-      nextFrom = latestTo - span;
-    }
-    setHistoryWindow(nextFrom, nextTo, loadDelayMillis);
-  }
-
-  function millisFromTimelineEvent(event: PointerEvent, element: HTMLElement) {
-    const rect = element.getBoundingClientRect();
-    const ratio = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
-    return Math.round(timelineFromMillis + timelineSpanMillis * ratio);
-  }
-
-  function timelinePositionPercent(millis: number, fromMillis: number, toMillis: number) {
-    if (!millis || toMillis <= fromMillis) return 0;
-    return clamp(((millis - fromMillis) / (toMillis - fromMillis)) * 100, 0, 100);
-  }
-
-  function buildTimelineBlocks(utterances: Utterance[], fromMillis: number, toMillis: number) {
-    const span = toMillis - fromMillis;
-    if (span <= 0 || span > waveformWindowMillis) return [];
-    return utterances
-      .filter(utterance => utterance.endMillis >= fromMillis && utterance.startMillis <= toMillis)
-      .map(utterance => {
-        const start = clamp(utterance.startMillis, fromMillis, toMillis);
-        const end = clamp(Math.max(utterance.endMillis, utterance.startMillis + 100), fromMillis, toMillis);
-        const snrDb = Number.isFinite(utterance.averageSnrDb) ? utterance.averageSnrDb! : minTimelineSnrDb;
-        const snrRatio = (clamp(snrDb, minTimelineSnrDb, maxTimelineSnrDb) - minTimelineSnrDb)
-          / (maxTimelineSnrDb - minTimelineSnrDb);
-        const height = 18 + snrRatio * 70;
-        const color = channelTimelineColor(utterance.channel);
-        return {
-          key: utteranceKey(utterance),
-          left: ((start - fromMillis) / span) * 100,
-          width: Math.max(0.18, ((end - start) / span) * 100),
-          top: 50 - height / 2,
-          height,
-          color,
-          label: `${utterance.channel} ${utcTime(utterance.startMillis)} ${duration(utterance)}s ${snr(utterance)}`
-        };
-      });
-  }
-
-  function buildTimelineTicks(fromMillis: number, toMillis: number) {
-    const span = toMillis - fromMillis;
-    if (span <= 0) return [];
-    const hour = 60 * 60 * 1000;
-    const day = 24 * hour;
-    const interval = span <= 2 * hour ? 15 * 60 * 1000
-      : span <= 12 * hour ? hour
-      : span <= 2 * day ? 6 * hour
-      : span <= 14 * day ? day
-      : 7 * day;
-    const ticks: { millis: number; left: number; label: string; major: boolean }[] = [];
-    const first = Math.ceil(fromMillis / interval) * interval;
-    for (let millis = first; millis <= toMillis && ticks.length < 240; millis += interval) {
-      const date = new Date(millis);
-      const major = interval >= day || (date.getUTCHours() === 0 && date.getUTCMinutes() === 0);
-      ticks.push({
-        millis,
-        left: ((millis - fromMillis) / span) * 100,
-        label: major ? date.toISOString().slice(5, 10) : `${date.toISOString().slice(11, 16)}Z`,
-        major
-      });
-    }
-    return ticks;
-  }
-
   function clamp(value: number, min: number, max: number) {
     return Math.min(max, Math.max(min, value));
-  }
-
-  function channelTimelineColor(channel: string) {
-    let hash = 0;
-    for (let i = 0; i < channel.length; i++) {
-      hash = ((hash << 5) - hash + channel.charCodeAt(i)) | 0;
-    }
-    const hue = ((hash % 360) + 360) % 360;
-    return `hsl(${hue} 76% 62%)`;
-  }
-
-  function scheduleTimelineDraw(_canvas: HTMLCanvasElement | null, _ticks: ReturnType<typeof buildTimelineTicks>,
-                                _blocks: ReturnType<typeof buildTimelineBlocks>, _playheadMillis: number,
-                                _fromMillis: number, _toMillis: number) {
-    if (!timelineCanvas) return;
-    if (timelineDrawFrame) cancelAnimationFrame(timelineDrawFrame);
-    timelineDrawFrame = requestAnimationFrame(() => {
-      timelineDrawFrame = 0;
-      drawTimelineCanvas();
-    });
-  }
-
-  function drawTimelineCanvas() {
-    if (!timelineCanvas) return;
-    const rect = timelineCanvas.getBoundingClientRect();
-    const width = Math.max(1, Math.round(rect.width));
-    const height = Math.max(1, Math.round(rect.height));
-    const scale = window.devicePixelRatio || 1;
-    const pixelWidth = Math.round(width * scale);
-    const pixelHeight = Math.round(height * scale);
-    if (timelineCanvas.width !== pixelWidth || timelineCanvas.height !== pixelHeight) {
-      timelineCanvas.width = pixelWidth;
-      timelineCanvas.height = pixelHeight;
-    }
-    const context = timelineCanvas.getContext('2d');
-    if (!context) return;
-    context.setTransform(scale, 0, 0, scale, 0, 0);
-    context.clearRect(0, 0, width, height);
-
-    const radius = 8;
-    context.fillStyle = '#10151c';
-    context.beginPath();
-    context.roundRect(0, 0, width, height, radius);
-    context.fill();
-
-    context.strokeStyle = 'rgb(255 255 255 / 0.03)';
-    context.lineWidth = 1;
-    for (let x = 0; x <= width; x += width / 10) {
-      context.beginPath();
-      context.moveTo(x, 0);
-      context.lineTo(x, height);
-      context.stroke();
-    }
-
-    const gradient = context.createLinearGradient(0, 0, 0, height * 0.42);
-    gradient.addColorStop(0, 'rgb(255 255 255 / 0.03)');
-    gradient.addColorStop(1, 'rgb(255 255 255 / 0)');
-    context.fillStyle = gradient;
-    context.fillRect(0, 0, width, height * 0.42);
-
-    context.strokeStyle = '#26313d';
-    context.beginPath();
-    context.moveTo(0, height / 2);
-    context.lineTo(width, height / 2);
-    context.stroke();
-
-    context.font = '11px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-    context.textBaseline = 'top';
-    for (const tick of timelineTicks) {
-      const x = (tick.left / 100) * width;
-      context.strokeStyle = tick.major ? '#526579' : '#33404d';
-      context.lineWidth = tick.major ? 2 : 1;
-      context.beginPath();
-      context.moveTo(x, 0);
-      context.lineTo(x, height);
-      context.stroke();
-      context.fillStyle = tick.major ? '#c3cfda' : '#8493a2';
-      context.fillText(tick.label, Math.min(width - 80, x + 6), 8, 78);
-    }
-
-    for (const block of timelineBlocks) {
-      const x = (block.left / 100) * width;
-      const blockWidth = Math.max(2, (block.width / 100) * width);
-      const y = (block.top / 100) * height;
-      const blockHeight = (block.height / 100) * height;
-      const blockGradient = context.createLinearGradient(0, y, 0, y + blockHeight);
-      blockGradient.addColorStop(0, mixCanvasColor(block.color, '#ffffff', 0.18));
-      blockGradient.addColorStop(1, mixCanvasColor(block.color, '#000000', 0.28));
-      context.fillStyle = blockGradient;
-      context.strokeStyle = mixCanvasColor(block.color, '#ffffff', 0.22);
-      context.lineWidth = 1;
-      context.beginPath();
-      context.roundRect(x, y, blockWidth, blockHeight, 2);
-      context.fill();
-      context.stroke();
-    }
-
-    const playheadX = (playheadPercent / 100) * width;
-    context.strokeStyle = '#7cf0a8';
-    context.lineWidth = 2;
-    context.shadowColor = 'rgb(124 240 168 / 0.36)';
-    context.shadowBlur = 14;
-    context.beginPath();
-    context.moveTo(playheadX, 0);
-    context.lineTo(playheadX, height);
-    context.stroke();
-    context.shadowBlur = 0;
-    context.fillStyle = '#7cf0a8';
-    context.beginPath();
-    context.roundRect(playheadX - 6, 0, 12, 12, 3);
-    context.fill();
-  }
-
-  function mixCanvasColor(color: string, other: string, amount: number) {
-    if (!color.startsWith('hsl(')) return color;
-    const match = /^hsl\(([-\d.]+) ([\d.]+)% ([\d.]+)%\)$/.exec(color);
-    if (!match) return color;
-    const hue = Number(match[1]);
-    const saturation = Number(match[2]);
-    const lightness = Number(match[3]);
-    const targetLightness = other === '#ffffff' ? 100 : 0;
-    return `hsl(${hue} ${saturation}% ${lightness + (targetLightness - lightness) * amount}%)`;
   }
 </script>
 
@@ -979,53 +786,16 @@
     <div class="history-controls">
       <label>From <input bind:value={fromValue} type="datetime-local" onchange={applyInputRange} /></label>
       <label>To <input bind:value={toValue} type="datetime-local" onchange={applyInputRange} /></label>
-      <label class="checkbox"><input bind:checked={realtimeGaps} type="checkbox" /> Real-time gaps</label>
     </div>
 
-    <div class="timeline-shell">
-      <div class="timeline-topline">
-        <span>{historyRangeLabel()}</span>
-        <span>{timelineLoading ? 'Loading...' : timelineSpanMillis <= waveformWindowMillis ? 'Waveform by utterance SNR' : 'Zoom in to show utterance blocks'}</span>
-      </div>
-      <div class="timeline-controls">
-        <button type="button" class="icon-button" disabled={selected.size === 0}
-          aria-label={historyPlaying ? 'Pause historical playback' : 'Play historical playback'}
-          onclick={toggleTimelinePlayback}>
-          <span class="icon-symbol">{historyPlaying ? 'Ⅱ' : '▶'}</span>
-        </button>
-        <button type="button" class="icon-button" disabled={selected.size === 0}
-          aria-label="Skip back 5 seconds" onclick={() => skipTimeline(-historySkipMillis)}>
-          <span class="icon-symbol">↶</span>
-        </button>
-        <button type="button" class="icon-button" disabled={selected.size === 0}
-          aria-label="Skip forward 5 seconds" onclick={() => skipTimeline(historySkipMillis)}>
-          <span class="icon-symbol">↷</span>
-        </button>
-        <button type="button" class="icon-button" disabled={selected.size === 0}
-          aria-label="Zoom out" onclick={() => zoomTimelineButton('out')}>
-          <span class="icon-symbol">−</span>
-        </button>
-        <button type="button" class="icon-button" disabled={selected.size === 0}
-          aria-label="Zoom in" onclick={() => zoomTimelineButton('in')}>
-          <span class="icon-symbol">+</span>
-        </button>
-        <label class="speed-control">
-          <span>{playbackSpeed.toFixed(1)}×</span>
-          <input bind:value={playbackSpeed} type="range" min="0.5" max="4" step="0.1"
-            onchange={changePlaybackSpeed} />
-        </label>
-      </div>
-      <canvas class="history-timeline" role="slider" aria-label="Historical playback seek bar"
-        bind:this={timelineCanvas}
-        aria-valuemin={timelineFromMillis} aria-valuemax={timelineToMillis} aria-valuenow={playheadMillis}
-        tabindex="0"
-        onwheel={zoomTimeline}
-        onpointerdown={beginTimelineSeek}
-        onpointermove={moveTimelineSeek}
-        onpointerup={endTimelineSeek}
-        onpointercancel={cancelTimelineDrag}>
-      </canvas>
-    </div>
+    <HistoryTimeline utterances={recentHistory} fromMillis={timelineFromMillis} toMillis={timelineToMillis}
+      {playheadMillis} loading={timelineLoading} selected={selected.size > 0} playing={historyPlaying}
+      {playbackSpeed} {skipSilence} skipMillis={historySkipMillis} cacheBytes={rangeCacheBytes}
+      activeChannels={activeTimelineChannels} nowMillis={now} realtime={realtimePlayback && historyPlaying && !historyPaused}
+      onNavigate={leaveRealtimeNavigation} onWindowChange={setHistoryWindow} onPreviewPlayhead={previewTimelinePlayhead}
+      onSeek={handleTimelineSeek} onTogglePlayback={toggleTimelinePlayback}
+      onSkip={skipTimeline} onStop={jumpToRealtime}
+      onSpeedChange={changePlaybackSpeed} onSkipSilenceChange={changeSkipSilence} />
 
     <div class="history-list">
       {#each recentHistory as utterance, index (utteranceKey(utterance))}
