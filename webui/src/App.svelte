@@ -4,7 +4,17 @@
   import ChannelTile from './components/ChannelTile.svelte';
   import HistoryTimeline from './components/HistoryTimeline.svelte';
   import { AudioEngine } from './lib/audio';
-  import { appendHistoryRecordingBytes, fetchHistoryIndex, fetchRecentHistory, fetchUtterancePacketChunk, fetchUtterancePackets, historyRangeCacheStats, invalidateRecordingFilesCache } from './lib/historyHttp';
+  import {
+    appendHistoryRecordingBytes,
+    fetchHistoryIndex,
+    fetchRecentHistory,
+    HISTORY_OPUS_CHUNK_BYTES,
+    fetchUtterancePacketWindow,
+    fetchUtterancePackets,
+    historyRangeCacheStats,
+    rememberHistoryRecordingFile,
+    type HistoryPacketWindowRequest
+  } from './lib/historyHttp';
   import { RowPlaybackHighlighter, utteranceKey } from './lib/rowPlayback';
   import { opusPacketsToWav } from './lib/wav';
   import type { Channel, OpusPacket, PlaybackMode, RecordingBytes, ServerMessage, Utterance } from './lib/types';
@@ -15,6 +25,7 @@
   const defaultTimelineWindowMillis = 60 * 60 * 1000;
   const minTimelineWindowMillis = 60 * 1000;
   const historySkipMillis = 5_000;
+  const playbackFetchWindowMillis = 30_000;
 
   type ScheduledHistoryFrame = {
     channel: string;
@@ -23,11 +34,10 @@
     endAtMillis: number;
   };
 
-  type HistoryChunkCursor = {
-    utterance: Utterance;
-    streamKey: string;
+  type HistoryUtteranceCursor = {
     nextOffset: number;
     nextMillis: number;
+    complete: boolean;
   };
 
   type HistoryPlaybackSession = {
@@ -39,8 +49,9 @@
     playbackMode: PlaybackMode;
     jumpRealtimeOnFinish: boolean;
     abort: AbortController;
-    nextUtteranceIndex: number;
-    cursor: HistoryChunkCursor | null;
+    nextMillis: number;
+    cursors: Map<string, HistoryUtteranceCursor>;
+    activeStreams: Set<string>;
     fetching: boolean;
   };
 
@@ -160,6 +171,10 @@
 
   function handleRecordingBytes(bytes: RecordingBytes) {
     appendHistoryRecordingBytes(bytes.recordingUrl, bytes.offset, bytes.data);
+    const session = historySession;
+    if (session && !session.fetching && session.activeStreams.size === 0 && bytes.recordingUrl.endsWith('.opus')) {
+      void queueNextHistoryWindow(session);
+    }
   }
 
   function playbackModeFor(streamKey: string) {
@@ -547,8 +562,12 @@
   }
 
   function handleStreamIdle(streamKey: string) {
-    if (isSessionStream(streamKey, historySession)) {
-      void queueNextHistoryChunk(historySession);
+    const session = historySession;
+    if (isSessionStream(streamKey, session)) {
+      session.activeStreams.delete(streamKey);
+      if (session.activeStreams.size === 0) {
+        void queueNextHistoryWindow(session);
+      }
     }
   }
 
@@ -599,39 +618,62 @@
       playbackMode,
       jumpRealtimeOnFinish: options.jumpRealtimeOnFinish ?? false,
       abort,
-      nextUtteranceIndex: 0,
-      cursor: null,
+      nextMillis: originMillis,
+      cursors: new Map(),
+      activeStreams: new Set(),
       fetching: false
     };
     status = `Fetching history near ${utcTime(originMillis)}...`;
-    await queueNextHistoryChunk(historySession);
+    await queueNextHistoryWindow(historySession);
   }
 
-  async function queueNextHistoryChunk(session: HistoryPlaybackSession | null) {
+  async function queueNextHistoryWindow(session: HistoryPlaybackSession | null) {
     if (!session || session !== historySession || session.abort.signal.aborted || session.fetching) {
       return;
     }
     session.fetching = true;
     try {
       while (session === historySession && !session.abort.signal.aborted) {
-        const cursor = nextHistoryCursor(session);
-        if (!cursor) {
+        const window = nextHistoryWindow(session);
+        if (!window) {
           completePlayback(session);
           return;
         }
 
-        const chunk = await fetchUtterancePacketChunk(cursor.utterance, cursor.streamKey,
-          cursor.nextOffset, cursor.nextMillis, session.abort.signal, session.originMillis);
-        cursor.nextOffset = chunk.nextOffset;
-        cursor.nextMillis = chunk.nextMillis;
-
-        if (chunk.complete) {
-          session.cursor = null;
+        const chunk = await fetchUtterancePacketWindow(window.requests, window.horizonMillis,
+          session.originMillis, session.abort.signal);
+        const requestsById = new Map(window.requests.map(request => [request.id, request]));
+        const advanced = chunk.updates.some(update => {
+          const request = requestsById.get(update.id);
+          const previousOffset = session.cursors.get(update.id)?.nextOffset
+            ?? request?.byteOffset
+            ?? request?.utterance.startOffset
+            ?? 0;
+          return update.nextOffset > previousOffset;
+        });
+        for (const update of chunk.updates) {
+          session.cursors.set(update.id, {
+            nextOffset: update.nextOffset,
+            nextMillis: update.nextMillis,
+            complete: update.complete
+          });
         }
+        session.nextMillis = nextHistoryWindowStart(session, window.horizonMillis);
         if (!chunk.packets.length) {
+          if (advanced) {
+            continue;
+          }
+          if (chunk.updates.some(update => !update.complete)) {
+            status = 'Waiting for recorded audio bytes...';
+            return;
+          }
           continue;
         }
 
+        const streams = new Set(chunk.packets.map(packet => packet.streamKey));
+        for (const streamKey of streams) {
+          session.activeStreams.add(streamKey);
+        }
         for (const packet of chunk.packets) {
           if (session.abort.signal.aborted) break;
           audio.enqueue(packet, session.playbackMode);
@@ -648,28 +690,114 @@
     }
   }
 
-  function nextHistoryCursor(session: HistoryPlaybackSession) {
-    if (session.cursor) {
-      return session.cursor;
+  function nextHistoryWindow(session: HistoryPlaybackSession) {
+    if (session.compactStreamKey) {
+      return nextCompactHistoryWindow(session);
     }
-    while (session.nextUtteranceIndex < session.utterances.length) {
-      const utterance = session.utterances[session.nextUtteranceIndex++];
-      if (!utterance.opusUrl || utterance.startOffset === undefined) {
-        continue;
-      }
-      const streamKey = session.compactStreamKey ?? `history:${session.playbackId}:${utterance.channel}`;
-      session.cursor = {
+    return nextTimelineHistoryWindow(session);
+  }
+
+  function nextTimelineHistoryWindow(session: HistoryPlaybackSession) {
+    let startMillis = session.nextMillis;
+    let horizonMillis = startMillis + playbackFetchWindowMillis;
+    let requests = historyWindowRequests(session, startMillis, horizonMillis);
+    if (!requests.length) {
+      const next = session.utterances.find(utterance =>
+        utterance.startMillis > startMillis && !session.cursors.get(utteranceKey(utterance))?.complete);
+      if (!next) return null;
+      startMillis = next.startMillis;
+      horizonMillis = startMillis + playbackFetchWindowMillis;
+      requests = historyWindowRequests(session, startMillis, horizonMillis);
+    }
+    return requests.length ? { horizonMillis, requests } : null;
+  }
+
+  function nextCompactHistoryWindow(session: HistoryPlaybackSession) {
+    const anchor = nextCompactAnchor(session, session.nextMillis);
+    if (!anchor) return null;
+    const chunkEnd = anchor.byteOffset + HISTORY_OPUS_CHUNK_BYTES;
+    const requests = compactHistoryWindowRequests(session, anchor.url, anchor.byteOffset, chunkEnd, session.nextMillis);
+    if (!requests.length) return null;
+    return {
+      horizonMillis: Math.max(...requests.map(request => request.targetMillis ?? request.utterance.endMillis)),
+      requests
+    };
+  }
+
+  function historyWindowRequests(session: HistoryPlaybackSession, startMillis: number, horizonMillis: number) {
+    const requests: HistoryPacketWindowRequest[] = [];
+    for (const utterance of session.utterances) {
+      if (utterance.startMillis > horizonMillis || utterance.endMillis < startMillis) continue;
+      const id = utteranceKey(utterance);
+      const cursor = session.cursors.get(id);
+      if (cursor?.complete || !utterance.opusUrl || utterance.startOffset === undefined) continue;
+      requests.push({
+        id,
         utterance,
-        streamKey,
-        nextOffset: utterance.startOffset,
-        nextMillis: utterance.startMillis
+        streamKey: session.compactStreamKey ?? `history:${session.playbackId}:${utterance.channel}`,
+        byteOffset: cursor?.nextOffset,
+        packetMillis: cursor?.nextMillis
+      });
+    }
+    return requests;
+  }
+
+  function nextCompactAnchor(session: HistoryPlaybackSession, startMillis: number) {
+    for (const utterance of session.utterances) {
+      const id = utteranceKey(utterance);
+      const cursor = session.cursors.get(id);
+      if (cursor?.complete || !utterance.opusUrl || utterance.startOffset === undefined) continue;
+      const requestStartMillis = cursor?.nextMillis ?? Math.max(utterance.startMillis, startMillis);
+      if (!cursor && compactRequestEndMillis(utterance, requestStartMillis) < startMillis) continue;
+      return {
+        utterance,
+        url: utterance.opusUrl,
+        byteOffset: cursor?.nextOffset ?? utterance.startOffset
       };
-      return session.cursor;
     }
     return null;
   }
 
-  function isSessionStream(streamKey: string, session: HistoryPlaybackSession | null) {
+  function compactHistoryWindowRequests(session: HistoryPlaybackSession, url: string,
+                                        chunkStart: number, chunkEnd: number, startMillis: number) {
+    const requests: HistoryPacketWindowRequest[] = [];
+    for (const utterance of session.utterances) {
+      const id = utteranceKey(utterance);
+      const cursor = session.cursors.get(id);
+      if (cursor?.complete || utterance.opusUrl !== url || utterance.startOffset === undefined) continue;
+      const byteOffset = cursor?.nextOffset ?? utterance.startOffset;
+      if (byteOffset < chunkStart || byteOffset >= chunkEnd) continue;
+
+      const requestStartMillis = cursor?.nextMillis ?? Math.max(utterance.startMillis, startMillis);
+      const requestEndMillis = compactRequestEndMillis(utterance, requestStartMillis);
+      if (!cursor && requestEndMillis < startMillis) continue;
+      requests.push({
+        id,
+        utterance,
+        streamKey: session.compactStreamKey ?? `history:${session.playbackId}:${utterance.channel}`,
+        byteOffset,
+        packetMillis: cursor?.nextMillis,
+        targetMillis: requestEndMillis,
+        chunkEnd
+      });
+    }
+    return requests;
+  }
+
+  function compactRequestEndMillis(utterance: Utterance, requestStartMillis: number) {
+    return utterance.endMillis > utterance.startMillis
+      ? utterance.endMillis
+      : requestStartMillis + playbackFetchWindowMillis;
+  }
+
+  function nextHistoryWindowStart(session: HistoryPlaybackSession, horizonMillis: number) {
+    const incompleteMillis = [...session.cursors.values()]
+      .filter(cursor => !cursor.complete && cursor.nextMillis < horizonMillis)
+      .map(cursor => cursor.nextMillis);
+    return incompleteMillis.length ? Math.min(...incompleteMillis) : horizonMillis;
+  }
+
+  function isSessionStream(streamKey: string, session: HistoryPlaybackSession | null): session is HistoryPlaybackSession {
     return !!session && streamKey.startsWith(`history:${session.playbackId}:`);
   }
 
@@ -758,7 +886,7 @@
   }
 
   function appendLiveUtterance(utterance: Utterance) {
-    invalidateRecordingFilesCache([utterance.channel]);
+    rememberHistoryRecordingFile(utterance);
     if (selected.size === 0 || !selected.has(utterance.channel)) {
       return;
     }

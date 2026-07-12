@@ -35,18 +35,47 @@ type ParsedUdbRecords = {
   firstRecordOffset: number | null;
 };
 
-export type HistoryPacketChunk = {
-  packets: OpusPacket[];
+type UdbTailRecords = {
+  count: number;
+  startRecord: number;
+  records: UdbRecord[];
+};
+
+type PacketWindowRange = {
+  request: HistoryPacketWindowRequest;
+  start: number;
+  parseEnd: number;
+  fetchEnd: number;
+  packetMillis: number;
+};
+
+export type HistoryPacketWindowRequest = {
+  id: string;
+  utterance: Utterance;
+  streamKey: string;
+  byteOffset?: number;
+  packetMillis?: number;
+  targetMillis?: number;
+  chunkEnd?: number;
+};
+
+export type HistoryPacketWindowUpdate = {
+  id: string;
   nextOffset: number;
   nextMillis: number;
   complete: boolean;
 };
 
+export type HistoryPacketWindow = {
+  packets: OpusPacket[];
+  updates: HistoryPacketWindowUpdate[];
+};
+
 const decoder = new TextDecoder();
+export const HISTORY_OPUS_CHUNK_BYTES = 64 * 1024;
 const UDB_HEADER_BYTES = 4;
 const UDB_RECORD_BYTES = 16;
 const UDB_CHUNK_BYTES = 50 * 1024;
-const OPUS_CHUNK_BYTES = 64 * 1024;
 const defaultRecentHistorySearchMillis = 2 * 60 * 60 * 1000;
 const DURATION_UNIT_MILLIS = 100;
 const DURATION_INDEFINITE = 0xffff;
@@ -95,52 +124,50 @@ export async function fetchUtterancePackets(utterance: Utterance, streamKey: str
   return parseOggOpusPackets(bytes, utterance, streamKey);
 }
 
-export async function fetchUtterancePacketChunk(utterance: Utterance, streamKey: string,
-                                                byteOffset: number | undefined,
-                                                packetMillis: number | undefined,
-                                                signal: AbortSignal | undefined,
-                                                minPacketMillis: number): Promise<HistoryPacketChunk> {
-  if (!utterance.opusUrl || utterance.startOffset === undefined) {
-    throw new Error('History row is missing Opus byte-range metadata.');
-  }
-  const start = byteOffset ?? utterance.startOffset;
-  const endLimit = utterance.endOffset ?? Number.POSITIVE_INFINITY;
-  if (start >= endLimit) {
-    return {
-      packets: [],
-      nextOffset: start,
-      nextMillis: packetMillis ?? utterance.startMillis,
-      complete: true
-    };
+export async function fetchUtterancePacketWindow(requests: HistoryPacketWindowRequest[],
+                                                 horizonMillis: number,
+                                                 minPacketMillis: number,
+                                                 signal?: AbortSignal): Promise<HistoryPacketWindow> {
+  const groups = new Map<string, HistoryPacketWindowRequest[]>();
+  for (const request of requests) {
+    const url = request.utterance.opusUrl;
+    if (!url || request.utterance.startOffset === undefined) continue;
+    const group = groups.get(url) ?? [];
+    group.push(request);
+    groups.set(url, group);
   }
 
-  const requestedEnd = Math.min(start + OPUS_CHUNK_BYTES, endLimit);
-  const result = await rangeCache.fetchRangeAvailable(utterance.opusUrl, start, requestedEnd, { signal });
-  const parsed = parseOggOpusPacketChunk(result.data, utterance, streamKey,
-    packetMillis ?? utterance.startMillis, minPacketMillis);
-  const nextOffset = result.start + parsed.consumedBytes;
-  const complete = parsed.consumedBytes === 0
-    || nextOffset >= endLimit
-    || (result.total !== null && nextOffset >= result.total);
+  const chunks = await Promise.all([...groups.entries()].map(([url, group]) =>
+    fetchPacketWindowGroup(url, group, horizonMillis, minPacketMillis, signal)));
   return {
-    packets: parsed.packets,
-    nextOffset,
-    nextMillis: parsed.nextMillis,
-    complete
+    packets: chunks.flatMap(chunk => chunk.packets)
+      .sort((a, b) => a.unixMillis - b.unixMillis || a.channelName.localeCompare(b.channelName)),
+    updates: chunks.flatMap(chunk => chunk.updates)
   };
 }
 
-export function invalidateRecordingFilesCache(channels?: string[]) {
-  if (!channels?.length) {
-    recordingFilesCache.clear();
-    rangeCache.clear();
-    return;
-  }
-  const changed = new Set(channels);
-  for (const key of recordingFilesCache.keys()) {
-    if (key.split('\u0000').some(channel => changed.has(channel))) {
-      recordingFilesCache.delete(key);
-    }
+export function rememberHistoryRecordingFile(utterance: Utterance) {
+  if (!utterance.opusUrl || utterance.sampleRate === undefined || utterance.frameMillis === undefined) return;
+  const dbUrl = dbUrlForOpusUrl(utterance.opusUrl);
+  if (!dbUrl) return;
+  const file = {
+    channel: utterance.channel,
+    dbUrl,
+    opusUrl: utterance.opusUrl,
+    sampleRate: utterance.sampleRate,
+    frameMillis: utterance.frameMillis
+  } satisfies RecordingFile;
+
+  // Closed-utterance messages identify the active recording file, so existing
+  // file-list cache entries can learn about it without refetching recording-files.
+  for (const [key, cached] of recordingFilesCache) {
+    const channels = key.split('\u0000').filter(Boolean);
+    if (channels.length > 0 && !channels.includes(file.channel)) continue;
+    recordingFilesCache.set(key, cached.then(files => upsertRecordingFile(files, file))
+      .catch(error => {
+        recordingFilesCache.delete(key);
+        throw error;
+      }));
   }
 }
 
@@ -189,6 +216,22 @@ function channelsKey(channels: string[]) {
   return channels.slice().sort().join('\u0000');
 }
 
+function upsertRecordingFile(files: RecordingFile[], file: RecordingFile) {
+  // Keep the cached array stable when the current file is already known.
+  const exists = files.some(item => item.channel === file.channel
+    && item.dbUrl === file.dbUrl
+    && item.opusUrl === file.opusUrl);
+  return exists ? files : [file, ...files];
+}
+
+function dbUrlForOpusUrl(opusUrl: string) {
+  // Recording pairs share a basename and directory: current.opus/current.udb.
+  const marker = '.opus';
+  const index = opusUrl.lastIndexOf(marker);
+  if (index < 0) return null;
+  return `${opusUrl.slice(0, index)}.udb${opusUrl.slice(index + marker.length)}`;
+}
+
 async function readRecentFileUtterances(file: RecordingFile, beforeMillis: number, limit: number) {
   const recordsPerChunk = Math.max(1, Math.floor(UDB_CHUNK_BYTES / UDB_RECORD_BYTES));
   let endByteExclusive: number | null = null;
@@ -220,17 +263,17 @@ async function readRecentFileUtterances(file: RecordingFile, beforeMillis: numbe
 }
 
 async function readAllFileUtterances(file: RecordingFile, fromMillis: number, toMillis: number) {
-  const count = await udbRecordCount(file);
-  if (count <= 0) return [];
   const recordsPerChunk = Math.max(1, Math.floor(UDB_CHUNK_BYTES / UDB_RECORD_BYTES));
+  const tail = await readTailRecords(file, recordsPerChunk);
+  const count = tail.count;
+  if (count <= 0) return [];
   const preferTailScan = toMillis >= Date.now() - defaultRecentHistorySearchMillis;
 
   if (preferTailScan) {
-    const tailStartRecord = Math.max(0, count - recordsPerChunk);
-    const tailRecords = await readRecords(file, tailStartRecord, count, false, count);
-    const tailOldestMillis = tailRecords[0]?.startMillis ?? Number.POSITIVE_INFINITY;
-    if (tailRecords.length && tailOldestMillis <= toMillis) {
-      return readAllFileUtterancesBackward(file, fromMillis, toMillis, tailStartRecord, tailRecords, count, recordsPerChunk);
+    const tailOldestMillis = tail.records[0]?.startMillis ?? Number.POSITIVE_INFINITY;
+    if (tail.records.length && tailOldestMillis <= toMillis) {
+      return readAllFileUtterancesBackward(file, fromMillis, toMillis,
+        tail.startRecord, tail.records, count, recordsPerChunk);
     }
   }
 
@@ -251,6 +294,34 @@ async function readAllFileUtterances(file: RecordingFile, fromMillis: number, to
     startRecord = endRecordExclusive;
   }
   return utterances;
+}
+
+async function readTailRecords(file: RecordingFile, recordsPerChunk: number): Promise<UdbTailRecords> {
+  const knownTotal = rangeCache.knownTotal(file.dbUrl);
+  if (knownTotal !== null) {
+    const count = udbRecordCountFromTotal(knownTotal);
+    const startRecord = Math.max(0, count - recordsPerChunk);
+    return {
+      count,
+      startRecord,
+      records: count > 0 ? await readRecords(file, startRecord, count, false, count) : []
+    };
+  }
+
+  const result = await rangeCache.fetchSuffix(file.dbUrl, UDB_CHUNK_BYTES);
+  if (result.total === null) {
+    throw new Error(`Range response for ${file.dbUrl} did not include a total size.`);
+  }
+  const count = udbRecordCountFromTotal(result.total);
+  const parsed = parseUdbRecords(result.data, result.start);
+  const startRecord = parsed.firstRecordOffset === null
+    ? count
+    : recordIndexForOffset(parsed.firstRecordOffset);
+  return {
+    count,
+    startRecord,
+    records: parsed.records.slice(0, Math.max(0, count - startRecord))
+  };
 }
 
 async function readAllFileUtterancesBackward(file: RecordingFile, fromMillis: number, toMillis: number,
@@ -274,16 +345,12 @@ async function readAllFileUtterancesBackward(file: RecordingFile, fromMillis: nu
   return utterances.sort((a, b) => a.startMillis - b.startMillis || a.channel.localeCompare(b.channel));
 }
 
-async function udbRecordCount(file: RecordingFile) {
-  const knownTotal = rangeCache.knownTotal(file.dbUrl);
-  if (knownTotal !== null) {
-    return Math.max(0, Math.floor((knownTotal - UDB_HEADER_BYTES) / UDB_RECORD_BYTES));
-  }
-  const result = await rangeCache.fetchSuffix(file.dbUrl, 1);
-  if (result.total === null) {
-    throw new Error(`Range response for ${file.dbUrl} did not include a total size.`);
-  }
-  return Math.max(0, Math.floor((result.total - UDB_HEADER_BYTES) / UDB_RECORD_BYTES));
+function udbRecordCountFromTotal(total: number) {
+  return Math.max(0, Math.floor((total - UDB_HEADER_BYTES) / UDB_RECORD_BYTES));
+}
+
+function recordIndexForOffset(offset: number) {
+  return Math.max(0, Math.floor((offset - UDB_HEADER_BYTES) / UDB_RECORD_BYTES));
 }
 
 async function lowerBoundRecordStart(file: RecordingFile, count: number, targetMillis: number) {
@@ -359,6 +426,112 @@ async function fetchRangeCached(url: string, start: number, end: number, blockBy
   return (await rangeCache.fetchRange(url, start, end, { blockSize: blockBytes, signal })).data;
 }
 
+async function fetchPacketWindowGroup(url: string, requests: HistoryPacketWindowRequest[],
+                                      horizonMillis: number, minPacketMillis: number,
+                                      signal?: AbortSignal): Promise<HistoryPacketWindow> {
+  const ranges = requests
+    .map(request => packetRequestRange(request, horizonMillis))
+    .filter(range => range.parseEnd > range.start)
+    .sort((a, b) => a.start - b.start || a.parseEnd - b.parseEnd);
+  if (!ranges.length) return { packets: [], updates: [] };
+
+  const start = ranges[0].start;
+  let end = ranges[0].fetchEnd;
+  for (const range of ranges) {
+    end = Math.max(end, range.fetchEnd);
+  }
+  // Decode only each utterance slice, but fetch one forward span per Opus file
+  // so nearby future utterances are cached without separate network requests.
+  const result = await rangeCache.fetchRangeAvailable(url, start, end, { signal });
+  const packets: OpusPacket[] = [];
+  const updates: HistoryPacketWindowUpdate[] = [];
+
+  for (const range of ranges) {
+    if (range.start >= result.end) {
+      updates.push({
+        id: range.request.id,
+        nextOffset: range.start,
+        nextMillis: range.packetMillis,
+        complete: packetRangeComplete(range, 0, range.start, range.packetMillis, result.total)
+      });
+      continue;
+    }
+    const sliceStart = range.start - result.start;
+    const sliceEnd = Math.min(range.parseEnd, result.end) - result.start;
+    const parsed = parseOggOpusPacketChunk(result.data.slice(sliceStart, sliceEnd),
+      range.request.utterance, range.request.streamKey, range.packetMillis, minPacketMillis);
+    const nextOffset = range.start + parsed.consumedBytes;
+    packets.push(...parsed.packets);
+    updates.push({
+      id: range.request.id,
+      nextOffset,
+      nextMillis: parsed.nextMillis,
+      complete: packetRangeComplete(range, parsed.consumedBytes, nextOffset, parsed.nextMillis, result.total)
+    });
+  }
+
+  return { packets, updates };
+}
+
+function packetRequestRange(request: HistoryPacketWindowRequest, horizonMillis: number): PacketWindowRange {
+  const utterance = request.utterance;
+  const start = request.byteOffset ?? utterance.startOffset ?? 0;
+  const packetMillis = request.packetMillis ?? utterance.startMillis;
+  if (request.chunkEnd !== undefined) {
+    return {
+      request,
+      start,
+      parseEnd: utterance.endOffset === undefined ? request.chunkEnd : Math.min(utterance.endOffset, request.chunkEnd),
+      fetchEnd: request.chunkEnd,
+      packetMillis
+    };
+  }
+
+  const targetMillis = Math.max(packetMillis, request.targetMillis ?? horizonMillis);
+  let parseEnd = start + HISTORY_OPUS_CHUNK_BYTES;
+  if (utterance.endOffset !== undefined) {
+    parseEnd = utterance.endMillis <= targetMillis
+      ? utterance.endOffset
+      : Math.min(utterance.endOffset,
+        Math.max(start + HISTORY_OPUS_CHUNK_BYTES, estimatedOffsetAtMillis(utterance, targetMillis)));
+  }
+  return {
+    request,
+    start,
+    parseEnd,
+    fetchEnd: Math.max(parseEnd, start + HISTORY_OPUS_CHUNK_BYTES),
+    packetMillis
+  };
+}
+
+function packetRangeComplete(range: PacketWindowRange, consumedBytes: number,
+                             nextOffset: number, nextMillis: number, total: number | null) {
+  const utterance = range.request.utterance;
+  if (utterance.endOffset !== undefined) return nextOffset >= utterance.endOffset;
+  if (!isClosedUtterance(utterance)) return false;
+  if (consumedBytes === 0) return total !== null && nextOffset >= total;
+  return nextMillis >= utterance.endMillis || (total !== null && nextOffset >= total);
+}
+
+function estimatedOffsetAtMillis(utterance: Utterance, millis: number) {
+  if (utterance.startOffset === undefined || utterance.endOffset === undefined) {
+    return utterance.startOffset ?? 0;
+  }
+  const durationMillis = utterance.endMillis - utterance.startMillis;
+  if (durationMillis <= 0) return utterance.startOffset;
+  const fraction = clamp((millis - utterance.startMillis) / durationMillis, 0, 1);
+  return utterance.startOffset + Math.ceil((utterance.endOffset - utterance.startOffset) * fraction);
+}
+
+function isClosedUtterance(utterance: Utterance) {
+  return utterance.endMillis > utterance.startMillis
+    && (utterance.durationMillis === undefined || utterance.durationMillis > 0);
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
 function parseOggOpusPackets(buffer: ArrayBuffer, utterance: Utterance, streamKey: string) {
   return parseOggOpusPacketChunk(buffer, utterance, streamKey, utterance.startMillis, Number.NEGATIVE_INFINITY).packets;
 }
@@ -370,8 +543,11 @@ function parseOggOpusPacketChunk(buffer: ArrayBuffer, utterance: Utterance, stre
   let offset = 0;
   let partial = new Uint8Array(0);
   let packetMillis = startPacketMillis;
-  const frameMillis = utterance.frameMillis ?? 20;
-  const sampleRate = utterance.sampleRate ?? 16_000;
+  if (utterance.frameMillis === undefined || utterance.sampleRate === undefined) {
+    throw new Error('History row is missing Opus codec metadata.');
+  }
+  const frameMillis = utterance.frameMillis;
+  const sampleRate = utterance.sampleRate;
 
   while (offset + 27 <= bytes.length) {
     if (bytes[offset] !== 0x4f || bytes[offset + 1] !== 0x67
