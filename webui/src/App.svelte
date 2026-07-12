@@ -5,10 +5,9 @@
   import HistoryTimeline from './components/HistoryTimeline.svelte';
   import { AudioEngine } from './lib/audio';
   import { appendHistoryRecordingBytes, fetchHistoryIndex, fetchRecentHistory, fetchUtterancePacketChunk, fetchUtterancePackets, historyRangeCacheStats, invalidateRecordingFilesCache } from './lib/historyHttp';
-  import { HistoryPlaybackTracker } from './lib/historyPlayback';
   import { RowPlaybackHighlighter, utteranceKey } from './lib/rowPlayback';
   import { opusPacketsToWav } from './lib/wav';
-  import type { Channel, OpusPacket, RecordingBytes, ServerMessage, Utterance } from './lib/types';
+  import type { Channel, OpusPacket, PlaybackMode, RecordingBytes, ServerMessage, Utterance } from './lib/types';
   import { connectSocket, send } from './lib/ws';
 
   const historyPageSize = 20;
@@ -37,6 +36,8 @@
     utterances: Utterance[];
     originMillis: number;
     compactStreamKey: string | null;
+    playbackMode: PlaybackMode;
+    jumpRealtimeOnFinish: boolean;
     abort: AbortController;
     nextUtteranceIndex: number;
     cursor: HistoryChunkCursor | null;
@@ -75,13 +76,10 @@
   let channelsOpen = false;
 
   const audio = new AudioEngine();
-  const historyPlayback = new HistoryPlaybackTracker();
   const rowHighlighter = new RowPlaybackHighlighter(rows => playingRows = rows);
   let scheduledHistoryFrames: ScheduledHistoryFrame[] = [];
   let historySession: HistoryPlaybackSession | null = null;
-  let historyAbort: AbortController | null = null;
   let nextPlaybackId = 1;
-  let jumpRealtimeOnPlaybackFinish = new Set<number>();
   let playingRows = new Set<string>();
   let replayingLast = new Set<string>();
   let tickTimer: ReturnType<typeof setInterval>;
@@ -165,7 +163,9 @@
   }
 
   function playbackModeFor(streamKey: string) {
-    return historyPlayback.modeFor(streamKey);
+    return historySession && isSessionStream(streamKey, historySession)
+      ? historySession.playbackMode
+      : null;
   }
 
   function shouldPlayIncomingPacket(packet: OpusPacket) {
@@ -529,14 +529,11 @@
 
   function clearHistoryPlaybackState(flushAudio: boolean) {
     const keepPlayheadMillis = currentTimelinePlayhead();
-    historyAbort?.abort();
-    historyAbort = null;
+    historySession?.abort.abort();
     historySession = null;
     if (flushAudio) {
       audio.flushPrefix('history:');
     }
-    historyPlayback.clear();
-    jumpRealtimeOnPlaybackFinish = new Set();
     replayingLast = new Set();
     scheduledHistoryFrames = [];
     rowHighlighter.clear();
@@ -550,21 +547,15 @@
   }
 
   function handleStreamIdle(streamKey: string) {
-    const completed = historyPlayback.streamIdle(streamKey);
-    if (completePlayback(completed)) {
-      return;
-    }
-    if (streamKey.startsWith('history:')) {
+    if (isSessionStream(streamKey, historySession)) {
       void queueNextHistoryChunk(historySession);
     }
   }
 
-  function completePlayback(completed: { playbackId: number; channels: string[] } | null) {
-    if (!completed) return false;
-    const jumpRealtime = jumpRealtimeOnPlaybackFinish.has(completed.playbackId);
-    jumpRealtimeOnPlaybackFinish.delete(completed.playbackId);
+  function completePlayback(session: HistoryPlaybackSession) {
+    if (session !== historySession) return false;
     const next = new Set(replayingLast);
-    for (const channel of completed.channels) next.delete(channel);
+    for (const channel of session.channels) next.delete(channel);
     replayingLast = next;
     scheduledHistoryFrames = [];
     rowHighlighter.clear();
@@ -572,10 +563,8 @@
     historyPaused = false;
     playbackClockOriginMillis = 0;
     playbackClockStartedAt = 0;
-    if (historySession?.playbackId === completed.playbackId) {
-      historySession = null;
-    }
-    if (jumpRealtime) {
+    historySession = null;
+    if (session.jumpRealtimeOnFinish) {
       jumpToRealtime();
       return true;
     }
@@ -587,16 +576,12 @@
                                       options: { jumpRealtimeOnFinish?: boolean } = {}) {
     const playbackId = nextPlaybackId++;
     const abort = new AbortController();
-    historyAbort = abort;
-    if (options.jumpRealtimeOnFinish) {
-      jumpRealtimeOnPlaybackFinish = new Set(jumpRealtimeOnPlaybackFinish).add(playbackId);
-    }
-    historyPlayback.start(playbackId, channels, {
+    const playbackMode = {
       realtime,
       originMillis,
       originAudioTime: audio.audioTime(0.15),
       speed: playbackSpeed
-    });
+    } satisfies PlaybackMode;
     historyPlaying = true;
     historyPaused = false;
     playbackClockOriginMillis = originMillis;
@@ -611,6 +596,8 @@
       utterances: uniqueUtterances,
       originMillis,
       compactStreamKey: realtime ? null : `history:${playbackId}:skip-silence`,
+      playbackMode,
+      jumpRealtimeOnFinish: options.jumpRealtimeOnFinish ?? false,
       abort,
       nextUtteranceIndex: 0,
       cursor: null,
@@ -629,10 +616,7 @@
       while (session === historySession && !session.abort.signal.aborted) {
         const cursor = nextHistoryCursor(session);
         if (!cursor) {
-          const completed = completePlayback(historyPlayback.serverDone(session.playbackId));
-          if (!completed) {
-            status = 'Queued historical playback';
-          }
+          completePlayback(session);
           return;
         }
 
@@ -650,8 +634,7 @@
 
         for (const packet of chunk.packets) {
           if (session.abort.signal.aborted) break;
-          historyPlayback.trackPacket(packet);
-          audio.enqueue(packet, playbackModeFor(packet.streamKey));
+          audio.enqueue(packet, session.playbackMode);
         }
         status = `Queued ${chunk.packets.length} historical packets`;
         return;
@@ -662,9 +645,6 @@
       }
     } finally {
       session.fetching = false;
-      if (historyAbort === session.abort && session !== historySession) {
-        historyAbort = null;
-      }
     }
   }
 
@@ -689,6 +669,14 @@
     return null;
   }
 
+  function isSessionStream(streamKey: string, session: HistoryPlaybackSession | null) {
+    return !!session && streamKey.startsWith(`history:${session.playbackId}:`);
+  }
+
+  function channelFromHistoryStreamKey(streamKey: string) {
+    return streamKey.replace(/^history:\d+:/, '');
+  }
+
   async function downloadHistoryUtterance(utterance: Utterance) {
     try {
       status = `Preparing ${utterance.channel}-${utterance.startMillis}.wav...`;
@@ -711,7 +699,7 @@
   function handleFrameScheduled(streamKey: string, targetMillis: number, startTime: number,
                                 durationSeconds: number, channelName: string) {
     if (!streamKey.startsWith('history:')) return;
-    const channel = channelName || historyPlayback.channelFromStreamKey(streamKey);
+    const channel = channelName || channelFromHistoryStreamKey(streamKey);
     const delayMillis = Math.max(0, (startTime - audio.currentTime()) * 1000);
     const startAtMillis = performance.now() + delayMillis;
     const endAtMillis = startAtMillis + durationSeconds * 1000 + 150;
