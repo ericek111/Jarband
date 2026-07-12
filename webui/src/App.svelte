@@ -508,9 +508,19 @@
   }
 
   function changePlaybackSpeed(speed: number) {
-    playbackSpeed = speed;
-    if (historyPlaying) {
-      seekHistoryTo(currentTimelinePlayhead());
+    const nextSpeed = clamp(speed, 0.5, 4);
+    if (nextSpeed === playbackSpeed) return;
+    const currentPlayhead = currentTimelinePlayhead();
+    playbackSpeed = nextSpeed;
+    if (!historyPlaying) return;
+
+    playbackClockOriginMillis = currentPlayhead;
+    playbackClockStartedAt = performance.now();
+    const session = historySession;
+    if (session) {
+      session.playbackMode.speed = nextSpeed;
+      session.playbackMode.originMillis = currentPlayhead;
+      session.playbackMode.originAudioTime = audio.audioTime(0.05);
     }
   }
 

@@ -216,6 +216,10 @@
     onSpeedChange(Number((event.currentTarget as HTMLInputElement).value));
   }
 
+  function resetSpeed() {
+    onSpeedChange(1);
+  }
+
   function changeSkipSilence(event: Event) {
     onSkipSilenceChange((event.currentTarget as HTMLInputElement).checked);
   }
@@ -528,9 +532,12 @@
       <span class="icon-symbol">+</span>
     </button>
     <label class="speed-control">
-      <span>{playbackSpeed.toFixed(1)}×</span>
+      <button type="button" class="speed-label" aria-label="Reset playback speed to 1.0x"
+        onclick={resetSpeed}>
+        {playbackSpeed.toFixed(1)}×
+      </button>
       <input value={playbackSpeed} type="range" min="0.5" max="4" step="0.1"
-        onchange={changeSpeed} />
+        oninput={changeSpeed} />
     </label>
     <label class="checkbox skip-silence">
       <input checked={skipSilence} type="checkbox" onchange={changeSkipSilence} />
@@ -598,9 +605,14 @@
     font-size: 13px;
   }
 
-  .speed-control span {
+  .speed-label {
+    border: 0;
+    padding: 0;
+    background: none;
     color: #9ee6b5;
+    cursor: pointer;
     font-weight: 700;
+    text-align: left;
   }
 
   .speed-control input {
