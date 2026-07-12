@@ -1,12 +1,20 @@
-import type { OpusPacket, ServerMessage } from './types';
+import type { OpusPacket, RecordingBytes, ServerMessage } from './types';
 
 const MAGIC = 0x4a424f50;
+const RECORDING_MAGIC = 0x4a425243;
 const decoder = new TextDecoder();
 
-export function connectSocket(onMessage: (message: ServerMessage) => void, onPacket: (packet: OpusPacket) => void, onStatus: (status: string) => void) {
+export function connectSocket(
+  onMessage: (message: ServerMessage) => void,
+  onPacket: (packet: OpusPacket) => void,
+  onRecordingBytes: (bytes: RecordingBytes) => void,
+  onStatus: (status: string) => void,
+  onSocket?: (socket: WebSocket) => void
+) {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const socket = new WebSocket(`${protocol}//${location.host}/airband/ws`);
   socket.binaryType = 'arraybuffer';
+  onSocket?.(socket);
 
   socket.addEventListener('open', () => {
     onStatus('Connected');
@@ -14,13 +22,15 @@ export function connectSocket(onMessage: (message: ServerMessage) => void, onPac
   });
   socket.addEventListener('close', () => {
     onStatus('Disconnected; reconnecting...');
-    setTimeout(() => connectSocket(onMessage, onPacket, onStatus), 1500);
+    setTimeout(() => connectSocket(onMessage, onPacket, onRecordingBytes, onStatus, onSocket), 1500);
   });
   socket.addEventListener('message', event => {
     if (typeof event.data === 'string') {
       onMessage(JSON.parse(event.data) as ServerMessage);
     } else {
-      parsePackets(event.data as ArrayBuffer).forEach(onPacket);
+      const parsed = parseBinary(event.data as ArrayBuffer);
+      parsed.packets.forEach(onPacket);
+      parsed.recordingBytes.forEach(onRecordingBytes);
     }
   });
 
@@ -31,6 +41,14 @@ export function send(socket: WebSocket | null, message: unknown) {
   if (socket?.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify(message));
   }
+}
+
+function parseBinary(buffer: ArrayBuffer): { packets: OpusPacket[]; recordingBytes: RecordingBytes[] } {
+  if (buffer.byteLength < 4) return { packets: [], recordingBytes: [] };
+  const magic = new DataView(buffer).getUint32(0, true);
+  if (magic === MAGIC) return { packets: parsePackets(buffer), recordingBytes: [] };
+  if (magic === RECORDING_MAGIC) return { packets: [], recordingBytes: parseRecordingBytes(buffer) };
+  return { packets: [], recordingBytes: [] };
 }
 
 function parsePackets(buffer: ArrayBuffer): OpusPacket[] {
@@ -88,5 +106,54 @@ function parseRecord(buffer: ArrayBuffer, offset: number): { packet: OpusPacket;
       packet: new Uint8Array(buffer, payloadOffset, packetLength).slice()
     },
     nextOffset: payloadOffset + packetLength
+  };
+}
+
+function parseRecordingBytes(buffer: ArrayBuffer): RecordingBytes[] {
+  const view = new DataView(buffer);
+  if (view.getUint32(0, true) !== RECORDING_MAGIC) return [];
+  const version = view.getUint16(4, true);
+  if (version !== 1) return [];
+
+  const count = view.getUint16(6, true);
+  let offset = 8;
+  const records: RecordingBytes[] = [];
+  for (let i = 0; i < count; i++) {
+    const parsed = parseRecordingRecord(buffer, offset);
+    if (!parsed) break;
+    records.push(parsed.bytes);
+    offset = parsed.nextOffset;
+  }
+  return records;
+}
+
+function parseRecordingRecord(buffer: ArrayBuffer, offset: number): { bytes: RecordingBytes; nextOffset: number } | null {
+  if (offset + 16 > buffer.byteLength) return null;
+  const view = new DataView(buffer);
+  const recordVersion = view.getUint16(offset, true);
+  if (recordVersion !== 1) return null;
+
+  const channelId = view.getUint16(offset + 2, true);
+  const recordingOffset = view.getUint32(offset + 4, true);
+  const payloadLength = view.getUint32(offset + 8, true);
+  const nameLength = view.getUint16(offset + 12, true);
+  const fileLength = view.getUint16(offset + 14, true);
+  const nameOffset = offset + 16;
+  const fileOffset = nameOffset + nameLength;
+  const payloadOffset = fileOffset + fileLength;
+  const nextOffset = payloadOffset + payloadLength;
+  if (nextOffset > buffer.byteLength) return null;
+
+  const channelName = decoder.decode(new Uint8Array(buffer, nameOffset, nameLength));
+  const fileName = decoder.decode(new Uint8Array(buffer, fileOffset, fileLength));
+  return {
+    bytes: {
+      channelId,
+      channelName,
+      recordingUrl: `/airband/recordings/${channelName}/${fileName}`,
+      offset: recordingOffset,
+      data: new Uint8Array(buffer, payloadOffset, payloadLength).slice()
+    },
+    nextOffset
   };
 }

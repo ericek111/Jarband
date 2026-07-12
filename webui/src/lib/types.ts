@@ -36,6 +36,14 @@ export type OpusPacket = {
   packet: Uint8Array;
 };
 
+export type RecordingBytes = {
+  channelId: number;
+  channelName: string;
+  recordingUrl: string;
+  offset: number;
+  data: Uint8Array;
+};
+
 export type PlaybackMode = {
   realtime: boolean;
   originMillis: number;

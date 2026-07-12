@@ -35,11 +35,18 @@ type ParsedUdbRecords = {
   firstRecordOffset: number | null;
 };
 
+export type HistoryPacketChunk = {
+  packets: OpusPacket[];
+  nextOffset: number;
+  nextMillis: number;
+  complete: boolean;
+};
+
 const decoder = new TextDecoder();
 const UDB_HEADER_BYTES = 4;
 const UDB_RECORD_BYTES = 16;
 const UDB_CHUNK_BYTES = 50 * 1024;
-const OPUS_CHUNK_BYTES = 500 * 1024;
+const OPUS_CHUNK_BYTES = 64 * 1024;
 const defaultRecentHistorySearchMillis = 2 * 60 * 60 * 1000;
 const DURATION_UNIT_MILLIS = 100;
 const DURATION_INDEFINITE = 0xffff;
@@ -84,8 +91,43 @@ export async function fetchUtterancePackets(utterance: Utterance, streamKey: str
   }
   const bytes = utterance.endOffset === undefined
     ? (await rangeCache.fetchOpenEnded(utterance.opusUrl, utterance.startOffset, { signal })).data
-    : await fetchRangeCached(utterance.opusUrl, utterance.startOffset, utterance.endOffset, OPUS_CHUNK_BYTES, signal);
+    : (await rangeCache.fetchRange(utterance.opusUrl, utterance.startOffset, utterance.endOffset, { signal })).data;
   return parseOggOpusPackets(bytes, utterance, streamKey);
+}
+
+export async function fetchUtterancePacketChunk(utterance: Utterance, streamKey: string,
+                                                byteOffset: number | undefined,
+                                                packetMillis: number | undefined,
+                                                signal: AbortSignal | undefined,
+                                                minPacketMillis: number): Promise<HistoryPacketChunk> {
+  if (!utterance.opusUrl || utterance.startOffset === undefined) {
+    throw new Error('History row is missing Opus byte-range metadata.');
+  }
+  const start = byteOffset ?? utterance.startOffset;
+  const endLimit = utterance.endOffset ?? Number.POSITIVE_INFINITY;
+  if (start >= endLimit) {
+    return {
+      packets: [],
+      nextOffset: start,
+      nextMillis: packetMillis ?? utterance.startMillis,
+      complete: true
+    };
+  }
+
+  const requestedEnd = Math.min(start + OPUS_CHUNK_BYTES, endLimit);
+  const result = await rangeCache.fetchRangeAvailable(utterance.opusUrl, start, requestedEnd, { signal });
+  const parsed = parseOggOpusPacketChunk(result.data, utterance, streamKey,
+    packetMillis ?? utterance.startMillis, minPacketMillis);
+  const nextOffset = result.start + parsed.consumedBytes;
+  const complete = parsed.consumedBytes === 0
+    || nextOffset >= endLimit
+    || (result.total !== null && nextOffset >= result.total);
+  return {
+    packets: parsed.packets,
+    nextOffset,
+    nextMillis: parsed.nextMillis,
+    complete
+  };
 }
 
 export function invalidateRecordingFilesCache(channels?: string[]) {
@@ -104,6 +146,16 @@ export function invalidateRecordingFilesCache(channels?: string[]) {
 
 export function historyRangeCacheStats() {
   return rangeCache.stats();
+}
+
+export function appendHistoryRecordingBytes(recordingUrl: string, offset: number, data: Uint8Array) {
+  if (data.byteLength === 0) {
+    rangeCache.truncate(recordingUrl, offset);
+    return;
+  }
+  const end = offset + data.byteLength;
+  rangeCache.putRange(recordingUrl, offset, data, Math.max(end, rangeCache.knownTotal(recordingUrl) ?? 0),
+    { overwrite: recordingUrl.endsWith('.udb') });
 }
 
 function historyParams(channels: string[]) {
@@ -308,11 +360,16 @@ async function fetchRangeCached(url: string, start: number, end: number, blockBy
 }
 
 function parseOggOpusPackets(buffer: ArrayBuffer, utterance: Utterance, streamKey: string) {
+  return parseOggOpusPacketChunk(buffer, utterance, streamKey, utterance.startMillis, Number.NEGATIVE_INFINITY).packets;
+}
+
+function parseOggOpusPacketChunk(buffer: ArrayBuffer, utterance: Utterance, streamKey: string,
+                                 startPacketMillis: number, minPacketMillis: number) {
   const bytes = new Uint8Array(buffer);
   const packets: OpusPacket[] = [];
   let offset = 0;
   let partial = new Uint8Array(0);
-  let packetMillis = utterance.startMillis;
+  let packetMillis = startPacketMillis;
   const frameMillis = utterance.frameMillis ?? 20;
   const sampleRate = utterance.sampleRate ?? 16_000;
 
@@ -343,18 +400,18 @@ function parseOggOpusPackets(buffer: ArrayBuffer, utterance: Utterance, streamKe
 
       if (len < 255) {
         if (!isHeaderPacket(partial)) {
-          if (utterance.endMillis > utterance.startMillis && packetMillis >= utterance.endMillis) {
-            return packets;
+          const insideUtterance = utterance.endMillis <= utterance.startMillis || packetMillis < utterance.endMillis;
+          if (insideUtterance && packetMillis + frameMillis >= minPacketMillis) {
+            packets.push({
+              streamKey,
+              channelName: utterance.channel,
+              channelId: 0,
+              sampleRate,
+              unixMillis: packetMillis,
+              durationMillis: frameMillis,
+              packet: partial.slice()
+            });
           }
-          packets.push({
-            streamKey,
-            channelName: utterance.channel,
-            channelId: 0,
-            sampleRate,
-            unixMillis: packetMillis,
-            durationMillis: frameMillis,
-            packet: partial.slice()
-          });
           packetMillis += frameMillis;
         }
         partial = new Uint8Array(0);
@@ -362,7 +419,7 @@ function parseOggOpusPackets(buffer: ArrayBuffer, utterance: Utterance, streamKe
     }
     offset = payloadOffset + payloadSize;
   }
-  return packets;
+  return { packets, consumedBytes: offset, nextMillis: packetMillis };
 }
 
 function isHeaderPacket(packet: Uint8Array) {

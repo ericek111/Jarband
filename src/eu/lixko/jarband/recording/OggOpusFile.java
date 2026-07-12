@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
 
@@ -25,6 +26,7 @@ public final class OggOpusFile implements AutoCloseable {
     private final int granuleIncrement;
     private final MemorySegment stream;
     private final MemorySegment page;
+    private final ArrayList<WrittenRange> writtenRanges = new ArrayList<>();
     private int serial;
     private int byteOffset;
     private long granulePosition;
@@ -65,6 +67,7 @@ public final class OggOpusFile implements AutoCloseable {
                 initStream(state.nextPageSequence());
             }
         }
+        writtenRanges.clear();
     }
 
     public synchronized int offsetForNextPacket() {
@@ -86,6 +89,12 @@ public final class OggOpusFile implements AutoCloseable {
 
     public synchronized void flushPendingAudio() throws IOException {
         flushAudio(false);
+    }
+
+    public synchronized List<WrittenRange> drainWrittenRanges() {
+        List<WrittenRange> ranges = List.copyOf(writtenRanges);
+        writtenRanges.clear();
+        return ranges;
     }
 
     private void writeHeaders() throws IOException {
@@ -196,15 +205,34 @@ public final class OggOpusFile implements AutoCloseable {
     }
 
     private void writeSegment(MemorySegment segment) throws IOException {
-        ByteBuffer buffer = segment.asByteBuffer();
+        byte[] bytes = new byte[Math.toIntExact(segment.byteSize())];
+        segment.asByteBuffer().get(bytes);
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        int offset = byteOffset;
         channel.position(byteOffset);
         while (buffer.hasRemaining()) {
             channel.write(buffer);
         }
-        byteOffset += (int) segment.byteSize();
-        if (byteOffset < 0) {
+        if (Integer.MAX_VALUE - byteOffset < bytes.length) {
             throw new IOException("Ogg Opus file exceeds 32-bit offset contract");
         }
+        byteOffset += bytes.length;
+        appendWrittenRange(offset, bytes);
+    }
+
+    private void appendWrittenRange(int offset, byte[] bytes) {
+        if (bytes.length == 0) return;
+        int lastIndex = writtenRanges.size() - 1;
+        if (lastIndex >= 0) {
+            WrittenRange last = writtenRanges.get(lastIndex);
+            if (last.offset() + last.bytes().length == offset) {
+                byte[] merged = java.util.Arrays.copyOf(last.bytes(), last.bytes().length + bytes.length);
+                System.arraycopy(bytes, 0, merged, last.bytes().length, bytes.length);
+                writtenRanges.set(lastIndex, new WrittenRange(last.offset(), merged));
+                return;
+            }
+        }
+        writtenRanges.add(new WrittenRange(offset, bytes));
     }
 
     private ResumeState scanExisting() throws IOException {
@@ -352,4 +380,15 @@ public final class OggOpusFile implements AutoCloseable {
 
     private record ResumeState(int serial, int nextPageSequence, long granulePosition,
                                long packetCount, int byteOffset, boolean endOfStream) {}
+
+    public record WrittenRange(int offset, byte[] bytes) {
+        public WrittenRange {
+            bytes = java.util.Arrays.copyOf(bytes, bytes.length);
+        }
+
+        @Override
+        public byte[] bytes() {
+            return bytes;
+        }
+    }
 }

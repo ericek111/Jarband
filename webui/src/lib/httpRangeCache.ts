@@ -25,6 +25,10 @@ export type HttpRangeRequestOptions = {
   blockSize?: number;
 };
 
+export type HttpRangePutOptions = {
+  overwrite?: boolean;
+};
+
 type CachedBlock = {
   start: number;
   end: number;
@@ -90,6 +94,42 @@ export class SparseHttpRangeCache {
     return { url, start, end, total: this.knownTotal(url), data, fromCache: false };
   }
 
+  async fetchRangeAvailable(url: string, start: number, end: number,
+                            options: HttpRangeRequestOptions = {}): Promise<HttpRangeFetchResult> {
+    assertBoundedRange(start, end);
+    const total = this.knownTotal(url);
+    if (total !== null) {
+      if (start >= total) {
+        return { url, start, end: start, total, data: new ArrayBuffer(0), fromCache: true };
+      }
+      end = Math.min(end, total);
+    }
+
+    const cached = this.readCached(url, start, end);
+    if (cached) {
+      return { url, start, end, total: this.knownTotal(url), data: cached, fromCache: true };
+    }
+
+    const missing = coalesceRanges(this.missingRanges(url, start, end)
+      .map(range => alignRange(range, options.blockSize)));
+    for (const range of missing) {
+      const result = await this.fetchHttpRange(url, `bytes=${range.start}-${range.end - 1}`, options.signal);
+      this.addBlock(url, result.start, result.end, result.data, result.total);
+    }
+
+    const knownTotal = this.knownTotal(url);
+    const availableEnd = knownTotal === null ? end : Math.min(end, knownTotal);
+    if (availableEnd <= start) {
+      return { url, start, end: start, total: knownTotal, data: new ArrayBuffer(0), fromCache: false };
+    }
+
+    const data = this.readCached(url, start, availableEnd);
+    if (!data) {
+      throw new Error(`Fetched ranges did not cover requested bytes ${start}-${availableEnd - 1}.`);
+    }
+    return { url, start, end: availableEnd, total: knownTotal, data, fromCache: false };
+  }
+
   async fetchOpenEnded(url: string, start: number,
                        options: HttpRangeRequestOptions = {}): Promise<HttpRangeFetchResult> {
     if (!Number.isSafeInteger(start) || start < 0) {
@@ -138,6 +178,34 @@ export class SparseHttpRangeCache {
 
   knownTotal(url: string) {
     return this.entries.get(url)?.total ?? null;
+  }
+
+  truncate(url: string, total: number) {
+    if (!Number.isSafeInteger(total) || total < 0) {
+      throw new Error(`Invalid total size: ${total}`);
+    }
+    const entry = this.entryFor(url);
+    entry.total = total;
+    entry.blocks = entry.blocks.flatMap(block => {
+      if (block.start >= total) return [];
+      if (block.end <= total) return [block];
+      return [{
+        ...block,
+        end: total,
+        data: block.data.slice(0, total - block.start),
+        lastUsed: this.nextAccessTick()
+      }];
+    });
+  }
+
+  putRange(url: string, start: number, data: ArrayBuffer | Uint8Array,
+           total?: number | null, options: HttpRangePutOptions = {}) {
+    if (!Number.isSafeInteger(start) || start < 0) {
+      throw new Error(`Invalid range start: ${start}`);
+    }
+    const bytes = arrayBufferFor(data);
+    this.addBlock(url, start, start + bytes.byteLength, bytes,
+      total ?? start + bytes.byteLength, options.overwrite ?? false);
   }
 
   stats(): HttpRangeCacheStats {
@@ -217,11 +285,12 @@ export class SparseHttpRangeCache {
     return missing;
   }
 
-  private addBlock(url: string, start: number, end: number, data: ArrayBuffer, total: number | null) {
+  private addBlock(url: string, start: number, end: number, data: ArrayBuffer,
+                   total: number | null, overwrite = false) {
     if (end <= start || data.byteLength === 0) return;
     const entry = this.entryFor(url);
     if (total !== null) entry.total = total;
-    if (this.cachedSegments(url, start, end)) return;
+    if (!overwrite && this.cachedSegments(url, start, end)) return;
 
     const nextBlock: CachedBlock = {
       start,
@@ -364,4 +433,16 @@ function compareBlocks(a: CachedBlock, b: CachedBlock) {
 
 function totalBytes(blocks: CachedBlock[]) {
   return blocks.reduce((total, block) => total + block.data.byteLength, 0);
+}
+
+function arrayBufferFor(data: ArrayBuffer | Uint8Array): ArrayBuffer {
+  if (data instanceof ArrayBuffer) return data;
+  if (data.buffer instanceof ArrayBuffer) {
+    return data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
+    ? data.buffer
+    : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+  }
+  const copy = new Uint8Array(data.byteLength);
+  copy.set(data);
+  return copy.buffer;
 }

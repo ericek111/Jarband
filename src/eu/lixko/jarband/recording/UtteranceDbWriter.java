@@ -7,6 +7,8 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.List;
 
 public final class UtteranceDbWriter implements AutoCloseable {
     public static final int FORMAT_VERSION = 2;
@@ -18,7 +20,7 @@ public final class UtteranceDbWriter implements AutoCloseable {
 
     private final FileChannel channel;
     private final ByteBuffer header = ByteBuffer.allocate(HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN);
-    private final ByteBuffer record = ByteBuffer.allocate(RECORD_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+    private final ArrayList<WrittenRange> writtenRanges = new ArrayList<>();
 
     public UtteranceDbWriter(Path path) throws IOException {
         Files.createDirectories(path.getParent());
@@ -27,38 +29,52 @@ public final class UtteranceDbWriter implements AutoCloseable {
         ensureHeader();
     }
 
-    public synchronized void append(long unixMillisStart, int opusFileByteOffset,
-                                    long durationMillis, float averageSnrDb) throws IOException {
-        writeRecord(channel.size(), unixMillisStart, opusFileByteOffset, durationMillis, averageSnrDb);
+    public synchronized WrittenRange append(long unixMillisStart, int opusFileByteOffset,
+                                            long durationMillis, float averageSnrDb) throws IOException {
+        return writeRecord(channel.size(), unixMillisStart, opusFileByteOffset, durationMillis, averageSnrDb);
     }
 
-    public synchronized long appendOpen(long unixMillisStart, int opusFileByteOffset) throws IOException {
+    public synchronized WrittenRange appendOpen(long unixMillisStart, int opusFileByteOffset) throws IOException {
         long recordOffset = channel.size();
-        writeRecord(recordOffset, unixMillisStart, opusFileByteOffset, 0, 0.0f);
-        return recordOffset;
+        return writeRecord(recordOffset, unixMillisStart, opusFileByteOffset, 0, 0.0f);
     }
 
-    public synchronized void update(long recordOffset, long unixMillisStart, int opusFileByteOffset,
-                                    long durationMillis, float averageSnrDb) throws IOException {
-        writeRecord(recordOffset, unixMillisStart, opusFileByteOffset, durationMillis, averageSnrDb);
+    public synchronized WrittenRange update(long recordOffset, long unixMillisStart, int opusFileByteOffset,
+                                            long durationMillis, float averageSnrDb) throws IOException {
+        return writeRecord(recordOffset, unixMillisStart, opusFileByteOffset, durationMillis, averageSnrDb);
     }
 
     public synchronized void truncateFrom(long recordOffset) throws IOException {
         channel.truncate(recordOffset);
     }
 
-    private void writeRecord(long recordOffset, long unixMillisStart, int opusFileByteOffset,
-                             long durationMillis, float averageSnrDb) throws IOException {
-        record.clear();
-        record.putLong(unixMillisStart);
-        record.putInt(opusFileByteOffset);
-        record.putShort((short) durationTensMillis(durationMillis));
-        record.putShort(snrQ8_8(averageSnrDb));
-        record.flip();
+    public synchronized List<WrittenRange> drainWrittenRanges() {
+        List<WrittenRange> ranges = List.copyOf(writtenRanges);
+        writtenRanges.clear();
+        return ranges;
+    }
+
+    private WrittenRange writeRecord(long recordOffset, long unixMillisStart, int opusFileByteOffset,
+                                     long durationMillis, float averageSnrDb) throws IOException {
+        byte[] bytes = recordBytes(unixMillisStart, opusFileByteOffset, durationMillis, averageSnrDb);
+        ByteBuffer record = ByteBuffer.wrap(bytes);
         channel.position(recordOffset);
         while (record.hasRemaining()) {
             channel.write(record);
         }
+        WrittenRange range = new WrittenRange(Math.toIntExact(recordOffset), bytes);
+        writtenRanges.add(range);
+        return range;
+    }
+
+    private byte[] recordBytes(long unixMillisStart, int opusFileByteOffset,
+                               long durationMillis, float averageSnrDb) {
+        ByteBuffer buffer = ByteBuffer.allocate(RECORD_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        buffer.putLong(unixMillisStart);
+        buffer.putInt(opusFileByteOffset);
+        buffer.putShort((short) durationTensMillis(durationMillis));
+        buffer.putShort(snrQ8_8(averageSnrDb));
+        return buffer.array();
     }
 
     private void ensureHeader() throws IOException {
@@ -70,6 +86,10 @@ public final class UtteranceDbWriter implements AutoCloseable {
             while (header.hasRemaining()) {
                 channel.write(header);
             }
+            writtenRanges.add(new WrittenRange(0, ByteBuffer.allocate(HEADER_BYTES)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .putInt(FORMAT_VERSION)
+                    .array()));
             return;
         }
     }
@@ -90,5 +110,16 @@ public final class UtteranceDbWriter implements AutoCloseable {
     @Override
     public void close() throws IOException {
         channel.close();
+    }
+
+    public record WrittenRange(int offset, byte[] bytes) {
+        public WrittenRange {
+            bytes = java.util.Arrays.copyOf(bytes, bytes.length);
+        }
+
+        @Override
+        public byte[] bytes() {
+            return bytes;
+        }
     }
 }

@@ -52,7 +52,9 @@ public final class ChannelRecorder implements AutoCloseable {
         if (!utteranceOpen) {
             utteranceStartMillis = unixMillis;
             utteranceStartOffset = opusFile.offsetForNextPacket();
-            utteranceDbOffset = dbFile.appendOpen(utteranceStartMillis, utteranceStartOffset);
+            UtteranceDbWriter.WrittenRange dbRange = dbFile.appendOpen(utteranceStartMillis, utteranceStartOffset);
+            utteranceDbOffset = dbRange.offset();
+            publishDbRecordingBytes();
             utteranceOpen = true;
         }
         for (int i = 0; i < length; i++) {
@@ -63,6 +65,7 @@ public final class ChannelRecorder implements AutoCloseable {
             if (frameFill == frameBuffer.length) {
                 int bytes = encoder.encode(frameBuffer, packet);
                 opusFile.writeAudioPacket(packet, bytes);
+                publishRecordingBytes();
                 publishFrame(bytes);
                 frameFill = 0;
             }
@@ -81,12 +84,15 @@ public final class ChannelRecorder implements AutoCloseable {
             // playable byte range immediately.
             frameFill = 0;
             opusFile.flushPendingAudio();
+            publishRecordingBytes();
             int utteranceEndOffset = opusFile.offsetForNextPacket();
             if (durationMillis < MIN_STORED_UTTERANCE_MILLIS || utteranceEndOffset <= utteranceStartOffset) {
                 dbFile.truncateFrom(utteranceDbOffset);
+                publishRecordingBytes(rotationKey + ".udb", Math.toIntExact(utteranceDbOffset), new byte[0]);
             } else {
                 dbFile.update(utteranceDbOffset, utteranceStartMillis, utteranceStartOffset,
                         durationMillis, averageSnrDb);
+                publishDbRecordingBytes();
                 closed = new OpusFrameSink.UtteranceClosed(channel.id(), channel.name(),
                         utteranceStartMillis, unixMillis, durationMillis, averageSnrDb,
                         rotationKey + ".opus", utteranceStartOffset, utteranceEndOffset,
@@ -99,6 +105,7 @@ public final class ChannelRecorder implements AutoCloseable {
         frameFill = 0;
         if (opusFile != null && closed == null) {
             opusFile.flushPendingAudio();
+            publishRecordingBytes();
         }
         return closed;
     }
@@ -108,6 +115,33 @@ public final class ChannelRecorder implements AutoCloseable {
             frameSink.accept(new EncodedOpusFrame(channel.id(), channel.name(), frameStartMillis,
                     opusFrameMillis, opusSampleRate, packetSequence++,
                     java.util.Arrays.copyOf(packet, bytes)));
+        }
+    }
+
+    private void publishRecordingBytes() {
+        if (frameSink == null || opusFile == null) {
+            return;
+        }
+        String opusFileName = rotationKey + ".opus";
+        for (OggOpusFile.WrittenRange range : opusFile.drainWrittenRanges()) {
+            publishRecordingBytes(opusFileName, range.offset(), range.bytes());
+        }
+    }
+
+    private void publishDbRecordingBytes() {
+        if (frameSink == null || dbFile == null) {
+            return;
+        }
+        String dbFileName = rotationKey + ".udb";
+        for (UtteranceDbWriter.WrittenRange range : dbFile.drainWrittenRanges()) {
+            publishRecordingBytes(dbFileName, range.offset(), range.bytes());
+        }
+    }
+
+    private void publishRecordingBytes(String fileName, int offset, byte[] bytes) {
+        if (frameSink != null) {
+            frameSink.recordingBytes(new OpusFrameSink.RecordingBytes(channel.id(), channel.name(),
+                    fileName, offset, bytes));
         }
     }
 

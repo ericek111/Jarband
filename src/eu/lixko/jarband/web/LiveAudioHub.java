@@ -21,6 +21,7 @@ import io.undertow.websockets.core.WebSockets;
 public final class LiveAudioHub implements OpusFrameSink {
     private static final long MIN_BROADCAST_UTTERANCE_MILLIS = 100;
     public static final int PACKET_MAGIC = 0x4a424f50; // JBOP
+    public static final int RECORDING_MAGIC = 0x4a425243; // JBRC
     private static final int LIVE_BATCH_MILLIS = 200;
 
     private final List<LogicalChannel> channels;
@@ -127,6 +128,15 @@ public final class LiveAudioHub implements OpusFrameSink {
         }
         if (!wasActive) {
             broadcastActivity(channels.get(frame.channelId()));
+        }
+    }
+
+    @Override
+    public void recordingBytes(OpusFrameSink.RecordingBytes bytes) {
+        for (Client client : clients) {
+            if (client.isSubscribed(bytes.channelId())) {
+                client.sendRecordingBytes(bytes);
+            }
         }
     }
 
@@ -279,10 +289,41 @@ public final class LiveAudioHub implements OpusFrameSink {
             WebSockets.sendBinary(batchMessage(batch.frames), channel, null);
         }
 
+        private void sendRecordingBytes(OpusFrameSink.RecordingBytes bytes) {
+            if (!channel.isOpen()) {
+                return;
+            }
+            WebSockets.sendBinary(recordingBytesMessage(bytes), channel, null);
+        }
+
         public WebSocketChannel channel() {
             return channel;
         }
 
+    }
+
+    private static ByteBuffer recordingBytesMessage(OpusFrameSink.RecordingBytes bytes) {
+        byte[] channelName = bytes.channelName().getBytes(StandardCharsets.UTF_8);
+        byte[] fileName = bytes.fileName().getBytes(StandardCharsets.UTF_8);
+        byte[] payload = bytes.bytes();
+        int length = 4 + 2 + 2
+                + 2 + 2 + 4 + 4 + 2 + 2
+                + channelName.length + fileName.length + payload.length;
+        ByteBuffer buffer = ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN);
+        buffer.putInt(RECORDING_MAGIC);
+        buffer.putShort((short) 1);
+        buffer.putShort((short) 1);
+        buffer.putShort((short) 1);
+        buffer.putShort((short) bytes.channelId());
+        buffer.putInt(bytes.offset());
+        buffer.putInt(payload.length);
+        buffer.putShort((short) channelName.length);
+        buffer.putShort((short) fileName.length);
+        buffer.put(channelName);
+        buffer.put(fileName);
+        buffer.put(payload);
+        buffer.flip();
+        return buffer;
     }
 
     private static ByteBuffer batchMessage(List<EncodedOpusFrame> frames) {

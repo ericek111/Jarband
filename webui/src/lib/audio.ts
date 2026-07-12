@@ -5,13 +5,19 @@ type Clock = {
   lastTargetMillis: number;
 };
 
+type FrameMetadata = {
+  channelName: string;
+};
+
 export class AudioEngine {
   private context: AudioContext | null = null;
   private decoders = new Map<string, AudioDecoder>();
   private queues = new Map<string, OpusPacket[]>();
+  private frameMetadata = new Map<string, FrameMetadata[]>();
   private clocks = new Map<string, Clock>();
   private sources = new Map<string, Set<AudioBufferSourceNode>>();
-  private onFrameScheduled: ((streamKey: string, targetMillis: number, startTime: number, durationSeconds: number) => void) | null = null;
+  private onFrameScheduled: ((streamKey: string, targetMillis: number, startTime: number,
+    durationSeconds: number, channelName: string) => void) | null = null;
   private onStreamIdle: ((streamKey: string) => void) | null = null;
 
   private readonly maxDecodeQueue = 48;
@@ -41,7 +47,8 @@ export class AudioEngine {
     this.drain(packet.streamKey, playbackMode);
   }
 
-  onScheduled(callback: (streamKey: string, targetMillis: number, startTime: number, durationSeconds: number) => void) {
+  onScheduled(callback: (streamKey: string, targetMillis: number, startTime: number,
+    durationSeconds: number, channelName: string) => void) {
     this.onFrameScheduled = callback;
   }
 
@@ -52,6 +59,7 @@ export class AudioEngine {
   flush(streamKey: string) {
     this.queues.delete(streamKey);
     this.clocks.delete(streamKey);
+    this.frameMetadata.delete(streamKey);
 
     const decoder = this.decoders.get(streamKey);
     if (decoder) {
@@ -96,6 +104,7 @@ export class AudioEngine {
 
     while (queue.length > 0 && decoder.decodeQueueSize < this.maxDecodeQueue) {
       const packet = queue.shift()!;
+      this.metadataQueueFor(streamKey).push({ channelName: packet.channelName });
       decoder.decode(new EncodedAudioChunk({
         type: 'key',
         timestamp: packet.unixMillis * 1000,
@@ -116,7 +125,8 @@ export class AudioEngine {
 
     const decoder = new AudioDecoder({
       output: frame => {
-        this.playFrame(streamKey, frame, playbackMode);
+        const metadata = this.frameMetadata.get(streamKey)?.shift();
+        this.playFrame(streamKey, frame, playbackMode, metadata);
         this.drain(streamKey, playbackMode);
       },
       error: () => setTimeout(() => this.drain(streamKey, playbackMode), 100)
@@ -126,7 +136,8 @@ export class AudioEngine {
     return decoder;
   }
 
-  private playFrame(streamKey: string, frame: AudioData, playbackMode: PlaybackMode | null) {
+  private playFrame(streamKey: string, frame: AudioData, playbackMode: PlaybackMode | null,
+                    metadata?: FrameMetadata) {
     if (!this.context) return;
     const samples = new Float32Array(frame.numberOfFrames);
     frame.copyTo(samples, { planeIndex: 0 });
@@ -146,9 +157,18 @@ export class AudioEngine {
       ? playbackMode.originAudioTime + (targetMillis - playbackMode.originMillis) / (1000 * speed)
       : this.liveStartTime(streamKey, targetMillis, playedDurationSeconds);
     const scheduledTime = Math.max(this.context.currentTime, startTime);
-    this.onFrameScheduled?.(streamKey, targetMillis, scheduledTime, playedDurationSeconds);
+    this.onFrameScheduled?.(streamKey, targetMillis, scheduledTime, playedDurationSeconds, metadata?.channelName ?? streamKey);
     source.start(scheduledTime);
     frame.close();
+  }
+
+  private metadataQueueFor(streamKey: string) {
+    let queue = this.frameMetadata.get(streamKey);
+    if (!queue) {
+      queue = [];
+      this.frameMetadata.set(streamKey, queue);
+    }
+    return queue;
   }
 
   private trackSource(streamKey: string, source: AudioBufferSourceNode) {
