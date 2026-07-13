@@ -4,6 +4,7 @@
     lastActiveLabel,
     active,
     selected,
+    historyColor,
     live,
     replaying,
     onHistory,
@@ -15,6 +16,7 @@
     lastActiveLabel: string;
     active: boolean;
     selected: boolean;
+    historyColor: string | null;
     live: boolean;
     replaying: boolean;
     onHistory: (name: string) => void;
@@ -41,7 +43,7 @@
 </script>
 
 <div class:active-channel={active} class="channel">
-  <strong>{name}</strong>
+  <strong style:color={historyColor}>{name}</strong>
   <span>{lastActiveLabel}</span>
   <div class:active={selected} class="split-button">
     <button type="button" onclick={showHistory}>History</button>

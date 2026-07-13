@@ -15,8 +15,8 @@ main {
   padding: 22px;
 }
 
-header,
-.toolbar,
+.section-heading,
+.channels-controls,
 .history-controls,
 .filter-chips {
   display: flex;
@@ -25,21 +25,15 @@ header,
   flex-wrap: wrap;
 }
 
-header {
+.section-heading {
   justify-content: space-between;
-  padding-bottom: 14px;
-  border-bottom: 1px solid #242b34;
+  padding-bottom: 8px;
 }
 
-h1,
 h2 {
   margin: 12px 0;
   font-weight: 650;
   letter-spacing: 0;
-}
-
-h1 {
-  font-size: 25px;
 }
 
 h2,
@@ -57,6 +51,18 @@ summary {
 section,
 details {
   margin-top: 18px;
+}
+
+.recent-section {
+  margin-top: 0;
+}
+
+.channels-controls {
+  margin-bottom: 10px;
+}
+
+.channels-controls input {
+  flex: 1 1 220px;
 }
 
 button,
@@ -129,16 +135,24 @@ button.active {
 }
 
 .split-button.active {
-  background: #175f40;
-  border-color: #2fbe75;
+  background: #7b2d35;
+  border-color: #df6b73;
 }
 
 .split-button.active button {
-  color: #effff5;
+  color: #fff3f4;
 }
 
 .split-button.active button + button {
-  border-left-color: #2fbe75;
+  border-left-color: #df6b73;
+}
+
+.split-button.active:hover {
+  border-color: #df6b73;
+}
+
+.split-button.active:hover button {
+  background: #7b2d35;
 }
 
 button.live {

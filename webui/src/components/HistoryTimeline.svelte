@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
+  import { channelAccentColor } from '../lib/channelColors';
   import { utteranceKey } from '../lib/rowPlayback';
   import type { Utterance } from '../lib/types';
 
@@ -309,7 +310,7 @@
           width: Math.max(0.18, ((end - start) / span) * 100),
           top: 50 - height / 2,
           height,
-          color: channelTimelineColor(utterance.channel),
+          color: channelAccentColor(utterance.channel),
           label: `${utterance.channel} ${utcTime(utterance.startMillis)} ${duration(utterance)}s ${snr(utterance)}`
         };
       });
@@ -324,7 +325,7 @@
           width: Math.max(0.18, ((Math.max(end, start + 100) - start) / span) * 100),
           top: 22,
           height: 56,
-          color: channelTimelineColor(channel.name),
+          color: channelAccentColor(channel.name),
           label: `${channel.name} active`
         };
       });
@@ -471,15 +472,6 @@
       context.fillStyle = '#7cf0a8';
       context.fillText(label, x, 13);
     }
-  }
-
-  function channelTimelineColor(channel: string) {
-    let hash = 0;
-    for (let i = 0; i < channel.length; i++) {
-      hash = ((hash << 5) - hash + channel.charCodeAt(i)) | 0;
-    }
-    const hue = ((hash % 360) + 360) % 360;
-    return `hsl(${hue} 76% 62%)`;
   }
 
   function mixCanvasColor(color: string, other: string, amount: number) {

@@ -4,6 +4,7 @@
   import ChannelTile from './components/ChannelTile.svelte';
   import HistoryTimeline from './components/HistoryTimeline.svelte';
   import { AudioEngine } from './lib/audio';
+  import { channelAccentColor } from './lib/channelColors';
   import {
     appendHistoryRecordingBytes,
     fetchHistoryIndex,
@@ -96,9 +97,9 @@
   let tickTimer: ReturnType<typeof setInterval>;
 
   $: channelList = sortedChannels(channelVersion);
-  $: filteredChannels = channelList.filter(channel => channel.name.toLowerCase().includes(filter.trim().toLowerCase()));
-  $: recentChannels = channelList
-    .filter(channel => channel.lastActivityMillis > 0)
+  $: recordedChannels = channelList.filter(channel => channel.lastActivityMillis > 0);
+  $: filteredChannels = recordedChannels.filter(channel => channel.name.toLowerCase().includes(filter.trim().toLowerCase()));
+  $: recentChannels = recordedChannels
     .filter(channel => channel.active || now - channel.lastActivityMillis <= recentWindowMillis)
     .sort((a, b) => a.frequencyHz - b.frequencyHz);
   $: timelineSpanMillis = Math.max(minTimelineWindowMillis, timelineToMillis - timelineFromMillis);
@@ -965,6 +966,10 @@
     return Number.isFinite(utterance.averageSnrDb) ? `${utterance.averageSnrDb!.toFixed(1)} dB` : '-';
   }
 
+  function historyChannelColor(channel: string) {
+    return selected.size > 1 && selected.has(channel) ? channelAccentColor(channel) : null;
+  }
+
   function historyRangeLabel() {
     if (!timelineFromMillis || !timelineToMillis) return 'No recordings';
     const fromDate = utcDate(timelineFromMillis);
@@ -982,23 +987,16 @@
 </script>
 
 <main>
-  <header>
-    <h1>Jarband Airband</h1>
-    <div class="status">{status}</div>
-  </header>
-
-  <section class="toolbar">
-    <input bind:value={filter} type="search" placeholder="Filter channels" />
-    <button type="button" onclick={() => send(socket, { type: 'list_channels' })}>Refresh</button>
-    <button type="button" onclick={stopHistory}>Stop history</button>
-  </section>
-
-  <section>
-    <h2>Recent Activity</h2>
+  <section class="recent-section">
+    <div class="section-heading">
+      <h2>Recent activity</h2>
+      <div class="status">{status}</div>
+    </div>
     <div class="channel-grid">
       {#each recentChannels as channel (channel.id)}
         <ChannelTile name={channel.name} active={channel.active} lastActiveLabel={lastActiveText(channel)}
-          selected={selected.has(channel.name)} live={live.has(channel.name)}
+          selected={selected.has(channel.name)} historyColor={historyChannelColor(channel.name)}
+          live={live.has(channel.name)}
           replaying={replayingLast.has(channel.name)}
           onHistory={showChannelHistory} onAddFilter={addChannelHistoryFilter}
           onLive={toggleLive} onReplayLast={toggleLastUtterance} />
@@ -1009,10 +1007,15 @@
   <details bind:open={channelsOpen}>
     <summary>Channels</summary>
     {#if channelsOpen}
+      <div class="channels-controls">
+        <input bind:value={filter} type="search" placeholder="Filter channels" />
+        <button type="button" onclick={() => send(socket, { type: 'list_channels' })}>Refresh</button>
+      </div>
       <div class="channel-grid">
         {#each filteredChannels as channel (channel.id)}
           <ChannelTile name={channel.name} active={channel.active} lastActiveLabel={lastActiveText(channel)}
-            selected={selected.has(channel.name)} live={live.has(channel.name)}
+            selected={selected.has(channel.name)} historyColor={historyChannelColor(channel.name)}
+            live={live.has(channel.name)}
             replaying={replayingLast.has(channel.name)}
             onHistory={showChannelHistory} onAddFilter={addChannelHistoryFilter}
             onLive={toggleLive} onReplayLast={toggleLastUtterance} />
@@ -1058,6 +1061,7 @@
         {/if}
         <div class:playing-row={playingRows.has(utteranceKey(utterance))} class="utterance">
           <span class="utterance-channel" role="link" tabindex="0"
+            style:color={historyChannelColor(utterance.channel)}
             aria-label={`Filter history to ${utterance.channel}`}
             onclick={() => filterHistoryAtUtterance(utterance)}
             onkeydown={(event) => filterHistoryFromKey(event, utterance)}>
