@@ -500,45 +500,55 @@
     </span>
   </div>
   <div class="timeline-controls">
-    <button type="button" class="icon-button" disabled={!selected}
-      aria-label={playing ? 'Pause historical playback' : 'Play historical playback'}
-      onclick={onTogglePlayback}>
-      <span class="icon-symbol">{playing ? 'Ⅱ' : '▶'}</span>
-    </button>
-    <button type="button" class="icon-button" disabled={!selected}
-      aria-label="Skip back 5 seconds" onclick={() => onSkip(-skipMillis)}>
-      <span class="icon-symbol">↶</span>
-    </button>
-    <button type="button" class="icon-button" disabled={!selected}
-      aria-label="Skip forward 5 seconds" onclick={() => onSkip(skipMillis)}>
-      <span class="icon-symbol">↷</span>
-    </button>
-    <button type="button" class="icon-button" disabled={!selected}
-      aria-label="Jump to real time" onclick={onStop}>
-      <span class="icon-symbol">■</span>
-    </button>
-    <button type="button" class="icon-button" disabled={!selected}
-      aria-label="Zoom out" onclick={() => zoomTimelineButton('out')}>
-      <span class="icon-symbol">−</span>
-    </button>
-    <button type="button" class="icon-button" disabled={!selected}
-      aria-label="Zoom in" onclick={() => zoomTimelineButton('in')}>
-      <span class="icon-symbol">+</span>
-    </button>
-    <label class="speed-control">
+    <div class="control-group playback-buttons">
+      <button type="button" class="icon-button" disabled={!selected}
+        aria-label={playing ? 'Pause historical playback' : 'Play historical playback'}
+        title={playing ? 'Pause historical playback' : 'Play historical playback'}
+        onclick={onTogglePlayback}>
+        <span class="icon-symbol">{playing ? 'Ⅱ' : '▶'}</span>
+      </button>
+      <button type="button" class="icon-button" disabled={!selected}
+        aria-label="Skip back 5 seconds" title="Skip back 5 seconds"
+        onclick={() => onSkip(-skipMillis)}>
+        <span class="icon-symbol">↶</span>
+      </button>
+      <button type="button" class="icon-button" disabled={!selected}
+        aria-label="Skip forward 5 seconds" title="Skip forward 5 seconds"
+        onclick={() => onSkip(skipMillis)}>
+        <span class="icon-symbol">↷</span>
+      </button>
+      <button type="button" class="icon-button" disabled={!selected}
+        aria-label="Jump to real time" title="Stop history playback and jump to real time"
+        onclick={onStop}>
+        <span class="icon-symbol">■</span>
+      </button>
+    </div>
+    <div class="control-group zoom-buttons">
+      <button type="button" class="icon-button" disabled={!selected}
+        aria-label="Zoom out" title="Zoom the timeline out"
+        onclick={() => zoomTimelineButton('out')}>
+        <span class="icon-symbol">−</span>
+      </button>
+      <button type="button" class="icon-button" disabled={!selected}
+        aria-label="Zoom in" title="Zoom the timeline in"
+        onclick={() => zoomTimelineButton('in')}>
+        <span class="icon-symbol">+</span>
+      </button>
+    </div>
+    <label class="control-group volume-control">
+      <span class="volume-label">{Math.round(playbackVolume * 100)}%</span>
+      <input value={playbackVolume} type="range" min="0" max="1" step="0.01"
+        aria-label="Playback volume" oninput={changeVolume} />
+    </label>
+    <label class="control-group speed-control">
       <button type="button" class="speed-label" aria-label="Reset playback speed to 1.0x"
-        onclick={resetSpeed}>
+        title="Reset playback speed to 1.0x" onclick={resetSpeed}>
         {playbackSpeed.toFixed(1)}×
       </button>
       <input value={playbackSpeed} type="range" min="0.5" max="4" step="0.1"
         oninput={changeSpeed} />
     </label>
-    <label class="volume-control">
-      <span class="volume-label">{Math.round(playbackVolume * 100)}%</span>
-      <input value={playbackVolume} type="range" min="0" max="1" step="0.01"
-        aria-label="Playback volume" oninput={changeVolume} />
-    </label>
-    <label class="checkbox skip-silence">
+    <label class="control-group checkbox skip-silence">
       <input checked={skipSilence} type="checkbox" onchange={changeSkipSilence} />
       Skip silence
     </label>
@@ -589,8 +599,14 @@
   .timeline-controls {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 16px;
     flex-wrap: wrap;
+  }
+
+  .control-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
   }
 
   .speed-control,
@@ -600,7 +616,6 @@
     align-items: center;
     gap: 8px;
     min-height: 34px;
-    margin-left: 4px;
     color: #cbd5df;
     font-size: 13px;
   }

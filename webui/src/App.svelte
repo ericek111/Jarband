@@ -965,35 +965,37 @@
     return utcDate(recentHistory[index].startMillis) !== utcDate(recentHistory[index - 1].startMillis);
   }
 
-  function localDateValue(millis: number) {
+  function utcDateValue(millis: number) {
     if (!Number.isFinite(millis)) return '';
-    const date = new Date(millis);
-    return new Date(millis - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 10);
+    return new Date(millis).toISOString().slice(0, 10);
   }
 
-  function localDayStartMillis(value: string) {
-    return value ? new Date(`${value}T00:00`).getTime() : 0;
+  function utcDayStartMillis(value: string) {
+    if (!value) return 0;
+    const [year, month, day] = value.split('-').map(Number);
+    if (!year || !month || !day) return 0;
+    return Date.UTC(year, month - 1, day);
   }
 
   function hourSlotLabel(slot: number) {
     const totalMinutes = clamp(Math.round(slot), 0, 47) * 30;
     const hours = Math.floor(totalMinutes / 60);
     const minutes = totalMinutes % 60;
-    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}Z`;
   }
 
   function syncHistoryRangeControls(centerMillis: number) {
     if (!Number.isFinite(centerMillis)) return;
-    historyDateValue = localDateValue(centerMillis);
-    const dayStart = localDayStartMillis(historyDateValue);
+    historyDateValue = utcDateValue(centerMillis);
+    const dayStart = utcDayStartMillis(historyDateValue);
     historyHourSlot = clamp(Math.round((centerMillis - dayStart) / halfHourMillis), 0, 47);
   }
 
   function centerHistoryWindowFromControls(loadDelayMillis = 0) {
     if (!historyDateValue) {
-      historyDateValue = localDateValue(Date.now());
+      historyDateValue = utcDateValue(Date.now());
     }
-    const centerMillis = localDayStartMillis(historyDateValue) + historyHourSlot * halfHourMillis;
+    const centerMillis = utcDayStartMillis(historyDateValue) + historyHourSlot * halfHourMillis;
     setHistoryWindow(centerMillis - halfHourMillis, centerMillis + halfHourMillis, loadDelayMillis);
   }
 
@@ -1103,13 +1105,13 @@
     </div>
 
     <div class="history-controls">
-      <label class="date-control">Date
+      <label class="date-control">Date Z
         <input bind:value={historyDateValue} type="date" onchange={changeHistoryDate} />
       </label>
       <label class="hour-control">
         <span>{hourSlotLabel(historyHourSlot)}</span>
         <input value={historyHourSlot} type="range" min="0" max="47" step="1"
-          aria-label="Timeline center time" oninput={changeHistoryHour} />
+          aria-label="Timeline center time in Zulu" oninput={changeHistoryHour} />
       </label>
     </div>
 
