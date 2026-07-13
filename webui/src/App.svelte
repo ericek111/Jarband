@@ -3,13 +3,12 @@
   import { SvelteMap } from 'svelte/reactivity';
   import ChannelTile from './components/ChannelTile.svelte';
   import HistoryTimeline from './components/HistoryTimeline.svelte';
-  import { AudioEngine } from './lib/audio';
+  import { AudioEngine, type AudioRoute } from './lib/audio';
   import { channelAccentColor } from './lib/channelColors';
   import {
     appendHistoryRecordingBytes,
     fetchHistoryIndex,
     fetchRecentHistory,
-    HISTORY_OPUS_CHUNK_BYTES,
     fetchUtterancePacketWindow,
     fetchUtterancePackets,
     historyRangeCacheStats,
@@ -41,12 +40,19 @@
     complete: boolean;
   };
 
+  type CompactPlaybackInterval = {
+    startMillis: number;
+    endMillis: number;
+    playbackStartMillis: number;
+  };
+
   type HistoryPlaybackSession = {
     playbackId: number;
     channels: string[];
     utterances: Utterance[];
     originMillis: number;
-    compactStreamKey: string | null;
+    compact: boolean;
+    compactIntervals: CompactPlaybackInterval[];
     playbackMode: PlaybackMode;
     jumpRealtimeOnFinish: boolean;
     abort: AbortController;
@@ -63,6 +69,7 @@
   let channelVersion = 0;
   let selected = new Set<string>();
   let live = new Set<string>();
+  const historyAudioRoutes = new SvelteMap<string, AudioRoute>();
   let filter = '';
   let recentHistory: Utterance[] = [];
   let historyHasOlder = false;
@@ -95,6 +102,12 @@
   let playingRows = new Set<string>();
   let replayingLast = new Set<string>();
   let tickTimer: ReturnType<typeof setInterval>;
+
+  const routeOptions: { route: AudioRoute; label: string; description: string }[] = [
+    { route: 'left', label: 'L', description: 'Route to left earcup' },
+    { route: 'right', label: 'R', description: 'Route to right earcup' },
+    { route: 'both', label: 'M', description: 'Route to both earcups' }
+  ];
 
   $: channelList = sortedChannels(channelVersion);
   $: recordedChannels = channelList.filter(channel => channel.lastActivityMillis > 0);
@@ -220,6 +233,15 @@
     selected = next;
     syncSocketSubscriptions();
     resetHistoryWindow();
+  }
+
+  function channelAudioRoute(name: string) {
+    return historyAudioRoutes.get(name) ?? 'both';
+  }
+
+  function setChannelAudioRoute(name: string, route: AudioRoute) {
+    historyAudioRoutes.set(name, route);
+    audio.setChannelRoute(name, route);
   }
 
   function toggleLive(name: string) {
@@ -607,11 +629,12 @@
     const playbackId = nextPlaybackId++;
     const abort = new AbortController();
     const playbackMode = {
-      realtime,
+      realtime: true,
       originMillis,
       originAudioTime: audio.audioTime(0.15),
       speed: playbackSpeed
     } satisfies PlaybackMode;
+    const compact = !realtime;
     historyPlaying = true;
     historyPaused = false;
     playbackClockOriginMillis = originMillis;
@@ -625,7 +648,8 @@
       channels,
       utterances: uniqueUtterances,
       originMillis,
-      compactStreamKey: realtime ? null : `history:${playbackId}:skip-silence`,
+      compact,
+      compactIntervals: compact ? buildCompactPlaybackIntervals(uniqueUtterances, originMillis) : [],
       playbackMode,
       jumpRealtimeOnFinish: options.jumpRealtimeOnFinish ?? false,
       abort,
@@ -687,7 +711,10 @@
         }
         for (const packet of chunk.packets) {
           if (session.abort.signal.aborted) break;
-          audio.enqueue(packet, session.playbackMode);
+          const playbackPacket = historyPlaybackPacket(session, packet);
+          if (playbackPacket) {
+            audio.enqueue(playbackPacket, session.playbackMode);
+          }
         }
         status = `Queued ${chunk.packets.length} historical packets`;
         return;
@@ -702,9 +729,6 @@
   }
 
   function nextHistoryWindow(session: HistoryPlaybackSession) {
-    if (session.compactStreamKey) {
-      return nextCompactHistoryWindow(session);
-    }
     return nextTimelineHistoryWindow(session);
   }
 
@@ -723,18 +747,6 @@
     return requests.length ? { horizonMillis, requests } : null;
   }
 
-  function nextCompactHistoryWindow(session: HistoryPlaybackSession) {
-    const anchor = nextCompactAnchor(session, session.nextMillis);
-    if (!anchor) return null;
-    const chunkEnd = anchor.byteOffset + HISTORY_OPUS_CHUNK_BYTES;
-    const requests = compactHistoryWindowRequests(session, anchor.url, anchor.byteOffset, chunkEnd, session.nextMillis);
-    if (!requests.length) return null;
-    return {
-      horizonMillis: Math.max(...requests.map(request => request.targetMillis ?? request.utterance.endMillis)),
-      requests
-    };
-  }
-
   function historyWindowRequests(session: HistoryPlaybackSession, startMillis: number, horizonMillis: number) {
     const requests: HistoryPacketWindowRequest[] = [];
     for (const utterance of session.utterances) {
@@ -745,7 +757,7 @@
       requests.push({
         id,
         utterance,
-        streamKey: session.compactStreamKey ?? `history:${session.playbackId}:${utterance.channel}`,
+        streamKey: historyStreamKey(session, utterance.channel),
         byteOffset: cursor?.nextOffset,
         packetMillis: cursor?.nextMillis
       });
@@ -753,52 +765,67 @@
     return requests;
   }
 
-  function nextCompactAnchor(session: HistoryPlaybackSession, startMillis: number) {
-    for (const utterance of session.utterances) {
-      const id = utteranceKey(utterance);
-      const cursor = session.cursors.get(id);
-      if (cursor?.complete || !utterance.opusUrl || utterance.startOffset === undefined) continue;
-      const requestStartMillis = cursor?.nextMillis ?? Math.max(utterance.startMillis, startMillis);
-      if (!cursor && compactRequestEndMillis(utterance, requestStartMillis) < startMillis) continue;
-      return {
-        utterance,
-        url: utterance.opusUrl,
-        byteOffset: cursor?.nextOffset ?? utterance.startOffset
-      };
+  function historyPlaybackPacket(session: HistoryPlaybackSession, packet: OpusPacket) {
+    if (!session.compact) return packet;
+    const playbackMillis = compactPlaybackMillis(session, packet.unixMillis);
+    return playbackMillis === null ? null : { ...packet, playbackMillis };
+  }
+
+  function buildCompactPlaybackIntervals(utterances: Utterance[], originMillis: number) {
+    const intervals: { startMillis: number; endMillis: number }[] = [];
+    for (const utterance of utterances) {
+      const startMillis = Math.max(originMillis, utterance.startMillis);
+      const endMillis = utteranceEffectiveEndMillis(utterance);
+      if (endMillis <= startMillis) continue;
+      const previous = intervals[intervals.length - 1];
+      if (previous && startMillis <= previous.endMillis) {
+        previous.endMillis = Math.max(previous.endMillis, endMillis);
+      } else {
+        intervals.push({ startMillis, endMillis });
+      }
+    }
+
+    let playbackStartMillis = originMillis;
+    return intervals.map(interval => {
+      const compactInterval = { ...interval, playbackStartMillis };
+      playbackStartMillis += interval.endMillis - interval.startMillis;
+      return compactInterval;
+    });
+  }
+
+  function compactPlaybackMillis(session: HistoryPlaybackSession, packetMillis: number) {
+    for (const interval of session.compactIntervals) {
+      if (packetMillis < interval.startMillis) {
+        return interval.playbackStartMillis;
+      }
+      if (packetMillis <= interval.endMillis) {
+        return interval.playbackStartMillis + packetMillis - interval.startMillis;
+      }
     }
     return null;
   }
 
-  function compactHistoryWindowRequests(session: HistoryPlaybackSession, url: string,
-                                        chunkStart: number, chunkEnd: number, startMillis: number) {
-    const requests: HistoryPacketWindowRequest[] = [];
-    for (const utterance of session.utterances) {
-      const id = utteranceKey(utterance);
-      const cursor = session.cursors.get(id);
-      if (cursor?.complete || utterance.opusUrl !== url || utterance.startOffset === undefined) continue;
-      const byteOffset = cursor?.nextOffset ?? utterance.startOffset;
-      if (byteOffset < chunkStart || byteOffset >= chunkEnd) continue;
-
-      const requestStartMillis = cursor?.nextMillis ?? Math.max(utterance.startMillis, startMillis);
-      const requestEndMillis = compactRequestEndMillis(utterance, requestStartMillis);
-      if (!cursor && requestEndMillis < startMillis) continue;
-      requests.push({
-        id,
-        utterance,
-        streamKey: session.compactStreamKey ?? `history:${session.playbackId}:${utterance.channel}`,
-        byteOffset,
-        packetMillis: cursor?.nextMillis,
-        targetMillis: requestEndMillis,
-        chunkEnd
-      });
+  function originalMillisForCompactPlayback(session: HistoryPlaybackSession, playbackMillis: number) {
+    for (const interval of session.compactIntervals) {
+      const playbackEndMillis = interval.playbackStartMillis + interval.endMillis - interval.startMillis;
+      if (playbackMillis < interval.playbackStartMillis) return interval.startMillis;
+      if (playbackMillis <= playbackEndMillis) {
+        return interval.startMillis + playbackMillis - interval.playbackStartMillis;
+      }
     }
-    return requests;
+    const last = session.compactIntervals[session.compactIntervals.length - 1];
+    return last?.endMillis ?? playbackMillis;
   }
 
-  function compactRequestEndMillis(utterance: Utterance, requestStartMillis: number) {
-    return utterance.endMillis > utterance.startMillis
-      ? utterance.endMillis
-      : requestStartMillis + playbackFetchWindowMillis;
+  function utteranceEffectiveEndMillis(utterance: Utterance) {
+    const durationEndMillis = utterance.durationMillis && utterance.durationMillis > 0
+      ? utterance.startMillis + utterance.durationMillis
+      : utterance.endMillis;
+    return Math.max(utterance.startMillis, durationEndMillis);
+  }
+
+  function historyStreamKey(session: HistoryPlaybackSession, channel: string) {
+    return `history:${session.playbackId}:${channel}`;
   }
 
   function nextHistoryWindowStart(session: HistoryPlaybackSession, horizonMillis: number) {
@@ -888,7 +915,8 @@
       return activeFrame.targetMillis;
     }
     if (historyPlaying && playbackClockOriginMillis > 0 && playbackClockStartedAt > 0) {
-      return playbackClockOriginMillis + (nowMillis - playbackClockStartedAt) * playbackSpeed;
+      const playbackMillis = playbackClockOriginMillis + (nowMillis - playbackClockStartedAt) * playbackSpeed;
+      return historySession?.compact ? originalMillisForCompactPlayback(historySession, playbackMillis) : playbackMillis;
     }
     if (realtimePlayback && historyPlaying && !historyPaused) {
       return Date.now();
@@ -1031,11 +1059,22 @@
         <span class="filter-empty">Select a channel to show history</span>
       {:else}
         {#each [...selected].sort() as name}
-          <button type="button" class="filter-chip" aria-label={`Remove ${name} from history filter`}
-            onclick={() => removeSelected(name)}>
-            <span aria-hidden="true" class="filter-chip-remove">×</span>
-            <span>{name}</span>
-          </button>
+          <div class="filter-chip">
+            <button type="button" class="filter-chip-remove" aria-label={`Remove ${name} from history filter`}
+              onclick={() => removeSelected(name)}>
+              <span aria-hidden="true">×</span>
+            </button>
+            <span class="filter-chip-name" style:color={historyChannelColor(name)}>{name}</span>
+            <div class="route-buttons" aria-label={`Audio route for ${name}`}>
+              {#each routeOptions as option}
+                <button type="button" class:active={channelAudioRoute(name) === option.route}
+                  aria-label={`${option.description} for ${name}`}
+                  onclick={() => setChannelAudioRoute(name, option.route)}>
+                  {option.label}
+                </button>
+              {/each}
+            </div>
+          </div>
         {/each}
       {/if}
     </div>

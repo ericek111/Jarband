@@ -1,5 +1,7 @@
 import type { OpusPacket, PlaybackMode } from './types';
 
+export type AudioRoute = 'left' | 'right' | 'both';
+
 type Clock = {
   nextAudioTime: number;
   lastTargetMillis: number;
@@ -7,11 +9,13 @@ type Clock = {
 
 type FrameMetadata = {
   channelName: string;
+  targetMillis: number;
 };
 
 type PcmFrame = {
   samples: Float32Array<ArrayBuffer>;
   sampleRate: number;
+  scheduleMillis: number;
   targetMillis: number;
   channelName: string;
 };
@@ -32,6 +36,7 @@ export class AudioEngine {
   private frameMetadata = new Map<string, FrameMetadata[]>();
   private pcmBuffers = new Map<string, PcmBuffer>();
   private clocks = new Map<string, Clock>();
+  private channelRoutes = new Map<string, AudioRoute>();
   private sources = new Map<string, Set<AudioBufferSourceNode>>();
   private onFrameScheduled: ((streamKey: string, targetMillis: number, startTime: number,
     durationSeconds: number, channelName: string) => void) | null = null;
@@ -78,6 +83,14 @@ export class AudioEngine {
 
   onIdle(callback: (streamKey: string) => void) {
     this.onStreamIdle = callback;
+  }
+
+  setChannelRoute(channelName: string, route: AudioRoute) {
+    if (route === 'both') {
+      this.channelRoutes.delete(channelName);
+    } else {
+      this.channelRoutes.set(channelName, route);
+    }
   }
 
   flush(streamKey: string) {
@@ -139,10 +152,14 @@ export class AudioEngine {
     while (queue.length > 0 && decoder.decodeQueueSize < this.maxDecodeQueue
       && this.bufferedAheadSeconds(streamKey) < this.maxScheduleAheadSeconds) {
       const packet = queue.shift()!;
-      this.metadataQueueFor(streamKey).push({ channelName: packet.channelName });
+      const scheduleMillis = packet.playbackMillis ?? packet.unixMillis;
+      this.metadataQueueFor(streamKey).push({
+        channelName: packet.channelName,
+        targetMillis: packet.unixMillis
+      });
       decoder.decode(new EncodedAudioChunk({
         type: 'key',
-        timestamp: packet.unixMillis * 1000,
+        timestamp: scheduleMillis * 1000,
         duration: packet.durationMillis * 1000,
         data: packet.packet
       }));
@@ -182,7 +199,8 @@ export class AudioEngine {
     this.bufferPcmFrame(streamKey, {
       samples,
       sampleRate: frame.sampleRate,
-      targetMillis: frame.timestamp / 1000,
+      scheduleMillis: frame.timestamp / 1000,
+      targetMillis: metadata?.targetMillis ?? frame.timestamp / 1000,
       channelName: metadata?.channelName ?? streamKey
     }, playbackMode);
     frame.close();
@@ -227,8 +245,8 @@ export class AudioEngine {
     const playbackMode = buffer.playbackMode;
     const speed = playbackMode ? this.normalizedPlaybackSpeed(playbackMode.speed) : 1;
     const renderedSamples = this.timeScaleSpeech(sourceSamples, speed, buffer.sampleRate);
-    this.scheduleSamples(streamKey, renderedSamples, buffer.sampleRate, buffer.frames[0].targetMillis,
-      buffer.frames[0].channelName, playbackMode, speed);
+    this.scheduleSamples(streamKey, renderedSamples, buffer.sampleRate, buffer.frames[0].scheduleMillis,
+      buffer.frames[0].targetMillis, buffer.frames[0].channelName, playbackMode, speed);
     this.drain(streamKey, playbackMode);
   }
 
@@ -256,7 +274,8 @@ export class AudioEngine {
   }
 
   private scheduleSamples(streamKey: string, samples: Float32Array<ArrayBuffer>, sampleRate: number,
-                          targetMillis: number, channelName: string, playbackMode: PlaybackMode | null,
+                          scheduleMillis: number, targetMillis: number, channelName: string,
+                          playbackMode: PlaybackMode | null,
                           speed: number) {
     if (!this.context) return;
     const audio = this.context.createBuffer(1, samples.length, sampleRate);
@@ -266,13 +285,13 @@ export class AudioEngine {
 
     const playedDurationSeconds = audio.duration;
     const startTime = playbackMode?.realtime
-      ? playbackMode.originAudioTime + (targetMillis - playbackMode.originMillis) / (1000 * speed)
-      : this.liveStartTime(streamKey, targetMillis, playedDurationSeconds);
+      ? playbackMode.originAudioTime + (scheduleMillis - playbackMode.originMillis) / (1000 * speed)
+      : this.liveStartTime(streamKey, scheduleMillis, playedDurationSeconds);
     const scheduledTime = Math.max(this.context.currentTime, startTime);
-    const gain = this.connectSource(source, scheduledTime, playedDurationSeconds, playbackMode !== null);
-    this.trackSource(streamKey, source, gain);
+    const nodes = this.connectSource(source, channelName, scheduledTime, playedDurationSeconds, playbackMode !== null);
+    this.trackSource(streamKey, source, nodes);
     if (playbackMode?.realtime) {
-      this.rememberScheduledTime(streamKey, targetMillis, scheduledTime, playedDurationSeconds);
+      this.rememberScheduledTime(streamKey, scheduleMillis, scheduledTime, playedDurationSeconds);
     }
     this.onFrameScheduled?.(streamKey, targetMillis, scheduledTime, playedDurationSeconds, channelName);
     source.start(scheduledTime);
@@ -311,17 +330,21 @@ export class AudioEngine {
     return output;
   }
 
-  private connectSource(source: AudioBufferSourceNode, startTime: number, durationSeconds: number,
+  private connectSource(source: AudioBufferSourceNode, channelName: string, startTime: number, durationSeconds: number,
                         smoothBoundaries: boolean) {
     if (!this.context) return null;
+    const nodes: AudioNode[] = [];
+    let tail: AudioNode = source;
+
     if (!smoothBoundaries || durationSeconds <= 0) {
-      source.connect(this.context.destination);
-      return null;
+      this.connectRoute(tail, channelName, nodes);
+      return nodes;
     }
 
     const gain = this.context.createGain();
-    source.connect(gain);
-    gain.connect(this.context.destination);
+    tail.connect(gain);
+    tail = gain;
+    nodes.push(gain);
 
     // Separate AudioBufferSourceNodes can click if the stretched waveform has a
     // non-zero boundary. A short envelope masks that without changing speed.
@@ -332,7 +355,22 @@ export class AudioEngine {
     gain.gain.linearRampToValueAtTime(1, startTime + fadeSeconds);
     gain.gain.setValueAtTime(1, fadeOutStart);
     gain.gain.linearRampToValueAtTime(0, endTime);
-    return gain;
+    this.connectRoute(tail, channelName, nodes);
+    return nodes;
+  }
+
+  private connectRoute(tail: AudioNode, channelName: string, nodes: AudioNode[]) {
+    if (!this.context) return;
+    const route = this.channelRoutes.get(channelName) ?? 'both';
+    if (route !== 'both' && typeof this.context.createStereoPanner === 'function') {
+      const panner = this.context.createStereoPanner();
+      panner.pan.value = route === 'left' ? -1 : 1;
+      tail.connect(panner);
+      panner.connect(this.context.destination);
+      nodes.push(panner);
+      return;
+    }
+    tail.connect(this.context.destination);
   }
 
   private bestOverlapSourceIndex(samples: Float32Array<ArrayBuffer>, output: Float32Array<ArrayBuffer>,
@@ -390,7 +428,7 @@ export class AudioEngine {
     return queue;
   }
 
-  private trackSource(streamKey: string, source: AudioBufferSourceNode, gain: GainNode | null) {
+  private trackSource(streamKey: string, source: AudioBufferSourceNode, nodes: AudioNode[] | null) {
     let sources = this.sources.get(streamKey);
     if (!sources) {
       sources = new Set();
@@ -400,7 +438,9 @@ export class AudioEngine {
     source.onended = () => {
       try {
         source.disconnect();
-        gain?.disconnect();
+        for (const node of nodes ?? []) {
+          node.disconnect();
+        }
       } catch {
         // Disconnecting an already torn-down graph is harmless.
       }

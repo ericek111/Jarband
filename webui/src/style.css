@@ -362,11 +362,12 @@ button.live {
 .filter-chip {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  min-height: 30px;
-  padding: 3px 9px 3px 5px;
-  border-color: #315143;
-  border-radius: 999px;
+  gap: 8px;
+  min-width: 230px;
+  min-height: 38px;
+  padding: 4px 5px;
+  border: 1px solid #315143;
+  border-radius: 8px;
   background: #13251d;
   color: #dff7e9;
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 5%);
@@ -374,19 +375,49 @@ button.live {
   font-weight: 650;
 }
 
-.filter-chip:hover:not(:disabled) {
-  background: #173323;
-  border-color: #3c8b5f;
-}
-
 .filter-chip-remove {
   display: grid;
   place-items: center;
-  width: 20px;
-  height: 20px;
-  border-radius: 999px;
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  min-height: 0;
+  padding: 0;
+  border-color: #315143;
+  border-radius: 6px;
   background: #244533;
   color: #9ee6b5;
   font-size: 16px;
   line-height: 1;
+}
+
+.filter-chip-name {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.route-buttons {
+  display: grid;
+  grid-template-columns: repeat(3, 30px);
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.route-buttons button {
+  width: 30px;
+  height: 28px;
+  min-height: 0;
+  padding: 0;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.route-buttons button.active {
+  background: #175f40;
+  border-color: #2fbe75;
+  color: #effff5;
 }

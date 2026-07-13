@@ -32,6 +32,7 @@ export type OpusPacket = {
   channelId: number;
   sampleRate: number;
   unixMillis: number;
+  playbackMillis?: number;
   durationMillis: number;
   packet: Uint8Array;
 };
