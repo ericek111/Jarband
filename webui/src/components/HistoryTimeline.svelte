@@ -6,7 +6,7 @@
 
   const minTimelineWindowMillis = 60 * 1000;
   const maxTimelineWindowMillis = 31 * 24 * 60 * 60 * 1000;
-  const waveformWindowMillis = 24 * 60 * 60 * 1000;
+  const waveformWindowMillis = 7 * 24 * 60 * 60 * 1000;
   const timelineZoomStep = 1.6;
   const minTimelineSnrDb = 35;
   const maxTimelineSnrDb = 50;
@@ -23,11 +23,11 @@
     fromMillis,
     toMillis,
     playheadMillis,
-    loading,
     selected,
     outlineBlocks,
     playing,
     playbackSpeed,
+    playbackVolume,
     skipSilence,
     skipMillis,
     cacheBytes,
@@ -42,17 +42,18 @@
     onSkip,
     onStop,
     onSpeedChange,
+    onVolumeChange,
     onSkipSilenceChange
   }: {
     utterances: Utterance[];
     fromMillis: number;
     toMillis: number;
     playheadMillis: number;
-    loading: boolean;
     selected: boolean;
     outlineBlocks: boolean;
     playing: boolean;
     playbackSpeed: number;
+    playbackVolume: number;
     skipSilence: boolean;
     skipMillis: number;
     cacheBytes: number;
@@ -67,6 +68,7 @@
     onSkip: (deltaMillis: number) => void;
     onStop: () => void;
     onSpeedChange: (speed: number) => void;
+    onVolumeChange: (volume: number) => void;
     onSkipSilenceChange: (skipSilence: boolean) => void;
   } = $props();
 
@@ -224,6 +226,10 @@
     onSpeedChange(1);
   }
 
+  function changeVolume(event: Event) {
+    onVolumeChange(Number((event.currentTarget as HTMLInputElement).value));
+  }
+
   function changeSkipSilence(event: Event) {
     onSkipSilenceChange((event.currentTarget as HTMLInputElement).checked);
   }
@@ -243,11 +249,6 @@
       return `${fromDate} ${utcTime(effectiveFromMillis)} - ${utcTime(effectiveToMillis)} · ${count}`;
     }
     return `${fromDate} ${utcTime(effectiveFromMillis)} - ${toDate} ${utcTime(effectiveToMillis)} · ${count}`;
-  }
-
-  function timelineStatusLabel() {
-    if (loading) return 'Loading...';
-    return spanMillis <= waveformWindowMillis ? 'Waveform by utterance SNR' : 'Zoom in to show utterance blocks';
   }
 
   function cacheLabel() {
@@ -438,10 +439,7 @@
       context.beginPath();
       context.roundRect(x, y, blockWidth, blockHeight, 2);
       if (!outlineBlocks) {
-        const blockGradient = context.createLinearGradient(0, y, 0, y + blockHeight);
-        blockGradient.addColorStop(0, mixCanvasColor(block.color, '#ffffff', 0.18));
-        blockGradient.addColorStop(1, mixCanvasColor(block.color, '#000000', 0.28));
-        context.fillStyle = blockGradient;
+        context.fillStyle = block.color;
         context.fill();
       }
       context.stroke();
@@ -498,7 +496,6 @@
   <div class="timeline-topline">
     <span>{historyRangeLabel()}</span>
     <span class="timeline-topline-right">
-      <span>{timelineStatusLabel()}</span>
       <span>{cacheLabel()}</span>
     </span>
   </div>
@@ -535,6 +532,11 @@
       </button>
       <input value={playbackSpeed} type="range" min="0.5" max="4" step="0.1"
         oninput={changeSpeed} />
+    </label>
+    <label class="volume-control">
+      <span class="volume-label">{Math.round(playbackVolume * 100)}%</span>
+      <input value={playbackVolume} type="range" min="0" max="1" step="0.01"
+        aria-label="Playback volume" oninput={changeVolume} />
     </label>
     <label class="checkbox skip-silence">
       <input checked={skipSilence} type="checkbox" onchange={changeSkipSilence} />
@@ -591,7 +593,8 @@
     flex-wrap: wrap;
   }
 
-  .speed-control {
+  .speed-control,
+  .volume-control {
     display: inline-grid;
     grid-template-columns: 42px minmax(130px, 190px);
     align-items: center;
@@ -612,7 +615,13 @@
     text-align: left;
   }
 
-  .speed-control input {
+  .volume-label {
+    color: #9aa7b4;
+    font-weight: 700;
+  }
+
+  .speed-control input,
+  .volume-control input {
     width: 100%;
     accent-color: #7cf0a8;
   }

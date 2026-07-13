@@ -30,6 +30,7 @@ type PcmBuffer = {
 
 export class AudioEngine {
   private context: AudioContext | null = null;
+  private masterGain: GainNode | null = null;
   private decoders = new Map<string, AudioDecoder>();
   private queues = new Map<string, OpusPacket[]>();
   private drainTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -38,6 +39,7 @@ export class AudioEngine {
   private clocks = new Map<string, Clock>();
   private channelRoutes = new Map<string, AudioRoute>();
   private sources = new Map<string, Set<AudioBufferSourceNode>>();
+  private volume = 1;
   private onFrameScheduled: ((streamKey: string, targetMillis: number, startTime: number,
     durationSeconds: number, channelName: string) => void) | null = null;
   private onStreamIdle: ((streamKey: string) => void) | null = null;
@@ -62,6 +64,11 @@ export class AudioEngine {
       throw new Error('WebCodecs AudioDecoder is unavailable. Use HTTPS or localhost and a Chromium build with WebCodecs enabled.');
     }
     this.context ??= new AudioContext();
+    if (!this.masterGain) {
+      this.masterGain = this.context.createGain();
+      this.masterGain.gain.value = this.volume;
+      this.masterGain.connect(this.context.destination);
+    }
     void this.context.resume();
   }
 
@@ -90,6 +97,13 @@ export class AudioEngine {
       this.channelRoutes.delete(channelName);
     } else {
       this.channelRoutes.set(channelName, route);
+    }
+  }
+
+  setVolume(volume: number) {
+    this.volume = clamp(volume, 0, 1);
+    if (this.context && this.masterGain) {
+      this.masterGain.gain.setValueAtTime(this.volume, this.context.currentTime);
     }
   }
 
@@ -362,15 +376,16 @@ export class AudioEngine {
   private connectRoute(tail: AudioNode, channelName: string, nodes: AudioNode[]) {
     if (!this.context) return;
     const route = this.channelRoutes.get(channelName) ?? 'both';
+    const destination = this.masterGain ?? this.context.destination;
     if (route !== 'both' && typeof this.context.createStereoPanner === 'function') {
       const panner = this.context.createStereoPanner();
       panner.pan.value = route === 'left' ? -1 : 1;
       tail.connect(panner);
-      panner.connect(this.context.destination);
+      panner.connect(destination);
       nodes.push(panner);
       return;
     }
-    tail.connect(this.context.destination);
+    tail.connect(destination);
   }
 
   private bestOverlapSourceIndex(samples: Float32Array<ArrayBuffer>, output: Float32Array<ArrayBuffer>,

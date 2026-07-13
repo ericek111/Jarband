@@ -26,6 +26,7 @@
   const minTimelineWindowMillis = 60 * 1000;
   const historySkipMillis = 5_000;
   const playbackFetchWindowMillis = 30_000;
+  const halfHourMillis = 30 * 60 * 1000;
 
   type ScheduledHistoryFrame = {
     channel: string;
@@ -74,17 +75,17 @@
   let recentHistory: Utterance[] = [];
   let historyHasOlder = false;
   let skipSilence = true;
-  let fromValue = '';
-  let toValue = '';
+  let historyDateValue = '';
+  let historyHourSlot = 0;
   let timelineFromMillis = 0;
   let timelineToMillis = 0;
   let timelineFollowRealtime = false;
-  let timelineLoading = false;
   let playheadMillis = 0;
   let historyPlaying = false;
   let historyPaused = false;
   let realtimePlayback = false;
   let playbackSpeed = 1;
+  let playbackVolume = 1;
   let playbackClockOriginMillis = 0;
   let playbackClockStartedAt = 0;
   let timelineLoadTimer: ReturnType<typeof setTimeout> | null = null;
@@ -385,16 +386,6 @@
       .catch(error => status = error instanceof Error ? error.message : String(error));
   }
 
-  function applyInputRange() {
-    const fromMillis = localMillis(fromValue);
-    const toMillis = localMillis(toValue);
-    if (!Number.isFinite(fromMillis) || !Number.isFinite(toMillis) || toMillis <= fromMillis) {
-      status = 'Choose a valid historical time range';
-      return;
-    }
-    setHistoryWindow(fromMillis, toMillis);
-  }
-
   function setHistoryWindow(fromMillis: number, toMillis: number, loadDelayMillis = 0) {
     const latestTo = Date.now();
     const followsRealtime = toMillis >= latestTo - 1000;
@@ -406,8 +397,7 @@
     if (!playheadMillis) {
       playheadMillis = safeTo;
     }
-    fromValue = localDateTime(safeFrom);
-    toValue = localDateTime(safeTo);
+    syncHistoryRangeControls((safeFrom + safeTo) / 2);
     if (timelineLoadTimer) clearTimeout(timelineLoadTimer);
     if (loadDelayMillis < 0) {
       return;
@@ -431,8 +421,7 @@
     if (!historyPlaying || historyPaused || scheduledHistoryFrames.length === 0) {
       playheadMillis = timelineToMillis;
     }
-    fromValue = localDateTime(timelineFromMillis);
-    toValue = localDateTime(timelineToMillis);
+    syncHistoryRangeControls((timelineFromMillis + timelineToMillis) / 2);
   }
 
   async function loadHistoryWindow() {
@@ -443,7 +432,6 @@
       return;
     }
     const requestId = ++historyWindowRequestId;
-    timelineLoading = true;
     try {
       const utterances = await fetchHistoryIndex([...selected], timelineFromMillis, timelineToMillis);
       if (requestId !== historyWindowRequestId) return;
@@ -452,10 +440,6 @@
       refreshVisiblePlaybackHighlights();
     } catch (error) {
       status = error instanceof Error ? error.message : String(error);
-    } finally {
-      if (requestId === historyWindowRequestId) {
-        timelineLoading = false;
-      }
     }
   }
 
@@ -549,6 +533,11 @@
       session.playbackMode.originMillis = currentPlayhead;
       session.playbackMode.originAudioTime = audio.audioTime(0.05);
     }
+  }
+
+  function changePlaybackVolume(volume: number) {
+    playbackVolume = clamp(volume, 0, 1);
+    audio.setVolume(playbackVolume);
   }
 
   function changeSkipSilence(nextSkipSilence: boolean) {
@@ -938,8 +927,7 @@
       const span = timelineSpanMillis;
       timelineToMillis = latestTo;
       timelineFromMillis = Math.max(0, latestTo - span);
-      fromValue = localDateTime(timelineFromMillis);
-      toValue = localDateTime(timelineToMillis);
+      syncHistoryRangeControls((timelineFromMillis + timelineToMillis) / 2);
     }
     if (utterance.endMillis < timelineFromMillis || utterance.startMillis > timelineToMillis) {
       return;
@@ -977,14 +965,45 @@
     return utcDate(recentHistory[index].startMillis) !== utcDate(recentHistory[index - 1].startMillis);
   }
 
-  function localDateTime(millis: number) {
+  function localDateValue(millis: number) {
     if (!Number.isFinite(millis)) return '';
     const date = new Date(millis);
-    return new Date(millis - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+    return new Date(millis - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 10);
   }
 
-  function localMillis(value: string) {
-    return value ? new Date(value).getTime() : 0;
+  function localDayStartMillis(value: string) {
+    return value ? new Date(`${value}T00:00`).getTime() : 0;
+  }
+
+  function hourSlotLabel(slot: number) {
+    const totalMinutes = clamp(Math.round(slot), 0, 47) * 30;
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+  }
+
+  function syncHistoryRangeControls(centerMillis: number) {
+    if (!Number.isFinite(centerMillis)) return;
+    historyDateValue = localDateValue(centerMillis);
+    const dayStart = localDayStartMillis(historyDateValue);
+    historyHourSlot = clamp(Math.round((centerMillis - dayStart) / halfHourMillis), 0, 47);
+  }
+
+  function centerHistoryWindowFromControls(loadDelayMillis = 0) {
+    if (!historyDateValue) {
+      historyDateValue = localDateValue(Date.now());
+    }
+    const centerMillis = localDayStartMillis(historyDateValue) + historyHourSlot * halfHourMillis;
+    setHistoryWindow(centerMillis - halfHourMillis, centerMillis + halfHourMillis, loadDelayMillis);
+  }
+
+  function changeHistoryDate() {
+    centerHistoryWindowFromControls();
+  }
+
+  function changeHistoryHour(event: Event) {
+    historyHourSlot = Number((event.currentTarget as HTMLInputElement).value);
+    centerHistoryWindowFromControls(250);
   }
 
   function duration(utterance: Utterance) {
@@ -1084,19 +1103,26 @@
     </div>
 
     <div class="history-controls">
-      <label>From <input bind:value={fromValue} type="datetime-local" onchange={applyInputRange} /></label>
-      <label>To <input bind:value={toValue} type="datetime-local" onchange={applyInputRange} /></label>
+      <label class="date-control">Date
+        <input bind:value={historyDateValue} type="date" onchange={changeHistoryDate} />
+      </label>
+      <label class="hour-control">
+        <span>{hourSlotLabel(historyHourSlot)}</span>
+        <input value={historyHourSlot} type="range" min="0" max="47" step="1"
+          aria-label="Timeline center time" oninput={changeHistoryHour} />
+      </label>
     </div>
 
     <HistoryTimeline utterances={recentHistory} fromMillis={timelineFromMillis} toMillis={timelineToMillis}
-      {playheadMillis} loading={timelineLoading} selected={selected.size > 0} outlineBlocks={selected.size > 1}
+      {playheadMillis} selected={selected.size > 0} outlineBlocks={selected.size > 1}
       playing={historyPlaying}
-      {playbackSpeed} {skipSilence} skipMillis={historySkipMillis} cacheBytes={rangeCacheBytes}
+      {playbackSpeed} {playbackVolume} {skipSilence} skipMillis={historySkipMillis} cacheBytes={rangeCacheBytes}
       activeChannels={activeTimelineChannels} nowMillis={now} realtime={realtimePlayback && historyPlaying && !historyPaused}
       onNavigate={leaveRealtimeNavigation} onWindowChange={setHistoryWindow} onPreviewPlayhead={previewTimelinePlayhead}
       onSeek={handleTimelineSeek} onTogglePlayback={toggleTimelinePlayback}
       onSkip={skipTimeline} onStop={jumpToRealtime}
-      onSpeedChange={changePlaybackSpeed} onSkipSilenceChange={changeSkipSilence} />
+      onSpeedChange={changePlaybackSpeed} onVolumeChange={changePlaybackVolume}
+      onSkipSilenceChange={changeSkipSilence} />
 
     <div class="history-list">
       {#each recentHistory as utterance, index (utteranceKey(utterance))}
