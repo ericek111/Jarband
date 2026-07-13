@@ -213,6 +213,7 @@
   }
 
   function showChannelHistory(name: string) {
+    clearHistoryPlaybackState(true);
     selected = new Set([name]);
     syncSocketSubscriptions();
     resetHistoryWindow();
@@ -220,6 +221,7 @@
   }
 
   function addChannelHistoryFilter(name: string) {
+    clearHistoryPlaybackState(true);
     const next = new Set(selected);
     next.add(name);
     selected = next;
@@ -228,6 +230,7 @@
   }
 
   function removeSelected(name: string) {
+    clearHistoryPlaybackState(true);
     const next = new Set(selected);
     next.delete(name);
     selected = next;
@@ -317,6 +320,7 @@
   }
 
   function filterHistoryAtUtterance(utterance: Utterance) {
+    clearHistoryPlaybackState(true);
     selected = new Set([utterance.channel]);
     syncSocketSubscriptions();
     const halfWindow = defaultTimelineWindowMillis / 2;
