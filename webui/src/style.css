@@ -15,6 +15,11 @@ main {
   padding: 22px;
 }
 
+main.wide-view {
+  max-width: none;
+  width: 100%;
+}
+
 .section-heading,
 .channels-controls,
 .history-controls,
@@ -28,6 +33,42 @@ main {
 .section-heading {
   justify-content: space-between;
   padding-bottom: 8px;
+}
+
+.section-heading-main {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.top-volume-control {
+  display: inline-grid;
+  grid-template-columns: auto minmax(140px, 220px);
+  align-items: center;
+  gap: 12px;
+  margin-inline: 6px;
+  padding-inline: 14px;
+  border-inline: 1px solid #33404d;
+  color: #cbd5df;
+  font-size: 13px;
+}
+
+.top-volume-control span {
+  color: #9ee6b5;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.top-volume-control input {
+  width: 100%;
+  accent-color: #7cf0a8;
+}
+
+.view-toggle {
+  min-height: 34px;
+  padding: 6px 10px;
 }
 
 h2 {
@@ -66,7 +107,7 @@ details {
 }
 
 .history-controls {
-  align-items: end;
+  align-items: center;
 }
 
 .date-control,
@@ -86,6 +127,7 @@ details {
   grid-template-columns: 48px minmax(220px, 1fr);
   align-items: center;
   flex: 1 1 360px;
+  align-self: center;
 }
 
 .hour-control span {
@@ -119,9 +161,14 @@ input[type="range"] {
 
 @media (max-width: 680px) {
   .date-control,
-  .hour-control {
+  .hour-control,
+  .top-volume-control {
     flex: 1 1 100%;
     width: 100%;
+  }
+
+  .top-volume-control {
+    grid-template-columns: 72px minmax(140px, 1fr);
   }
 }
 

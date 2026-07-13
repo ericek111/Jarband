@@ -27,6 +27,7 @@
   const historySkipMillis = 5_000;
   const playbackFetchWindowMillis = 30_000;
   const halfHourMillis = 30 * 60 * 1000;
+  const playbackVolumeStorageKey = 'jarband.playbackVolume';
 
   type ScheduledHistoryFrame = {
     channel: string;
@@ -63,6 +64,10 @@
     fetching: boolean;
   };
 
+  type HistorySelectionOptions = {
+    playRealtimeWhenStarting?: boolean;
+  };
+
   let socket: WebSocket | null = null;
   let status = 'Connecting...';
   let socketSubscriptions = new Set<string>();
@@ -75,6 +80,7 @@
   let recentHistory: Utterance[] = [];
   let historyHasOlder = false;
   let skipSilence = true;
+  let showHistoryList = false;
   let historyDateValue = '';
   let historyHourSlot = 0;
   let timelineFromMillis = 0;
@@ -86,6 +92,7 @@
   let realtimePlayback = false;
   let playbackSpeed = 1;
   let playbackVolume = 1;
+  let wideView = false;
   let playbackClockOriginMillis = 0;
   let playbackClockStartedAt = 0;
   let timelineLoadTimer: ReturnType<typeof setTimeout> | null = null;
@@ -122,6 +129,8 @@
     .map(channel => ({ name: channel.name, startMillis: channel.lastActivityMillis }));
 
   onMount(() => {
+    playbackVolume = storedPlaybackVolume(playbackVolume);
+    audio.setVolume(playbackVolume);
     audio.onScheduled(handleFrameScheduled);
     audio.onIdle(handleStreamIdle);
     socket = connectSocket(handleMessage, handlePacket, handleRecordingBytes, next => {
@@ -214,29 +223,81 @@
   }
 
   function showChannelHistory(name: string) {
-    clearHistoryPlaybackState(true);
-    selected = new Set([name]);
-    syncSocketSubscriptions();
-    resetHistoryWindow();
-    startRealtimeHistory();
+    updateHistorySelection(new Set([name]), { playRealtimeWhenStarting: true });
   }
 
   function addChannelHistoryFilter(name: string) {
-    clearHistoryPlaybackState(true);
     const next = new Set(selected);
     next.add(name);
-    selected = next;
-    syncSocketSubscriptions();
-    resetHistoryWindow();
+    updateHistorySelection(next);
   }
 
   function removeSelected(name: string) {
-    clearHistoryPlaybackState(true);
     const next = new Set(selected);
     next.delete(name);
+    updateHistorySelection(next);
+  }
+
+  function updateHistorySelection(next: Set<string>, options: HistorySelectionOptions = {}) {
+    const previous = selected;
+    const hadSelection = previous.size > 0;
+    const wasPlaying = historyPlaying;
+    const wasPaused = historyPaused;
+    const wasRealtime = realtimePlayback && historyPlaying && !historyPaused;
+    const resumeMillis = currentTimelinePlayhead();
+
+    if (next.size === 0) {
+      clearHistoryPlaybackState(true);
+      selected = next;
+      syncSocketSubscriptions();
+      resetHistoryWindow();
+      return;
+    }
+
+    if (sameSet(previous, next)) {
+      return;
+    }
+
+    const removedChannels = [...previous].filter(name => !next.has(name));
+    const addedChannels = [...next].filter(name => !previous.has(name));
     selected = next;
     syncSocketSubscriptions();
-    resetHistoryWindow();
+
+    for (const channel of removedChannels) {
+      removeHistoryChannelFromPlayback(channel);
+      if (!live.has(channel)) {
+        audio.flush(channel);
+      }
+    }
+
+    if (!hadSelection) {
+      resetHistoryWindow();
+      if (options.playRealtimeWhenStarting) {
+        startRealtimeHistory();
+      }
+      return;
+    }
+
+    playheadMillis = resumeMillis;
+    void loadHistoryWindow();
+
+    if (!wasPlaying || wasPaused) {
+      historyPaused = wasPaused;
+      return;
+    }
+
+    if (wasRealtime) {
+      historyPlaying = true;
+      historyPaused = false;
+      realtimePlayback = true;
+      playbackClockOriginMillis = 0;
+      playbackClockStartedAt = 0;
+      return;
+    }
+
+    if (addedChannels.length > 0) {
+      seekHistoryTo(resumeMillis, false);
+    }
   }
 
   function channelAudioRoute(name: string) {
@@ -455,7 +516,7 @@
     setHistoryWindow(nextFrom, nextTo);
   }
 
-  function seekHistoryTo(targetMillis: number) {
+  function seekHistoryTo(targetMillis: number, clampToTimeline = true) {
     try {
       audio.ensure();
     } catch (error) {
@@ -464,7 +525,7 @@
     }
     clearHistoryPlaybackState(true);
     realtimePlayback = false;
-    const boundedTargetMillis = clamp(targetMillis, timelineFromMillis, timelineToMillis);
+    const boundedTargetMillis = clampToTimeline ? clamp(targetMillis, timelineFromMillis, timelineToMillis) : Math.max(0, targetMillis);
     playheadMillis = boundedTargetMillis;
     const channels = [...selected];
     const playbackToMillis = Date.now();
@@ -538,6 +599,15 @@
   function changePlaybackVolume(volume: number) {
     playbackVolume = clamp(volume, 0, 1);
     audio.setVolume(playbackVolume);
+    persistPlaybackVolume(playbackVolume);
+  }
+
+  function changeTopPlaybackVolume(event: Event) {
+    changePlaybackVolume(Number((event.currentTarget as HTMLInputElement).value));
+  }
+
+  function toggleWideView() {
+    wideView = !wideView;
   }
 
   function changeSkipSilence(nextSkipSilence: boolean) {
@@ -545,6 +615,10 @@
     if (historyPlaying) {
       seekHistoryTo(currentTimelinePlayhead());
     }
+  }
+
+  function changeShowHistoryList(nextShowHistoryList: boolean) {
+    showHistoryList = nextShowHistoryList;
   }
 
   function leaveRealtimeNavigation() {
@@ -584,6 +658,36 @@
     playbackClockStartedAt = 0;
     if (flushAudio && keepPlayheadMillis > 0) {
       playheadMillis = keepPlayheadMillis;
+    }
+  }
+
+  function removeHistoryChannelFromPlayback(channel: string) {
+    const session = historySession;
+    if (!session) return;
+
+    const streamKey = historyStreamKey(session, channel);
+    audio.flush(streamKey);
+    session.activeStreams.delete(streamKey);
+    session.channels = session.channels.filter(item => item !== channel);
+
+    const removedKeys = new Set(session.utterances
+      .filter(utterance => utterance.channel === channel)
+      .map(utteranceKey));
+    session.utterances = session.utterances.filter(utterance => utterance.channel !== channel);
+    for (const key of removedKeys) {
+      session.cursors.delete(key);
+    }
+
+    scheduledHistoryFrames = scheduledHistoryFrames.filter(frame => frame.channel !== channel);
+    rowHighlighter.clear();
+    refreshVisiblePlaybackHighlights();
+
+    const next = new Set(replayingLast);
+    next.delete(channel);
+    replayingLast = next;
+
+    if (session.activeStreams.size === 0 && !session.fetching) {
+      void queueNextHistoryWindow(session);
     }
   }
 
@@ -670,8 +774,13 @@
 
         const chunk = await fetchUtterancePacketWindow(window.requests, window.horizonMillis,
           session.originMillis, session.abort.signal);
+        const activeChannels = new Set(session.channels);
         const requestsById = new Map(window.requests.map(request => [request.id, request]));
-        const advanced = chunk.updates.some(update => {
+        const relevantUpdates = chunk.updates.filter(update => {
+          const request = requestsById.get(update.id);
+          return !!request && activeChannels.has(request.utterance.channel);
+        });
+        const advanced = relevantUpdates.some(update => {
           const request = requestsById.get(update.id);
           const previousOffset = session.cursors.get(update.id)?.nextOffset
             ?? request?.byteOffset
@@ -679,7 +788,7 @@
             ?? 0;
           return update.nextOffset > previousOffset;
         });
-        for (const update of chunk.updates) {
+        for (const update of relevantUpdates) {
           session.cursors.set(update.id, {
             nextOffset: update.nextOffset,
             nextMillis: update.nextMillis,
@@ -687,29 +796,30 @@
           });
         }
         session.nextMillis = nextHistoryWindowStart(session, window.horizonMillis);
-        if (!chunk.packets.length) {
-          if (advanced) {
+        const playablePackets = chunk.packets.filter(packet => activeChannels.has(packet.channelName));
+        if (!playablePackets.length) {
+          if (advanced || chunk.packets.length || !relevantUpdates.length) {
             continue;
           }
-          if (chunk.updates.some(update => !update.complete)) {
+          if (relevantUpdates.some(update => !update.complete)) {
             status = 'Waiting for recorded audio bytes...';
             return;
           }
           continue;
         }
 
-        const streams = new Set(chunk.packets.map(packet => packet.streamKey));
+        const streams = new Set(playablePackets.map(packet => packet.streamKey));
         for (const streamKey of streams) {
           session.activeStreams.add(streamKey);
         }
-        for (const packet of chunk.packets) {
+        for (const packet of playablePackets) {
           if (session.abort.signal.aborted) break;
           const playbackPacket = historyPlaybackPacket(session, packet);
           if (playbackPacket) {
             audio.enqueue(playbackPacket, session.playbackMode);
           }
         }
-        status = `Queued ${chunk.packets.length} historical packets`;
+        status = `Queued ${playablePackets.length} historical packets`;
         return;
       }
     } catch (error) {
@@ -1037,12 +1147,52 @@
   function clamp(value: number, min: number, max: number) {
     return Math.min(max, Math.max(min, value));
   }
+
+  function sameSet(left: Set<string>, right: Set<string>) {
+    if (left.size !== right.size) return false;
+    for (const item of left) {
+      if (!right.has(item)) return false;
+    }
+    return true;
+  }
+
+  function storedPlaybackVolume(fallback: number) {
+    try {
+      const rawVolume = localStorage.getItem(playbackVolumeStorageKey);
+      if (rawVolume === null) return fallback;
+      const volume = Number(rawVolume);
+      return Number.isFinite(volume) ? clamp(volume, 0, 1) : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  function persistPlaybackVolume(volume: number) {
+    try {
+      localStorage.setItem(playbackVolumeStorageKey, String(volume));
+    } catch {
+      // Storage can be unavailable in private or locked-down browser contexts.
+    }
+  }
 </script>
 
-<main>
+<main class:wide-view={wideView}>
   <section class="recent-section">
     <div class="section-heading">
-      <h2>Recent activity</h2>
+      <div class="section-heading-main">
+        <h2>Recent activity</h2>
+        <label class="top-volume-control">
+          <span>Vol.: {Math.round(playbackVolume * 100)} %</span>
+          <input value={playbackVolume} type="range" min="0" max="1" step="0.01"
+            aria-label="Playback volume" oninput={changeTopPlaybackVolume} />
+        </label>
+        <button type="button" class:active={wideView} class="view-toggle"
+          aria-pressed={wideView}
+          title={wideView ? 'Switch to narrow view' : 'Switch to wide view'}
+          onclick={toggleWideView}>
+          Wide
+        </button>
+      </div>
       <div class="status">{status}</div>
     </div>
     <div class="channel-grid">
@@ -1051,7 +1201,7 @@
           selected={selected.has(channel.name)} historyColor={historyChannelColor(channel.name)}
           live={live.has(channel.name)}
           replaying={replayingLast.has(channel.name)}
-          onHistory={showChannelHistory} onAddFilter={addChannelHistoryFilter}
+          onHistory={showChannelHistory} onAddFilter={addChannelHistoryFilter} onRemoveFilter={removeSelected}
           onLive={toggleLive} onReplayLast={toggleLastUtterance} />
       {/each}
     </div>
@@ -1070,7 +1220,7 @@
             selected={selected.has(channel.name)} historyColor={historyChannelColor(channel.name)}
             live={live.has(channel.name)}
             replaying={replayingLast.has(channel.name)}
-            onHistory={showChannelHistory} onAddFilter={addChannelHistoryFilter}
+            onHistory={showChannelHistory} onAddFilter={addChannelHistoryFilter} onRemoveFilter={removeSelected}
             onLive={toggleLive} onReplayLast={toggleLastUtterance} />
         {/each}
       </div>
@@ -1105,8 +1255,9 @@
     </div>
 
     <div class="history-controls">
-      <label class="date-control">Date Z
-        <input bind:value={historyDateValue} type="date" onchange={changeHistoryDate} />
+      <label class="date-control">
+        <input bind:value={historyDateValue} type="date" aria-label="Timeline date in Zulu"
+          onchange={changeHistoryDate} />
       </label>
       <label class="hour-control">
         <span>{hourSlotLabel(historyHourSlot)}</span>
@@ -1118,47 +1269,50 @@
     <HistoryTimeline utterances={recentHistory} fromMillis={timelineFromMillis} toMillis={timelineToMillis}
       {playheadMillis} selected={selected.size > 0} outlineBlocks={selected.size > 1}
       playing={historyPlaying}
-      {playbackSpeed} {playbackVolume} {skipSilence} skipMillis={historySkipMillis} cacheBytes={rangeCacheBytes}
+      {playbackSpeed} {skipSilence} showList={showHistoryList}
+      skipMillis={historySkipMillis} cacheBytes={rangeCacheBytes}
       activeChannels={activeTimelineChannels} nowMillis={now} realtime={realtimePlayback && historyPlaying && !historyPaused}
       onNavigate={leaveRealtimeNavigation} onWindowChange={setHistoryWindow} onPreviewPlayhead={previewTimelinePlayhead}
       onSeek={handleTimelineSeek} onTogglePlayback={toggleTimelinePlayback}
       onSkip={skipTimeline} onStop={jumpToRealtime}
-      onSpeedChange={changePlaybackSpeed} onVolumeChange={changePlaybackVolume}
-      onSkipSilenceChange={changeSkipSilence} />
+      onSpeedChange={changePlaybackSpeed}
+      onSkipSilenceChange={changeSkipSilence} onShowListChange={changeShowHistoryList} />
 
-    <div class="history-list">
-      {#each recentHistory as utterance, index (utteranceKey(utterance))}
-        {#if showDateSeparator(index)}
-          <div class="history-date">{utcDate(utterance.startMillis)}</div>
-        {/if}
-        <div class:playing-row={playingRows.has(utteranceKey(utterance))} class="utterance">
-          <span class="utterance-channel" role="link" tabindex="0"
-            style:color={historyChannelColor(utterance.channel)}
-            aria-label={`Filter history to ${utterance.channel}`}
-            onclick={() => filterHistoryAtUtterance(utterance)}
-            onkeydown={(event) => filterHistoryFromKey(event, utterance)}>
-            {utterance.channel}
-          </span>
-          <span>{utcTime(utterance.startMillis)}</span>
-          <span>{duration(utterance)}s</span>
-          <span>{snr(utterance)}</span>
-          <div class="utterance-actions">
-            <button type="button" class="icon-button" aria-label="Play or stop this recording"
-              onclick={() => toggleUtterancePlayback(utterance)}>
-              <span class="icon-symbol">{playingRows.has(utteranceKey(utterance)) ? '■' : '▶'}</span>
-            </button>
-            <button type="button" class="icon-button" aria-label="Play recordings since this time"
-              onclick={() => playSince(utterance)}>
-              <span class="icon-symbol">⤒</span>
-            </button>
-            <button type="button" class="icon-button" aria-label="Download this recording as WAV"
-              onclick={() => downloadUtterance(utterance)}>
-              <span class="icon-symbol">↓</span>
-            </button>
+    {#if showHistoryList}
+      <div class="history-list">
+        {#each recentHistory as utterance, index (utteranceKey(utterance))}
+          {#if showDateSeparator(index)}
+            <div class="history-date">{utcDate(utterance.startMillis)}</div>
+          {/if}
+          <div class:playing-row={playingRows.has(utteranceKey(utterance))} class="utterance">
+            <span class="utterance-channel" role="link" tabindex="0"
+              style:color={historyChannelColor(utterance.channel)}
+              aria-label={`Filter history to ${utterance.channel}`}
+              onclick={() => filterHistoryAtUtterance(utterance)}
+              onkeydown={(event) => filterHistoryFromKey(event, utterance)}>
+              {utterance.channel}
+            </span>
+            <span>{utcTime(utterance.startMillis)}</span>
+            <span>{duration(utterance)}s</span>
+            <span>{snr(utterance)}</span>
+            <div class="utterance-actions">
+              <button type="button" class="icon-button" aria-label="Play or stop this recording"
+                onclick={() => toggleUtterancePlayback(utterance)}>
+                <span class="icon-symbol">{playingRows.has(utteranceKey(utterance)) ? '■' : '▶'}</span>
+              </button>
+              <button type="button" class="icon-button" aria-label="Play recordings since this time"
+                onclick={() => playSince(utterance)}>
+                <span class="icon-symbol">⤒</span>
+              </button>
+              <button type="button" class="icon-button" aria-label="Download this recording as WAV"
+                onclick={() => downloadUtterance(utterance)}>
+                <span class="icon-symbol">↓</span>
+              </button>
+            </div>
           </div>
-        </div>
-      {/each}
-    </div>
+        {/each}
+      </div>
+    {/if}
 
     <div class="pager">
       <button type="button" disabled={selected.size === 0 || timelineToMillis >= now - 1000} onclick={loadNewerHistory}>Newer</button>

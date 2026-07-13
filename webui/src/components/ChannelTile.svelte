@@ -9,6 +9,7 @@
     replaying,
     onHistory,
     onAddFilter,
+    onRemoveFilter,
     onLive,
     onReplayLast
   }: {
@@ -21,6 +22,7 @@
     replaying: boolean;
     onHistory: (name: string) => void;
     onAddFilter: (name: string) => void;
+    onRemoveFilter: (name: string) => void;
     onLive: (name: string) => void;
     onReplayLast: (name: string) => void;
   } = $props();
@@ -30,7 +32,11 @@
   }
 
   function addFilter() {
-    onAddFilter(name);
+    if (selected) {
+      onRemoveFilter(name);
+    } else {
+      onAddFilter(name);
+    }
   }
 
   function toggleLive() {
@@ -47,7 +53,8 @@
   <span>{lastActiveLabel}</span>
   <div class:active={selected} class="split-button">
     <button type="button" onclick={showHistory}>History</button>
-    <button type="button" aria-label={`Add ${name} to history filter`} onclick={addFilter}>+</button>
+    <button type="button" aria-label={`${selected ? 'Remove' : 'Add'} ${name} ${selected ? 'from' : 'to'} history filter`}
+      onclick={addFilter}>{selected ? '-' : '+'}</button>
   </div>
   <div class="listen-row">
     <button type="button" class:live onclick={toggleLive}>

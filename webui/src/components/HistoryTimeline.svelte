@@ -27,8 +27,8 @@
     outlineBlocks,
     playing,
     playbackSpeed,
-    playbackVolume,
     skipSilence,
+    showList,
     skipMillis,
     cacheBytes,
     activeChannels,
@@ -42,8 +42,8 @@
     onSkip,
     onStop,
     onSpeedChange,
-    onVolumeChange,
-    onSkipSilenceChange
+    onSkipSilenceChange,
+    onShowListChange
   }: {
     utterances: Utterance[];
     fromMillis: number;
@@ -53,8 +53,8 @@
     outlineBlocks: boolean;
     playing: boolean;
     playbackSpeed: number;
-    playbackVolume: number;
     skipSilence: boolean;
+    showList: boolean;
     skipMillis: number;
     cacheBytes: number;
     activeChannels: ActiveTimelineChannel[];
@@ -68,8 +68,8 @@
     onSkip: (deltaMillis: number) => void;
     onStop: () => void;
     onSpeedChange: (speed: number) => void;
-    onVolumeChange: (volume: number) => void;
     onSkipSilenceChange: (skipSilence: boolean) => void;
+    onShowListChange: (showList: boolean) => void;
   } = $props();
 
   let canvas = $state<HTMLCanvasElement | null>(null);
@@ -123,7 +123,7 @@
 
   function zoomTimelineButton(direction: 'in' | 'out') {
     if (!selected || toMillis <= fromMillis) return;
-    zoomTimelineAt(0.5, direction === 'out' ? timelineZoomStep : 1 / timelineZoomStep, 250);
+    zoomTimelineAt(effectiveRealtime ? 1 : 0.5, direction === 'out' ? timelineZoomStep : 1 / timelineZoomStep, 250);
   }
 
   function zoomTimelineAt(ratio: number, zoomFactor: number, loadDelayMillis = 0) {
@@ -226,12 +226,12 @@
     onSpeedChange(1);
   }
 
-  function changeVolume(event: Event) {
-    onVolumeChange(Number((event.currentTarget as HTMLInputElement).value));
-  }
-
   function changeSkipSilence(event: Event) {
     onSkipSilenceChange((event.currentTarget as HTMLInputElement).checked);
+  }
+
+  function changeShowList(event: Event) {
+    onShowListChange((event.currentTarget as HTMLInputElement).checked);
   }
 
   function millisFromTimelineEvent(event: PointerEvent, element: HTMLElement) {
@@ -535,11 +535,6 @@
         <span class="icon-symbol">+</span>
       </button>
     </div>
-    <label class="control-group volume-control">
-      <span class="volume-label">{Math.round(playbackVolume * 100)}%</span>
-      <input value={playbackVolume} type="range" min="0" max="1" step="0.01"
-        aria-label="Playback volume" oninput={changeVolume} />
-    </label>
     <label class="control-group speed-control">
       <button type="button" class="speed-label" aria-label="Reset playback speed to 1.0x"
         title="Reset playback speed to 1.0x" onclick={resetSpeed}>
@@ -551,6 +546,10 @@
     <label class="control-group checkbox skip-silence">
       <input checked={skipSilence} type="checkbox" onchange={changeSkipSilence} />
       Skip silence
+    </label>
+    <label class="control-group checkbox show-list">
+      <input checked={showList} type="checkbox" onchange={changeShowList} />
+      Show list
     </label>
   </div>
   <canvas class="history-timeline" role="slider" aria-label="Historical playback seek bar"
@@ -599,18 +598,30 @@
   .timeline-controls {
     display: flex;
     align-items: center;
-    gap: 16px;
+    gap: 0;
     flex-wrap: wrap;
   }
 
   .control-group {
+    position: relative;
     display: inline-flex;
     align-items: center;
     gap: 6px;
+    padding-right: 14px;
+    margin-right: 14px;
   }
 
-  .speed-control,
-  .volume-control {
+  .control-group:not(:last-child)::after {
+    content: "";
+    position: absolute;
+    top: 5px;
+    right: 0;
+    width: 1px;
+    height: 24px;
+    background: #33404d;
+  }
+
+  .speed-control {
     display: inline-grid;
     grid-template-columns: 42px minmax(130px, 190px);
     align-items: center;
@@ -627,16 +638,10 @@
     color: #9ee6b5;
     cursor: pointer;
     font-weight: 700;
-    text-align: left;
+    text-align: right;
   }
 
-  .volume-label {
-    color: #9aa7b4;
-    font-weight: 700;
-  }
-
-  .speed-control input,
-  .volume-control input {
+  .speed-control input {
     width: 100%;
     accent-color: #7cf0a8;
   }
