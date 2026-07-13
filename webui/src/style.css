@@ -45,7 +45,7 @@ main.wide-view {
 
 .top-volume-control {
   display: inline-grid;
-  grid-template-columns: auto minmax(140px, 220px);
+  grid-template-columns: auto minmax(140px, 220px) auto;
   align-items: center;
   gap: 12px;
   margin-inline: 6px;
@@ -56,14 +56,30 @@ main.wide-view {
 }
 
 .top-volume-control span {
+  min-width: 76px;
   color: #9ee6b5;
   font-weight: 750;
+  text-align: right;
   white-space: nowrap;
 }
 
 .top-volume-control input {
   width: 100%;
   accent-color: #7cf0a8;
+}
+
+.top-agc-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #cbd5df;
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.top-agc-control input {
+  width: auto;
 }
 
 .view-toggle {
@@ -168,7 +184,7 @@ input[type="range"] {
   }
 
   .top-volume-control {
-    grid-template-columns: 72px minmax(140px, 1fr);
+    grid-template-columns: 76px minmax(140px, 1fr) auto;
   }
 }
 

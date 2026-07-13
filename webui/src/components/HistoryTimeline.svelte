@@ -241,7 +241,7 @@
   }
 
   function historyRangeLabel() {
-    if (!effectiveFromMillis || !effectiveToMillis) return 'No recordings';
+    if (!effectiveFromMillis || !effectiveToMillis) return '';
     const fromDate = utcDate(effectiveFromMillis);
     const toDate = utcDate(effectiveToMillis);
     const count = utterances.length === 1 ? '1 recording' : `${utterances.length} recordings`;

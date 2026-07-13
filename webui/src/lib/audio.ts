@@ -28,6 +28,10 @@ type PcmBuffer = {
   timer: ReturnType<typeof setTimeout> | null;
 };
 
+type AgcState = {
+  gain: number;
+};
+
 export class AudioEngine {
   private context: AudioContext | null = null;
   private masterGain: GainNode | null = null;
@@ -39,7 +43,9 @@ export class AudioEngine {
   private clocks = new Map<string, Clock>();
   private channelRoutes = new Map<string, AudioRoute>();
   private sources = new Map<string, Set<AudioBufferSourceNode>>();
+  private agcByChannel = new Map<string, AgcState>();
   private volume = 1;
+  private agcEnabled = false;
   private onFrameScheduled: ((streamKey: string, targetMillis: number, startTime: number,
     durationSeconds: number, channelName: string) => void) | null = null;
   private onStreamIdle: ((streamKey: string) => void) | null = null;
@@ -53,6 +59,12 @@ export class AudioEngine {
   private readonly livePcmChunkSeconds = 0.04;
   private readonly pcmFlushDelayMillis = 35;
   private readonly historyBoundaryFadeSeconds = 0.0025;
+  private readonly agcTargetRms = 0.14;
+  private readonly agcMinGain = 0.3;
+  private readonly agcMaxGain = 6;
+  private readonly agcSilenceRms = 0.003;
+  private readonly agcAttackSeconds = 0.04;
+  private readonly agcReleaseSeconds = 0.18;
 
   supported() {
     return typeof globalThis.AudioDecoder === 'function'
@@ -105,6 +117,13 @@ export class AudioEngine {
     if (this.context && this.masterGain) {
       this.masterGain.gain.setValueAtTime(this.volume, this.context.currentTime);
     }
+  }
+
+  setAgcEnabled(enabled: boolean) {
+    if (this.agcEnabled !== enabled) {
+      this.agcByChannel.clear();
+    }
+    this.agcEnabled = enabled;
   }
 
   flush(streamKey: string) {
@@ -259,6 +278,7 @@ export class AudioEngine {
     const playbackMode = buffer.playbackMode;
     const speed = playbackMode ? this.normalizedPlaybackSpeed(playbackMode.speed) : 1;
     const renderedSamples = this.timeScaleSpeech(sourceSamples, speed, buffer.sampleRate);
+    this.applyAgc(renderedSamples, buffer.sampleRate, buffer.frames[0].channelName);
     this.scheduleSamples(streamKey, renderedSamples, buffer.sampleRate, buffer.frames[0].scheduleMillis,
       buffer.frames[0].targetMillis, buffer.frames[0].channelName, playbackMode, speed);
     this.drain(streamKey, playbackMode);
@@ -386,6 +406,42 @@ export class AudioEngine {
       return;
     }
     tail.connect(destination);
+  }
+
+  private applyAgc(samples: Float32Array<ArrayBuffer>, sampleRate: number, channelName: string) {
+    if (!this.agcEnabled || samples.length === 0) return;
+    const rms = this.rms(samples);
+    if (rms < this.agcSilenceRms) return;
+
+    const desiredGain = clamp(this.agcTargetRms / rms, this.agcMinGain, this.agcMaxGain);
+    let state = this.agcByChannel.get(channelName);
+    if (!state) {
+      state = { gain: desiredGain };
+      this.agcByChannel.set(channelName, state);
+    }
+    const chunkSeconds = samples.length / sampleRate;
+    const timeConstant = desiredGain < state.gain ? this.agcAttackSeconds : this.agcReleaseSeconds;
+    const smoothing = 1 - Math.exp(-chunkSeconds / timeConstant);
+    const startGain = state.gain;
+    const endGain = startGain + (desiredGain - startGain) * smoothing;
+    const gainStep = samples.length > 1 ? (endGain - startGain) / (samples.length - 1) : 0;
+
+    // Ramp gain across the chunk so AGC changes do not create clicks at buffer
+    // boundaries. Each channel keeps its own state to avoid cross-channel pumping.
+    let gain = startGain;
+    for (let i = 0; i < samples.length; i++) {
+      samples[i] = clamp(samples[i] * gain, -1, 1);
+      gain += gainStep;
+    }
+    state.gain = endGain;
+  }
+
+  private rms(samples: Float32Array<ArrayBuffer>) {
+    let energy = 0;
+    for (let i = 0; i < samples.length; i++) {
+      energy += samples[i] * samples[i];
+    }
+    return Math.sqrt(energy / samples.length);
   }
 
   private bestOverlapSourceIndex(samples: Float32Array<ArrayBuffer>, output: Float32Array<ArrayBuffer>,

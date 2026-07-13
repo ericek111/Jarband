@@ -80,6 +80,7 @@
   let recentHistory: Utterance[] = [];
   let historyHasOlder = false;
   let skipSilence = true;
+  let agcEnabled = false;
   let showHistoryList = false;
   let historyDateValue = '';
   let historyHourSlot = 0;
@@ -606,6 +607,10 @@
     changePlaybackVolume(Number((event.currentTarget as HTMLInputElement).value));
   }
 
+  function changeTopAgc(event: Event) {
+    changeAgc((event.currentTarget as HTMLInputElement).checked);
+  }
+
   function toggleWideView() {
     wideView = !wideView;
   }
@@ -615,6 +620,11 @@
     if (historyPlaying) {
       seekHistoryTo(currentTimelinePlayhead());
     }
+  }
+
+  function changeAgc(nextAgcEnabled: boolean) {
+    agcEnabled = nextAgcEnabled;
+    audio.setAgcEnabled(agcEnabled);
   }
 
   function changeShowHistoryList(nextShowHistoryList: boolean) {
@@ -1133,17 +1143,6 @@
     return selected.size > 1 && selected.has(channel) ? channelAccentColor(channel) : null;
   }
 
-  function historyRangeLabel() {
-    if (!timelineFromMillis || !timelineToMillis) return 'No recordings';
-    const fromDate = utcDate(timelineFromMillis);
-    const toDate = utcDate(timelineToMillis);
-    const count = recentHistory.length === 1 ? '1 recording' : `${recentHistory.length} recordings`;
-    if (fromDate === toDate) {
-      return `${fromDate} ${utcTime(timelineFromMillis)} - ${utcTime(timelineToMillis)} · ${count}`;
-    }
-    return `${fromDate} ${utcTime(timelineFromMillis)} - ${toDate} ${utcTime(timelineToMillis)} · ${count}`;
-  }
-
   function clamp(value: number, min: number, max: number) {
     return Math.min(max, Math.max(min, value));
   }
@@ -1181,11 +1180,16 @@
     <div class="section-heading">
       <div class="section-heading-main">
         <h2>Recent activity</h2>
-        <label class="top-volume-control">
+        <div class="top-volume-control">
           <span>Vol.: {Math.round(playbackVolume * 100)} %</span>
           <input value={playbackVolume} type="range" min="0" max="1" step="0.01"
             aria-label="Playback volume" oninput={changeTopPlaybackVolume} />
-        </label>
+          <label class="top-agc-control" title="Normalize output volume independently per channel">
+            <input checked={agcEnabled} type="checkbox" aria-label="Enable per-channel AGC"
+              onchange={changeTopAgc} />
+            AGC
+          </label>
+        </div>
         <button type="button" class:active={wideView} class="view-toggle"
           aria-pressed={wideView}
           title={wideView ? 'Switch to narrow view' : 'Switch to wide view'}
@@ -1276,7 +1280,8 @@
       onSeek={handleTimelineSeek} onTogglePlayback={toggleTimelinePlayback}
       onSkip={skipTimeline} onStop={jumpToRealtime}
       onSpeedChange={changePlaybackSpeed}
-      onSkipSilenceChange={changeSkipSilence} onShowListChange={changeShowHistoryList} />
+      onSkipSilenceChange={changeSkipSilence}
+      onShowListChange={changeShowHistoryList} />
 
     {#if showHistoryList}
       <div class="history-list">
@@ -1312,12 +1317,11 @@
           </div>
         {/each}
       </div>
-    {/if}
 
-    <div class="pager">
-      <button type="button" disabled={selected.size === 0 || timelineToMillis >= now - 1000} onclick={loadNewerHistory}>Newer</button>
-      <span>{historyRangeLabel()}</span>
-      <button type="button" disabled={!historyHasOlder || selected.size === 0} onclick={loadOlderHistory}>Older</button>
-    </div>
+      <div class="pager">
+        <button type="button" disabled={selected.size === 0 || timelineToMillis >= now - 1000} onclick={loadNewerHistory}>Newer</button>
+        <button type="button" disabled={!historyHasOlder || selected.size === 0} onclick={loadOlderHistory}>Older</button>
+      </div>
+    {/if}
   </section>
 </main>
