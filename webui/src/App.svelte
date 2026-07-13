@@ -1085,7 +1085,8 @@
     </div>
 
     <HistoryTimeline utterances={recentHistory} fromMillis={timelineFromMillis} toMillis={timelineToMillis}
-      {playheadMillis} loading={timelineLoading} selected={selected.size > 0} playing={historyPlaying}
+      {playheadMillis} loading={timelineLoading} selected={selected.size > 0} outlineBlocks={selected.size > 1}
+      playing={historyPlaying}
       {playbackSpeed} {skipSilence} skipMillis={historySkipMillis} cacheBytes={rangeCacheBytes}
       activeChannels={activeTimelineChannels} nowMillis={now} realtime={realtimePlayback && historyPlaying && !historyPaused}
       onNavigate={leaveRealtimeNavigation} onWindowChange={setHistoryWindow} onPreviewPlayhead={previewTimelinePlayhead}

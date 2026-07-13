@@ -25,6 +25,7 @@
     playheadMillis,
     loading,
     selected,
+    outlineBlocks,
     playing,
     playbackSpeed,
     skipSilence,
@@ -49,6 +50,7 @@
     playheadMillis: number;
     loading: boolean;
     selected: boolean;
+    outlineBlocks: boolean;
     playing: boolean;
     playbackSpeed: number;
     skipSilence: boolean;
@@ -93,12 +95,13 @@
   let effectiveRealtime = $derived(realtime);
 
   $effect(() => {
-    scheduleDraw(canvas, ticks, blocks, playheadMillis, effectiveFromMillis, effectiveToMillis, effectiveRealtime, nowMillis);
+    scheduleDraw(canvas, ticks, blocks, playheadMillis, effectiveFromMillis, effectiveToMillis,
+      effectiveRealtime, nowMillis, outlineBlocks);
   });
 
   onMount(() => {
     const redraw = () => scheduleDraw(canvas, ticks, blocks, playheadMillis,
-      effectiveFromMillis, effectiveToMillis, effectiveRealtime, nowMillis);
+      effectiveFromMillis, effectiveToMillis, effectiveRealtime, nowMillis, outlineBlocks);
     window.addEventListener('resize', redraw);
     return () => window.removeEventListener('resize', redraw);
   });
@@ -359,7 +362,7 @@
 
   function scheduleDraw(_canvas: HTMLCanvasElement | null, _ticks: typeof ticks, _blocks: typeof blocks,
                         _playheadMillis: number, _fromMillis: number, _toMillis: number,
-                        _realtime: boolean, _nowMillis: number) {
+                        _realtime: boolean, _nowMillis: number, _outlineBlocks: boolean) {
     if (!canvas) return;
     if (drawFrame) cancelAnimationFrame(drawFrame);
     drawFrame = requestAnimationFrame(() => {
@@ -430,15 +433,17 @@
       const blockWidth = Math.max(2, (block.width / 100) * width);
       const y = (block.top / 100) * height;
       const blockHeight = (block.height / 100) * height;
-      const blockGradient = context.createLinearGradient(0, y, 0, y + blockHeight);
-      blockGradient.addColorStop(0, mixCanvasColor(block.color, '#ffffff', 0.18));
-      blockGradient.addColorStop(1, mixCanvasColor(block.color, '#000000', 0.28));
-      context.fillStyle = blockGradient;
-      context.strokeStyle = mixCanvasColor(block.color, '#ffffff', 0.22);
-      context.lineWidth = 1;
+      context.strokeStyle = outlineBlocks ? block.color : mixCanvasColor(block.color, '#ffffff', 0.22);
+      context.lineWidth = outlineBlocks ? 2 : 1;
       context.beginPath();
       context.roundRect(x, y, blockWidth, blockHeight, 2);
-      context.fill();
+      if (!outlineBlocks) {
+        const blockGradient = context.createLinearGradient(0, y, 0, y + blockHeight);
+        blockGradient.addColorStop(0, mixCanvasColor(block.color, '#ffffff', 0.18));
+        blockGradient.addColorStop(1, mixCanvasColor(block.color, '#000000', 0.28));
+        context.fillStyle = blockGradient;
+        context.fill();
+      }
       context.stroke();
     }
 
